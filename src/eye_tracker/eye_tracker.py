@@ -25,9 +25,9 @@ class EyeTracker:
         self.crop = crop if crop is not None else [0, 640, 0, 480]
         self.side = side
 
-        # ---- 根据 crop 计算帧尺寸 ----
-        self.frame_width = self.crop[1] - self.crop[0]
-        self.frame_height = self.crop[3] - self.crop[2]
+        # ---- 帧尺寸固定为 640x480，算法在该分辨率下效果最佳 ----
+        self.frame_width = 640
+        self.frame_height = 480
 
         # ---- 追踪状态变量（原全局变量） ----
         self.ray_lines = []                         # 近期瞳孔椭圆射线
@@ -47,14 +47,57 @@ class EyeTracker:
         self.last_tracking_result = None            # 最新追踪结果
         self.stored_intersections = []              # 历史交集点
 
+        # ---- 锁定状态 ----
+        self.sphere_radius_locked = False
+        self.locked_sphere_radius = 0
+        self.eye_center_locked = False
+        self.locked_eye_center = (self.frame_width // 2, self.frame_height // 2)
+
         # ---- 运行状态 ----
         self.cap = None
         self.running = False
 
+    # ==================== 锁定函数 ====================
+
+    def lock_sphere_radius(self):
+        """锁定当前眼球半径（max_observed_distance），之后不再自适应更新。"""
+        if self.max_observed_distance > 0:
+            self.sphere_radius_locked = True
+            self.locked_sphere_radius = self.max_observed_distance
+            print(f"[{self.side}] 眼球半径已锁定: {self.locked_sphere_radius:.1f}")
+        else:
+            print(f"[{self.side}] 眼球半径仍为0，无法锁定，请先让追踪稳定。")
+
+    def unlock_sphere_radius(self):
+        """解锁眼球半径，恢复自适应更新。"""
+        self.sphere_radius_locked = False
+        print(f"[{self.side}] 眼球半径已解锁")
+
+    def lock_eye_center(self):
+        """锁定当前眼球中心，之后不再通过射线交集更新。"""
+        if self.prev_model_center_avg[0] != self.frame_width // 2:
+            self.eye_center_locked = True
+            self.locked_eye_center = self.prev_model_center_avg
+            print(f"[{self.side}] 眼球中心已锁定: {self.locked_eye_center}")
+        else:
+            print(f"[{self.side}] 眼球中心尚未稳定，无法锁定。")
+
+    def unlock_eye_center(self):
+        """解锁眼球中心，恢复射线交集更新。"""
+        self.eye_center_locked = False
+        print(f"[{self.side}] 眼球中心已解锁")
+
     # ==================== 核心处理流程 ====================
 
-    def start_tracking(self):
-        """打开摄像机并进入主循环（阻塞）。关闭窗口可退出。"""
+    def start_tracking(self, command_queue=None):
+        """打开摄像机并进入主循环（阻塞）。关闭窗口可退出。
+        
+        Parameters
+        ----------
+        command_queue : multiprocessing.Queue | None
+            接收来自主进程的锁定/解锁命令队列。
+            支持的命令: 'lock_radius', 'unlock_radius', 'lock_center', 'unlock_center'
+        """
         self._reset_tracking_state()
 
         # 优先使用 V4L2 后端（Linux），失败则回退默认
@@ -79,6 +122,22 @@ class EyeTracker:
         max_fail = 10
 
         while self.running:
+            # ---- 处理来自主进程的命令 ----
+            if command_queue is not None:
+                while not command_queue.empty():
+                    try:
+                        cmd = command_queue.get_nowait()
+                        if cmd == "lock_radius":
+                            self.lock_sphere_radius()
+                        elif cmd == "unlock_radius":
+                            self.unlock_sphere_radius()
+                        elif cmd == "lock_center":
+                            self.lock_eye_center()
+                        elif cmd == "unlock_center":
+                            self.unlock_eye_center()
+                    except Exception:
+                        pass  # 队列已空或其他读取错误，忽略
+
             ret, frame = self.cap.read()
             if not ret:
                 frame_fail_count += 1
@@ -137,6 +196,7 @@ class EyeTracker:
 
     def _process_frame(self, frame):
         """处理单帧图像。"""
+        frame = cv2.resize(frame, (self.frame_width, self.frame_height))
         darkest_point = self._get_darkest_area(frame)
         if darkest_point is None:
             self.last_tracking_result = None
@@ -159,7 +219,6 @@ class EyeTracker:
             thresholded_medium,
             thresholded_relaxed,
             frame,
-            gray_frame,
         )
 
     # ==================== 多阈值融合与瞳孔拟合 ====================
@@ -170,7 +229,6 @@ class EyeTracker:
         thresholded_medium,
         thresholded_relaxed,
         frame,
-        gray_frame,
     ):
         """对三种阈值图像分别检测瞳孔，选出最佳椭圆并计算视线。"""
         kernel = np.ones((5, 5), np.uint8)
@@ -212,7 +270,7 @@ class EyeTracker:
         center_y = best_center_y
 
         # 角度优化
-        final_contours = [self._optimize_contours_by_angle(final_contours, gray_frame)]
+        final_contours = [self._optimize_contours_by_angle(final_contours)]
 
         if (
             final_contours
@@ -228,24 +286,27 @@ class EyeTracker:
                     self.ray_lines = self.ray_lines[-self.max_rays:]
 
         # 计算眼球中心均值
-        model_center_average = (self.frame_width // 2, self.frame_height // 2)
+        if self.eye_center_locked:
+            model_center_average = self.locked_eye_center
+        else:
+            model_center_average = (self.frame_width // 2, self.frame_height // 2)
 
-        model_center = self._compute_average_intersection(
-            frame,
-            self.ray_lines,
-            self.intersection_ray_count,
-            1500,
-            self.minimum_intersection_angle_degrees,
-        )
-        if model_center is not None and model_center != (0, 0):
-            model_center_average = self._update_and_average_point(
-                self.model_centers, model_center, 200
+            model_center = self._compute_average_intersection(
+                frame,
+                self.ray_lines,
+                self.intersection_ray_count,
+                1500,
+                self.minimum_intersection_angle_degrees,
             )
+            if model_center is not None and model_center != (0, 0):
+                model_center_average = self._update_and_average_point(
+                    self.model_centers, model_center, 200
+                )
 
-        if model_center_average[0] == self.frame_width // 2:
-            model_center_average = self.prev_model_center_avg
-        if model_center_average[0] != 0:
-            self.prev_model_center_avg = model_center_average
+            if model_center_average[0] == self.frame_width // 2:
+                model_center_average = self.prev_model_center_avg
+            if model_center_average[0] != 0:
+                self.prev_model_center_avg = model_center_average
 
         if center_x is None or center_y is None:
             self.last_tracking_result = None
@@ -540,7 +601,7 @@ class EyeTracker:
         return [largest_contour] if largest_contour is not None else []
 
     @staticmethod
-    def _optimize_contours_by_angle(contours, image):
+    def _optimize_contours_by_angle(contours):
         """根据点与质心的角度过滤轮廓点。"""
         if len(contours) < 1:
             return contours
@@ -559,8 +620,16 @@ class EyeTracker:
             vec2 = next_point - current_point
             vec_to_centroid = centroid - current_point
 
+            # 归一化所有向量，使点积仅反映方向相似度
+            n1 = np.linalg.norm(vec_to_centroid)
+            n2 = np.linalg.norm(vec1 + vec2)
+            if n1 < 1e-6 or n2 < 1e-6:
+                continue
+            v_dir = vec_to_centroid / n1
+            v_tangent = (vec1 + vec2) / n2
+
             cos_threshold = np.cos(np.radians(60))
-            if np.dot(vec_to_centroid, (vec1 + vec2) / 2) >= cos_threshold:
+            if np.dot(v_dir, v_tangent) >= cos_threshold:
                 filtered_points.append(current_point)
 
         return np.array(filtered_points, dtype=np.int32).reshape((-1, 1, 2))
@@ -649,7 +718,11 @@ class EyeTracker:
         return center_distance + edge_offset
 
     def _update_eye_sphere_radius(self, eye_center, current_pupil_ellipse, current_pupil_confidence):
-        """自适应更新眼球半径。"""
+        """自适应更新眼球半径（如果未锁定）。"""
+        if self.sphere_radius_locked:
+            self.max_observed_distance = self.locked_sphere_radius
+            return
+
         if self.last_sphere_radius_ellipse is not None:
             anchored_distance = self._distance_to_pupil_outer_edge(
                 eye_center, self.last_sphere_radius_ellipse
@@ -676,6 +749,12 @@ class EyeTracker:
                 self.last_sphere_radius_ellipse = current_pupil_ellipse
 
     # ==================== 射线交集与眼球中心估计 ====================
+
+    @staticmethod
+    def _angle_diff(a, b):
+        """返回 [0, 180) 范围内两个角度的最小夹角差。"""
+        diff = abs(a - b) % 180
+        return min(diff, 180 - diff)
 
     @staticmethod
     def _find_line_intersection(ellipse1, ellipse2):
@@ -719,7 +798,7 @@ class EyeTracker:
             line1 = selected_lines[i]
             line2 = selected_lines[i + 1]
 
-            if abs(line1[2] - line2[2]) >= minimum_angle_degrees:
+            if self._angle_diff(line1[2], line2[2]) >= minimum_angle_degrees:
                 intersection = self._find_line_intersection(line1, line2)
                 if (
                     intersection
@@ -742,7 +821,7 @@ class EyeTracker:
                         break
                     angle_i = selected_lines[i][2]
                     angle_j = selected_lines[j][2]
-                    if abs(angle_i - angle_j) < angle_threshold:
+                    if self._angle_diff(angle_i, angle_j) < angle_threshold:
                         accept = False
                         break
                 if not accept:

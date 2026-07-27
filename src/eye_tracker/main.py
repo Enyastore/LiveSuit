@@ -8,10 +8,16 @@ multiprocessing.set_start_method("spawn", force=True)
 from eye_tracker import EyeTracker
 
 
-def _run_tracker(cam_index, flip, crop, side):
-    """独立进程中运行 EyeTracker（解决 OpenCV GUI 线程冲突）。"""
+def _run_tracker(cam_index, flip, crop, side, command_queue):
+    """独立进程中运行 EyeTracker（解决 OpenCV GUI 线程冲突）。
+    
+    Parameters
+    ----------
+    command_queue : multiprocessing.Queue
+        接收来自主进程的锁定/解锁命令。
+    """
     tracker = EyeTracker(cam_index=cam_index, flip=flip, crop=crop, side=side)
-    tracker.start_tracking()
+    tracker.start_tracking(command_queue=command_queue)
 
 
 '''初始化'''
@@ -46,6 +52,10 @@ class MainWindow:
         self.window = tk.Tk()
         self.window.title("主窗口")
 
+        # ---- 命令队列（用于与追踪子进程通信） ----
+        self.cmd_queue_left = None
+        self.cmd_queue_right = None
+
         cameras = available_camera_index
         self.read_config()
 
@@ -77,10 +87,72 @@ class MainWindow:
         # --- 第三行：功能按钮 ---
         frame_action = tk.Frame(self.window)
         frame_action.pack(pady=(5, 10))
-
-        tk.Button(frame_action, text="选择双眼边界", command=self.func_b).pack(side=tk.LEFT, padx=10)
+        
         tk.Button(frame_action, text="开始眼球追踪", command=self.start_eye_tracking).pack(side=tk.LEFT, padx=10)
+        tk.Button(frame_action, text="锁定控制面板", command=self.open_lock_control_panel).pack(side=tk.LEFT, padx=10)
         tk.Button(frame_action, text="保存配置", command=self.save_config).pack(side=tk.LEFT, padx=10)
+
+    def open_lock_control_panel(self):
+        """打开锁定控制面板 - 包含四个切换按钮用于锁定/解锁双眼半径和中心。"""
+        panel = tk.Toplevel(self.window)
+        panel.title("锁定控制面板")
+        panel.resizable(False, False)
+
+        # ---- 状态变量（每个 True=已锁定, False=已解锁） ----
+        var_left_radius = tk.BooleanVar(value=False)
+        var_right_radius = tk.BooleanVar(value=False)
+        var_left_center = tk.BooleanVar(value=False)
+        var_right_center = tk.BooleanVar(value=False)
+
+        def _make_toggle(queue, state_var, label_prefix):
+            """工厂函数：返回一个 toggle 回调，根据当前状态发送 lock/unlock 并切换按钮文字。"""
+            def toggle():
+                if queue is None:
+                    print(f"[{label_prefix}] 追踪尚未启动，无法发送命令")
+                    return
+                if state_var.get():
+                    # 当前已锁定 → 发送解锁
+                    if "半径" in label_prefix:
+                        queue.put_nowait("unlock_radius")
+                    else:
+                        queue.put_nowait("unlock_center")
+                    state_var.set(False)
+                else:
+                    # 当前已解锁 → 发送锁定
+                    if "半径" in label_prefix:
+                        queue.put_nowait("lock_radius")
+                    else:
+                        queue.put_nowait("lock_center")
+                    state_var.set(True)
+            return toggle
+
+        # 辅助：根据 state_var 动态更新按钮文字
+        def _make_button(parent, queue, state_var, label_prefix):
+            btn_text = tk.StringVar()
+            def update_text(*args):
+                locked = state_var.get()
+                if locked:
+                    btn_text.set(f"解锁{label_prefix}")
+                else:
+                    btn_text.set(f"锁定{label_prefix}")
+            state_var.trace_add("write", update_text)
+            update_text()  # 初始化
+            toggle_cmd = _make_toggle(queue, state_var, label_prefix)
+            return tk.Button(parent, textvariable=btn_text, command=toggle_cmd, width=18)
+
+        # ---- 布局 ----
+        tk.Label(panel, text="眼球追踪锁定控制", font=("", 12, "bold")).pack(pady=(10, 5))
+
+        tk.Label(panel, text="左眼").pack(anchor="w", padx=20, pady=(5, 0))
+        _make_button(panel, self.cmd_queue_left, var_left_radius, "左眼半径").pack(pady=2)
+        _make_button(panel, self.cmd_queue_left, var_left_center, "左眼中心").pack(pady=2)
+
+        tk.Label(panel, text="右眼").pack(anchor="w", padx=20, pady=(10, 0))
+        _make_button(panel, self.cmd_queue_right, var_right_radius, "右眼半径").pack(pady=2)
+        _make_button(panel, self.cmd_queue_right, var_right_center, "右眼中心").pack(pady=2)
+
+        # 底部关闭按钮
+        tk.Button(panel, text="关闭面板", command=panel.destroy).pack(pady=(10, 10))
 
     def setup_cam(self, side, index):
         """打开一个 Toplevel 窗口，使用 OpenCV 显示对应 index 相机的视频流"""
@@ -155,16 +227,40 @@ class MainWindow:
             start_y[0] = event.y
             crop_rect[0] = None  # 按下时清除旧矩形
 
+        TARGET_RATIO = 4.0 / 3.0
+
+        def _constrain_rect(x1, y1, x2, y2):
+            """根据鼠标起止点计算固定 4:3 比例的矩形。"""
+            dx = x2 - x1
+            dy = y2 - y1
+            if dx == 0 and dy == 0:
+                return None
+            # 以绝对值更大的轴为主导，锁定比例
+            if abs(dx) / max(abs(dy), 1) > TARGET_RATIO:
+                new_w = abs(dx)
+                new_h = int(new_w / TARGET_RATIO)
+                y2 = y1 + new_h if dy >= 0 else y1 - new_h
+                x2 = x1 + dx
+            else:
+                new_h = abs(dy)
+                new_w = int(new_h * TARGET_RATIO)
+                x2 = x1 + new_w if dx >= 0 else x1 - new_w
+                y2 = y1 + dy
+            # 规范化为 (x1, y1) = 左上, (x2, y2) = 右下
+            x1, x2 = min(x1, x2), max(x1, x2)
+            y1, y2 = min(y1, y2), max(y1, y2)
+            return [x1, y1, x2, y2]
+
         def on_drag(event):
             if not crop_mode[0] or not drawing[0]:
                 return
-            crop_rect[0] = [start_x[0], start_y[0], event.x, event.y]
+            crop_rect[0] = _constrain_rect(start_x[0], start_y[0], event.x, event.y)
 
         def on_release(event):
             if not crop_mode[0]:
                 return
             drawing[0] = False
-            crop_rect[0] = [start_x[0], start_y[0], event.x, event.y]
+            crop_rect[0] = _constrain_rect(start_x[0], start_y[0], event.x, event.y)
 
         video_label.bind("<ButtonPress-1>", on_press)
         video_label.bind("<B1-Motion>", on_drag)
@@ -204,16 +300,16 @@ class MainWindow:
         # 开始显示第一帧
         show_frame()
 
-    def func_b(self):
-        """选择边界 - 暂时留空"""
-        pass
-
     def start_eye_tracking(self):
         """开始眼球追踪 - 在新进程中启动双眼 EyeTracker"""
+        # 为每次启动创建新的命令队列
+        self.cmd_queue_left = multiprocessing.Queue()
+        self.cmd_queue_right = multiprocessing.Queue()
+
         # 左眼
         p_left = multiprocessing.Process(
             target=_run_tracker,
-            args=(left_cam_i, left_cam_flip, left_cam_crop, "left"),
+            args=(left_cam_i, left_cam_flip, left_cam_crop, "left", self.cmd_queue_left),
             daemon=True,
         )
         p_left.start()
@@ -221,7 +317,7 @@ class MainWindow:
         # 右眼
         p_right = multiprocessing.Process(
             target=_run_tracker,
-            args=(right_cam_i, right_cam_flip, right_cam_crop, "right"),
+            args=(right_cam_i, right_cam_flip, right_cam_crop, "right", self.cmd_queue_right),
             daemon=True,
         )
         p_right.start()

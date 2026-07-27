@@ -1,14 +1,14 @@
 left_cam_crop:
-- 327
-- 606
-- 227
-- 464
+- 324
+- 562
+- 138
+- 317
 left_cam_flip: true
-left_cam_i: 4
+left_cam_i: 0
 right_cam_crop:
-- 338
-- 579
-- 34
-- 278
-right_cam_flip: false
-right_cam_i: 0
+- 143
+- 410
+- 215
+- 415
+right_cam_flip: true
+right_cam_i: 2
