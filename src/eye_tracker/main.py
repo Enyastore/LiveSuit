@@ -10,6 +10,8 @@ from tkinter import ttk
 from PIL import Image, ImageTk
 import yaml
 import multiprocessing
+import threading
+import queue
 from dataclasses import dataclass, field
 from typing import Optional, List
 import logging
@@ -195,9 +197,11 @@ class MainWindow:
         self._lock_right_radius: bool = False
         self._lock_right_center: bool = False
         self._control_panel: Optional[tk.Toplevel] = None   # 控制面板引用
+        self._gaze_lock = threading.Lock()  # 保护 _latest_gaze 的线程锁
         self._latest_gaze: dict = {"left": None, "right": None}  # 最新注视向量缓存
         self.result_queue: Optional[multiprocessing.Queue] = None
-        self._poll_after_id: Optional[str] = None   # 轮询 after ID
+        self._consumer_stop_event: Optional[threading.Event] = None  # 消费者线程停止信号
+        self._consumer_thread: Optional[threading.Thread] = None  # 消费者线程引用
 
         # 构建界面
         self.window = tk.Tk()
@@ -538,8 +542,8 @@ class MainWindow:
         )
         self._process_right.start()
 
-        # 开始轮询结果队列
-        self._poll_result_queue()
+        # 启动独立消费者线程（实时读取 result_queue）
+        self._start_gaze_consumer()
 
         logger.info("双眼眼球追踪已启动")
 
@@ -558,10 +562,8 @@ class MainWindow:
         self._process_right = None
         self.cmd_queue_left = None
         self.cmd_queue_right = None
-        # 停止轮询并清理结果缓存
-        if self._poll_after_id is not None:
-            self.window.after_cancel(self._poll_after_id)
-            self._poll_after_id = None
+        # 停止消费者线程并清理结果缓存
+        self._stop_gaze_consumer()
         self.result_queue = None
         self._latest_gaze = {"left": None, "right": None}
         # 自动关闭控制面板
@@ -573,21 +575,48 @@ class MainWindow:
             self._control_panel = None
         logger.info("眼球追踪已停止")
 
-    def _poll_result_queue(self) -> None:
-        """定时从 result_queue 中拉取最新注视向量，存入 _latest_gaze 缓存。"""
-        if self.result_queue is None:
+    # ----------------------------------------------------------
+    # 注视向量消费者线程
+    # ----------------------------------------------------------
+
+    def _start_gaze_consumer(self) -> None:
+        """启动守护线程，以最短延迟消费 result_queue 中的注视向量。"""
+        if self._consumer_thread is not None and self._consumer_thread.is_alive():
             return
-        try:
-            while not self.result_queue.empty():
-                data = self.result_queue.get_nowait()
-                side = data.get("side")
-                gaze = data.get("gaze_rotated")
-                if side in self._latest_gaze:
-                    self._latest_gaze[side] = gaze
-        except Exception:
-            pass
-        # 每 100ms 轮询一次
-        self._poll_after_id = self.window.after(100, self._poll_result_queue)
+        self._consumer_stop_event = threading.Event()
+        self._consumer_thread = threading.Thread(
+            target=self._gaze_consumer_loop, daemon=True
+        )
+        self._consumer_thread.start()
+        logger.info("注视向量消费者线程已启动")
+
+    def _stop_gaze_consumer(self) -> None:
+        """停止消费者线程。"""
+        if self._consumer_stop_event is not None:
+            self._consumer_stop_event.set()
+        if self._consumer_thread is not None:
+            self._consumer_thread.join(timeout=2)
+            if self._consumer_thread.is_alive():
+                logger.warning("消费者线程未能及时终止")
+            self._consumer_thread = None
+        self._consumer_stop_event = None
+
+    def _gaze_consumer_loop(self) -> None:
+        """守护线程主循环：约 1ms 轮询一次队列，写入 _latest_gaze 缓存。"""
+        while not self._consumer_stop_event.is_set():
+            try:
+                while True:
+                    data = self.result_queue.get_nowait()
+                    side = data.get("side")
+                    gaze = data.get("gaze_rotated")
+                    if side and gaze is not None:
+                        with self._gaze_lock:
+                            self._latest_gaze[side] = gaze
+            except queue.Empty:
+                pass
+            except Exception:
+                pass
+            self._consumer_stop_event.wait(0.001)  # 1ms 轮询，接近零延迟
 
     # ----------------------------------------------------------
     # 控制面板
