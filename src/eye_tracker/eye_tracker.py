@@ -384,6 +384,7 @@ class EyeTracker:
         center_3d, direction = self._compute_gaze_vector(
             center_x, center_y,
             model_center_average[0], model_center_average[1],
+            best_ratio_under_ellipse,
         )
 
         if center_3d is not None and direction is not None:
@@ -410,7 +411,7 @@ class EyeTracker:
 
     # ==================== 视线向量计算与文件输出 ====================
 
-    def _compute_gaze_vector(self, x, y, center_x, center_y):
+    def _compute_gaze_vector(self, x, y, center_x, center_y, confidence_ratio=0.0):
         """根据瞳孔屏幕坐标和眼球中心计算 3D 视线方向，并写入文件。"""
         viewport_width = self.frame_width
         viewport_height = self.frame_height
@@ -504,7 +505,10 @@ class EyeTracker:
             gaze_rotated = rotation_matrix @ gaze_local
             gaze_rotated /= np.linalg.norm(gaze_rotated)
 
-        # ---- 写入文件 ----
+        # ---- 写入文件（仅当置信度高于 75% 时写入） ----
+        if confidence_ratio < 0.75:
+            return sphere_center, gaze_rotated
+
         file_path = f"gaze_vector_{self.side}.txt"
 
         def is_file_available(path):
