@@ -1,11 +1,33 @@
+"""GazeVectorTracker：封装瞳孔检测与注视方向计算。
+
+在 EyeTracker 基础上增加了 headless 模式支持，可在无 X11 显示
+服务器的生产环境中运行。核心算法与原版完全一致。
+
+Headless 模式下：
+  - 不创建任何 OpenCV GUI 窗口
+  - 不调用 cv2.imshow / cv2.namedWindow / cv2.getWindowProperty
+  - 主循环退出仅依赖 self.running 标志和连续帧失败计数
+  - 注视向量通过 result_queue 实时回传
+
+文件写入（gaze_vector_*.txt）已移除，由上层 Normalizer / GazeConsumer
+统一管理归一化与数据管道。
+"""
+
 import cv2
 import random
 import math
+import time
 import numpy as np
 
 
-class EyeTracker:
-    """眼球追踪类：封装瞳孔检测与视线方向计算，实时输出gaze_ray到txt文件。"""
+class GazeVectorTracker:
+    """眼球追踪类：瞳孔检测 → 视线方向计算 → 实时输出 gaze_rotated 向量。
+
+    设计目标：
+      - 可 headless 运行（无 X11 环境）
+      - 算法逻辑与原 EyeTracker 完全一致
+      - 默认通过 result_queue 回传数据，不写文件
+    """
 
     def __init__(self, cam_index=0, flip=False, crop=None, side="left"):
         """
@@ -18,7 +40,7 @@ class EyeTracker:
         crop : list | None
             剪裁区域 [x1, x2, y1, y2]，None 则默认 [0, 640, 0, 480]。
         side : str
-            标识 "left" 或 "right"，影响输出文件名。
+            标识 "left" 或 "right"。
         """
         self.cam_index = cam_index
         self.flip = flip
@@ -29,23 +51,23 @@ class EyeTracker:
         self.frame_width = 640
         self.frame_height = 480
 
-        # ---- 追踪状态变量（原全局变量） ----
-        self.ray_lines = []                         # 近期瞳孔椭圆射线
-        self.model_centers = []                     # 近期估计的眼球中心
-        self.min_model_centers = 30                 # 最少眼球中心数量
-        self.max_rays = 100                         # 最多存储的射线数
+        # ---- 追踪状态变量 ----
+        self.ray_lines: list = []                      # 近期瞳孔椭圆射线
+        self.model_centers: list = []                  # 近期估计的眼球中心
+        self.min_model_centers = 30                    # 最少眼球中心数量
+        self.max_rays = 100                            # 最多存储的射线数
         self.prev_model_center_avg = (
             self.frame_width // 2,
             self.frame_height // 2,
-        )                                           # 上一个有效眼球中心
-        self.max_observed_distance = 0              # 自适应眼球半径
-        self.last_sphere_radius_ellipse = None      # 上一个用于扩展半径的椭圆
-        self.pupil_confidence_threshold = 0.85      # 存储射线的最低置信度
+        )                                              # 上一个有效眼球中心
+        self.max_observed_distance = 0                 # 自适应眼球半径
+        self.last_sphere_radius_ellipse = None         # 上一个用于扩展半径的椭圆
+        self.pupil_confidence_threshold = 0.85         # 存储射线的最低置信度
         self.pupil_confidence_threshold_sphere = 0.65  # 更新眼球半径的最低置信度
-        self.intersection_ray_count = 4             # 每次交集估计采样的射线数
-        self.minimum_intersection_angle_degrees = 8 # 采样射线间最小角度
-        self.last_tracking_result = None            # 最新追踪结果
-        self.stored_intersections = []              # 历史交集点
+        self.intersection_ray_count = 4                # 每次交集估计采样的射线数
+        self.minimum_intersection_angle_degrees = 8    # 采样射线间最小角度
+        self.last_tracking_result = None               # 最新追踪结果
+        self.stored_intersections: list = []           # 历史交集点
 
         # ---- 锁定状态 ----
         self.sphere_radius_locked = False
@@ -56,6 +78,8 @@ class EyeTracker:
         # ---- 运行状态 ----
         self.cap = None
         self.running = False
+        self._headless = False           # 是否跳过所有 GUI 调用
+        self.result_queue = None
 
     # ==================== 锁定函数 ====================
 
@@ -89,9 +113,14 @@ class EyeTracker:
 
     # ==================== 核心处理流程 ====================
 
-    def start_tracking(self, command_queue=None, result_queue=None):
-        """打开摄像机并进入主循环（阻塞）。关闭窗口可退出。
-        
+    def start_tracking(
+        self,
+        command_queue=None,
+        result_queue=None,
+        headless: bool = False,
+    ):
+        """打开摄像机并进入主循环（阻塞）。
+
         Parameters
         ----------
         command_queue : multiprocessing.Queue | None
@@ -100,7 +129,10 @@ class EyeTracker:
         result_queue : multiprocessing.Queue | None
             回传最新 gaze_rotated 向量的队列。
             每帧置信度达标时将 {'side': str, 'gaze_rotated': [x,y,z]} 放入队列。
+        headless : bool
+            True 时跳过所有 OpenCV GUI 操作，可在无 X11 环境中运行。
         """
+        self._headless = headless
         self._reset_tracking_state()
 
         # 优先使用 V4L2 后端（Linux），失败则回退默认
@@ -115,15 +147,18 @@ class EyeTracker:
 
         self.cap.set(cv2.CAP_PROP_FPS, 30)
         self.running = True
-        print(f"眼球追踪已启动 (cam={self.cam_index}, side={self.side})")
+        print(f"眼球追踪已启动 (cam={self.cam_index}, side={self.side}, "
+              f"headless={self._headless})")
 
         self.result_queue = result_queue
 
+        # ---- GUI 模式：创建调试窗口 ----
         win_name = f"Eye Tracker - {self.side.upper()} Eye"
-        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-        cv2.waitKey(1)  # 触发窗口系统初始化
+        if not self._headless:
+            cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+            cv2.waitKey(1)  # 触发窗口系统初始化
 
-        frame_fail_count = 0  # 连续失败计数
+        frame_fail_count = 0
         max_fail = 10
 
         while self.running:
@@ -149,7 +184,10 @@ class EyeTracker:
                 if frame_fail_count >= max_fail:
                     print(f"警告：连续 {max_fail} 次无法读取帧，退出")
                     break
-                cv2.waitKey(50)  # 等待后重试
+                if self._headless:
+                    time.sleep(0.05)  # 等待后重试
+                else:
+                    cv2.waitKey(50)
                 continue
             frame_fail_count = 0  # 成功读取，重置计数
 
@@ -167,16 +205,17 @@ class EyeTracker:
             # ---- 核心处理 ----
             self._process_frame(frame)
 
-            # ---- GUI 事件泵 ----
-            key = cv2.waitKey(1) & 0xFF
-            if key == 27 or key == ord('q'):
-                print("按下退出键，停止追踪。")
-                break
-            try:
-                if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
+            # ---- 退出检测 ----
+            if not self._headless:
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27 or key == ord('q'):
+                    print("按下退出键，停止追踪。")
                     break
-            except cv2.error:
-                break
+                try:
+                    if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
+                        break
+                except cv2.error:
+                    break
 
         self._cleanup()
 
@@ -186,12 +225,13 @@ class EyeTracker:
         self._cleanup()
 
     def _cleanup(self):
-        """释放摄像头并销毁窗口。"""
+        """释放摄像头并（仅非 headless 时）销毁窗口。"""
         self.running = False
         if self.cap is not None:
             self.cap.release()
             self.cap = None
-        cv2.destroyAllWindows()
+        if not self._headless:
+            cv2.destroyAllWindows()
 
     def get_last_tracking_result(self):
         """返回最近一次的追踪结果字典。"""
@@ -210,14 +250,26 @@ class EyeTracker:
         darkest_pixel_value = gray_frame[darkest_point[1], darkest_point[0]]
 
         # 三种阈值强度
-        thresholded_strict = self._apply_binary_threshold(gray_frame, darkest_pixel_value, 5)
-        thresholded_strict = self._mask_outside_square(thresholded_strict, darkest_point, 250)
+        thresholded_strict = self._apply_binary_threshold(
+            gray_frame, darkest_pixel_value, 5
+        )
+        thresholded_strict = self._mask_outside_square(
+            thresholded_strict, darkest_point, 250
+        )
 
-        thresholded_medium = self._apply_binary_threshold(gray_frame, darkest_pixel_value, 15)
-        thresholded_medium = self._mask_outside_square(thresholded_medium, darkest_point, 250)
+        thresholded_medium = self._apply_binary_threshold(
+            gray_frame, darkest_pixel_value, 15
+        )
+        thresholded_medium = self._mask_outside_square(
+            thresholded_medium, darkest_point, 250
+        )
 
-        thresholded_relaxed = self._apply_binary_threshold(gray_frame, darkest_pixel_value, 25)
-        thresholded_relaxed = self._mask_outside_square(thresholded_relaxed, darkest_point, 250)
+        thresholded_relaxed = self._apply_binary_threshold(
+            gray_frame, darkest_pixel_value, 25
+        )
+        thresholded_relaxed = self._mask_outside_square(
+            thresholded_relaxed, darkest_point, 250
+        )
 
         self._process_frames(
             thresholded_strict,
@@ -247,8 +299,12 @@ class EyeTracker:
 
         for i in range(3):
             dilated = cv2.dilate(image_array[i], kernel, iterations=2)
-            contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            reduced = self._filter_contours_by_area_and_return_largest(contours, 1000, 3)
+            contours, _ = cv2.findContours(
+                dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            reduced = self._filter_contours_by_area_and_return_largest(
+                contours, 1000, 3
+            )
 
             if len(reduced) > 0 and len(reduced[0]) > 5:
                 current_goodness = self._check_ellipse_goodness(dilated, reduced[0])
@@ -349,7 +405,36 @@ class EyeTracker:
             "sphere_radius": float(self.max_observed_distance),
         }
 
-        # ============ 绘制 ============
+        # 计算并输出视线向量（始终通过 queue 回传）
+        center_3d, gaze_rotated = self._compute_gaze_vector(
+            center_x, center_y,
+            model_center_average[0], model_center_average[1],
+            best_ratio_under_ellipse,
+        )
+
+        # ============ 绘制（仅非 headless 模式） ============
+        if not self._headless:
+            self._draw_debug_overlay(
+                frame,
+                model_center_average,
+                final_rotated_rect,
+                center_x, center_y,
+                center_3d, gaze_rotated,
+                best_ratio_under_ellipse,
+            )
+
+    # ==================== 调试绘制 ====================
+
+    def _draw_debug_overlay(
+        self,
+        frame,
+        model_center_average,
+        final_rotated_rect,
+        center_x, center_y,
+        center_3d, gaze_rotated,
+        best_ratio_under_ellipse,
+    ):
+        """在帧上绘制所有调试信息（仅在非 headless 模式下调用）。"""
         cv2.circle(
             frame,
             model_center_average,
@@ -385,39 +470,62 @@ class EyeTracker:
                 3,
             )
 
-        # 计算并显示视线向量
-        center_3d, direction = self._compute_gaze_vector(
-            center_x, center_y,
-            model_center_average[0], model_center_average[1],
-            best_ratio_under_ellipse,
-        )
-
-        if center_3d is not None and direction is not None:
-            origin_text = f"Origin: ({center_3d[0]:.2f}, {center_3d[1]:.2f}, {center_3d[2]:.2f})"
-            dir_text = f"Direction: ({direction[0]:.2f}, {direction[1]:.2f}, {direction[2]:.2f})"
+        # 视线向量文本
+        if center_3d is not None and gaze_rotated is not None:
+            origin_text = (
+                f"Origin: ({center_3d[0]:.2f}, "
+                f"{center_3d[1]:.2f}, {center_3d[2]:.2f})"
+            )
+            dir_text = (
+                f"Direction: ({gaze_rotated[0]:.2f}, "
+                f"{gaze_rotated[1]:.2f}, {gaze_rotated[2]:.2f})"
+            )
 
             text_origin_shadow = (12, frame.shape[0] - 38)
             text_dir_shadow = (12, frame.shape[0] - 13)
             text_origin = (10, frame.shape[0] - 40)
             text_dir = (10, frame.shape[0] - 15)
 
-            cv2.putText(frame, origin_text, text_origin_shadow, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-            cv2.putText(frame, dir_text, text_dir_shadow, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-            cv2.putText(frame, origin_text, text_origin, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            cv2.putText(frame, dir_text, text_dir, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            cv2.putText(
+                frame, origin_text, text_origin_shadow,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3,
+            )
+            cv2.putText(
+                frame, dir_text, text_dir_shadow,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3,
+            )
+            cv2.putText(
+                frame, origin_text, text_origin,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2,
+            )
+            cv2.putText(
+                frame, dir_text, text_dir,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2,
+            )
 
         # 置信度
         ratio_text = f"{best_ratio_under_ellipse * 100:.2f}%"
-        cv2.putText(frame, ratio_text, (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
-        cv2.putText(frame, ratio_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(
+            frame, ratio_text, (12, 32),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4,
+        )
+        cv2.putText(
+            frame, ratio_text, (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
+        )
 
         # 最终结果窗口
         cv2.imshow(f"Eye Tracker - {self.side.upper()} Eye", frame)
 
-    # ==================== 视线向量计算与文件输出 ====================
+    # ==================== 视线向量计算 ====================
 
-    def _compute_gaze_vector(self, x, y, center_x, center_y, confidence_ratio=0.0):
-        """根据瞳孔屏幕坐标和眼球中心计算 3D 视线方向，并写入文件。"""
+    def _compute_gaze_vector(
+        self, x, y, center_x, center_y, confidence_ratio=0.0
+    ):
+        """根据瞳孔屏幕坐标和眼球中心计算 3D 视线方向。
+
+        结果通过 result_queue 回传（若有），不再写入文件。
+        """
         viewport_width = self.frame_width
         viewport_height = self.frame_height
 
@@ -501,46 +609,31 @@ class EyeTracker:
             x_a, y_a, z_a = rotation_axis
 
             rotation_matrix = np.array([
-                [t_rot * x_a * x_a + c_rot, t_rot * x_a * y_a - s_rot * z_a, t_rot * x_a * z_a + s_rot * y_a],
-                [t_rot * x_a * y_a + s_rot * z_a, t_rot * y_a * y_a + c_rot, t_rot * y_a * z_a - s_rot * x_a],
-                [t_rot * x_a * z_a - s_rot * y_a, t_rot * y_a * z_a + s_rot * x_a, t_rot * z_a * z_a + c_rot],
+                [t_rot * x_a * x_a + c_rot,
+                 t_rot * x_a * y_a - s_rot * z_a,
+                 t_rot * x_a * z_a + s_rot * y_a],
+                [t_rot * x_a * y_a + s_rot * z_a,
+                 t_rot * y_a * y_a + c_rot,
+                 t_rot * y_a * z_a - s_rot * x_a],
+                [t_rot * x_a * z_a - s_rot * y_a,
+                 t_rot * y_a * z_a + s_rot * x_a,
+                 t_rot * z_a * z_a + c_rot],
             ])
 
             gaze_local = np.array([0.0, 0.0, inner_radius])
             gaze_rotated = rotation_matrix @ gaze_local
             gaze_rotated /= np.linalg.norm(gaze_rotated)
 
-        # ---- 回传至主进程（始终发送，供控制面板使用） ----
+        # ---- 回传至主进程（主要数据通道） ----
         if self.result_queue is not None:
             try:
                 self.result_queue.put_nowait({
                     "side": self.side,
                     "gaze_rotated": [float(v) for v in gaze_rotated],
+                    "confidence": confidence_ratio,
                 })
             except Exception:
                 pass
-
-        # ---- 写入文件（仅当置信度高于 75% 时写入） ----
-        if confidence_ratio >= 0.75:
-            file_path = f"gaze_vector_{self.side}.txt"
-
-            def is_file_available(path):
-                try:
-                    with open(path, "a"):
-                        return True
-                except IOError:
-                    return False
-
-            if is_file_available(file_path):
-                try:
-                    with open(file_path, "w") as f:
-                        all_values = np.concatenate((sphere_center, gaze_rotated))
-                        csv_line = ",".join(f"{v:.6f}" for v in all_values)
-                        f.write(csv_line + "\n")
-                except Exception as e:
-                    print("Write error:", e)
-            else:
-                print("File is currently in use. Skipping write.")
 
         return sphere_center, gaze_rotated
 
@@ -566,7 +659,9 @@ class EyeTracker:
         darkest_point = None
 
         for y in range(ignore_bounds, gray.shape[0] - ignore_bounds, image_skip_size):
-            for x in range(ignore_bounds, gray.shape[1] - ignore_bounds, image_skip_size):
+            for x in range(
+                ignore_bounds, gray.shape[1] - ignore_bounds, image_skip_size
+            ):
                 current_sum = 0
                 num_pixels = 0
                 for dy in range(0, search_area, internal_skip_size):
@@ -600,7 +695,9 @@ class EyeTracker:
     # ==================== 轮廓处理 ====================
 
     @staticmethod
-    def _filter_contours_by_area_and_return_largest(contours, pixel_thresh, ratio_thresh):
+    def _filter_contours_by_area_and_return_largest(
+        contours, pixel_thresh, ratio_thresh
+    ):
         """返回面积≥pixel_thresh且长宽比≤ratio_thresh的最大轮廓。"""
         max_area = 0
         largest_contour = None
@@ -630,14 +727,21 @@ class EyeTracker:
 
         for i in range(len(all_contours)):
             current_point = all_contours[i]
-            prev_point = all_contours[i - spacing] if i - spacing >= 0 else all_contours[-spacing]
-            next_point = all_contours[i + spacing] if i + spacing < len(all_contours) else all_contours[spacing]
+            prev_point = (
+                all_contours[i - spacing]
+                if i - spacing >= 0
+                else all_contours[-spacing]
+            )
+            next_point = (
+                all_contours[i + spacing]
+                if i + spacing < len(all_contours)
+                else all_contours[spacing]
+            )
 
             vec1 = prev_point - current_point
             vec2 = next_point - current_point
             vec_to_centroid = centroid - current_point
 
-            # 归一化所有向量，使点积仅反映方向相似度
             n1 = np.linalg.norm(vec_to_centroid)
             n2 = np.linalg.norm(vec1 + vec2)
             if n1 < 1e-6 or n2 < 1e-6:
@@ -670,7 +774,9 @@ class EyeTracker:
         covered_pixels = np.sum((binary_image == 255) & (mask == 255))
         goodness = [0, 0, 0]
         goodness[0] = covered_pixels / ellipse_area
-        goodness[2] = min(ellipse[1][1] / ellipse[1][0], ellipse[1][0] / ellipse[1][1])
+        goodness[2] = min(
+            ellipse[1][1] / ellipse[1][0], ellipse[1][0] / ellipse[1][1]
+        )
 
         return goodness
 
@@ -734,7 +840,9 @@ class EyeTracker:
 
         return center_distance + edge_offset
 
-    def _update_eye_sphere_radius(self, eye_center, current_pupil_ellipse, current_pupil_confidence):
+    def _update_eye_sphere_radius(
+        self, eye_center, current_pupil_ellipse, current_pupil_confidence
+    ):
         """自适应更新眼球半径（如果未锁定）。"""
         if self.sphere_radius_locked:
             self.max_observed_distance = self.locked_sphere_radius
@@ -799,7 +907,9 @@ class EyeTracker:
 
         return (int(intersection_x), int(intersection_y))
 
-    def _compute_average_intersection(self, frame, ray_lines, number_lines, total_lines, minimum_angle_degrees):
+    def _compute_average_intersection(
+        self, frame, ray_lines, number_lines, total_lines, minimum_angle_degrees
+    ):
         """从射线中采样、求交集，并返回滑动平均后的交点。"""
         pixel_limit = 30
         angle_threshold = 5
