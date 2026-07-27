@@ -89,7 +89,7 @@ class EyeTracker:
 
     # ==================== 核心处理流程 ====================
 
-    def start_tracking(self, command_queue=None):
+    def start_tracking(self, command_queue=None, result_queue=None):
         """打开摄像机并进入主循环（阻塞）。关闭窗口可退出。
         
         Parameters
@@ -97,6 +97,9 @@ class EyeTracker:
         command_queue : multiprocessing.Queue | None
             接收来自主进程的锁定/解锁命令队列。
             支持的命令: 'lock_radius', 'unlock_radius', 'lock_center', 'unlock_center'
+        result_queue : multiprocessing.Queue | None
+            回传最新 gaze_rotated 向量的队列。
+            每帧置信度达标时将 {'side': str, 'gaze_rotated': [x,y,z]} 放入队列。
         """
         self._reset_tracking_state()
 
@@ -113,6 +116,8 @@ class EyeTracker:
         self.cap.set(cv2.CAP_PROP_FPS, 30)
         self.running = True
         print(f"眼球追踪已启动 (cam={self.cam_index}, side={self.side})")
+
+        self.result_queue = result_queue
 
         win_name = f"Eye Tracker - {self.side.upper()} Eye"
         cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
@@ -505,29 +510,37 @@ class EyeTracker:
             gaze_rotated = rotation_matrix @ gaze_local
             gaze_rotated /= np.linalg.norm(gaze_rotated)
 
+        # ---- 回传至主进程（始终发送，供控制面板使用） ----
+        if self.result_queue is not None:
+            try:
+                self.result_queue.put_nowait({
+                    "side": self.side,
+                    "gaze_rotated": [float(v) for v in gaze_rotated],
+                })
+            except Exception:
+                pass
+
         # ---- 写入文件（仅当置信度高于 75% 时写入） ----
-        if confidence_ratio < 0.75:
-            return sphere_center, gaze_rotated
+        if confidence_ratio >= 0.75:
+            file_path = f"gaze_vector_{self.side}.txt"
 
-        file_path = f"gaze_vector_{self.side}.txt"
+            def is_file_available(path):
+                try:
+                    with open(path, "a"):
+                        return True
+                except IOError:
+                    return False
 
-        def is_file_available(path):
-            try:
-                with open(path, "a"):
-                    return True
-            except IOError:
-                return False
-
-        if is_file_available(file_path):
-            try:
-                with open(file_path, "w") as f:
-                    all_values = np.concatenate((sphere_center, gaze_rotated))
-                    csv_line = ",".join(f"{v:.6f}" for v in all_values)
-                    f.write(csv_line + "\n")
-            except Exception as e:
-                print("Write error:", e)
-        else:
-            print("File is currently in use. Skipping write.")
+            if is_file_available(file_path):
+                try:
+                    with open(file_path, "w") as f:
+                        all_values = np.concatenate((sphere_center, gaze_rotated))
+                        csv_line = ",".join(f"{v:.6f}" for v in all_values)
+                        f.write(csv_line + "\n")
+                except Exception as e:
+                    print("Write error:", e)
+            else:
+                print("File is currently in use. Skipping write.")
 
         return sphere_center, gaze_rotated
 

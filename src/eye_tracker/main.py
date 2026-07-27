@@ -143,7 +143,8 @@ def _run_tracker(
     flip: bool,
     crop: List[int],
     side: str,
-    command_queue: multiprocessing.Queue
+    command_queue: multiprocessing.Queue,
+    result_queue: multiprocessing.Queue
 ) -> None:
     """在独立进程中运行 EyeTracker（解决 OpenCV GUI 线程冲突）。
 
@@ -151,9 +152,11 @@ def _run_tracker(
     ----------
     command_queue : multiprocessing.Queue
         接收来自主进程的锁定/解锁命令。
+    result_queue : multiprocessing.Queue
+        回传最新 gaze_rotated 向量的队列。
     """
     tracker = EyeTracker(cam_index=cam_index, flip=flip, crop=crop, side=side)
-    tracker.start_tracking(command_queue=command_queue)
+    tracker.start_tracking(command_queue=command_queue, result_queue=result_queue)
 
 
 # ============================================================
@@ -191,6 +194,10 @@ class MainWindow:
         self._lock_left_center: bool = False
         self._lock_right_radius: bool = False
         self._lock_right_center: bool = False
+        self._control_panel: Optional[tk.Toplevel] = None   # 控制面板引用
+        self._latest_gaze: dict = {"left": None, "right": None}  # 最新注视向量缓存
+        self.result_queue: Optional[multiprocessing.Queue] = None
+        self._poll_after_id: Optional[str] = None   # 轮询 after ID
 
         # 构建界面
         self.window = tk.Tk()
@@ -288,19 +295,19 @@ class MainWindow:
         tk.Button(frame_action, text="停止眼球追踪", command=self.stop_eye_tracking).pack(
             side=tk.LEFT, padx=10
         )
-        tk.Button(
-            frame_action, text="锁定控制面板", command=self.open_lock_control_panel
-        ).pack(side=tk.LEFT, padx=10)
         tk.Button(frame_action, text="保存配置", command=self._save_config).pack(
             side=tk.LEFT, padx=10
         )
 
     @staticmethod
     def _set_combobox_to_index(combo: ttk.Combobox, index: int) -> None:
-        """安全地将 Combobox 设置到指定索引，索引不存在则设为 0。"""
+        """安全地将 Combobox 设置到指定索引，索引不存在则设为 0。
+
+        ttk.Combobox 内部将值存储为字符串，因此需要用 str(index) 匹配。
+        """
         values = combo['values']
         try:
-            pos = values.index(index)
+            pos = values.index(str(index))
             combo.current(pos)
         except (ValueError, tk.TclError):
             if values:
@@ -490,9 +497,10 @@ class MainWindow:
         # 从 UI 同步配置
         self._sync_config_from_ui()
 
-        # 创建命令队列
+        # 创建命令队列与结果队列
         self.cmd_queue_left = multiprocessing.Queue()
         self.cmd_queue_right = multiprocessing.Queue()
+        self.result_queue = multiprocessing.Queue()
 
         # 重置锁定状态
         self._lock_left_radius = False
@@ -509,6 +517,7 @@ class MainWindow:
                 self.config.left.crop,
                 "left",
                 self.cmd_queue_left,
+                self.result_queue,
             ),
             daemon=True,
         )
@@ -523,12 +532,19 @@ class MainWindow:
                 self.config.right.crop,
                 "right",
                 self.cmd_queue_right,
+                self.result_queue,
             ),
             daemon=True,
         )
         self._process_right.start()
 
+        # 开始轮询结果队列
+        self._poll_result_queue()
+
         logger.info("双眼眼球追踪已启动")
+
+        # 自动打开控制面板
+        self._open_control_panel()
 
     def stop_eye_tracking(self) -> None:
         """停止眼球追踪，终止子进程并清理队列。"""
@@ -542,16 +558,52 @@ class MainWindow:
         self._process_right = None
         self.cmd_queue_left = None
         self.cmd_queue_right = None
+        # 停止轮询并清理结果缓存
+        if self._poll_after_id is not None:
+            self.window.after_cancel(self._poll_after_id)
+            self._poll_after_id = None
+        self.result_queue = None
+        self._latest_gaze = {"left": None, "right": None}
+        # 自动关闭控制面板
+        if self._control_panel is not None:
+            try:
+                self._control_panel.destroy()
+            except tk.TclError:
+                pass
+            self._control_panel = None
         logger.info("眼球追踪已停止")
 
+    def _poll_result_queue(self) -> None:
+        """定时从 result_queue 中拉取最新注视向量，存入 _latest_gaze 缓存。"""
+        if self.result_queue is None:
+            return
+        try:
+            while not self.result_queue.empty():
+                data = self.result_queue.get_nowait()
+                side = data.get("side")
+                gaze = data.get("gaze_rotated")
+                if side in self._latest_gaze:
+                    self._latest_gaze[side] = gaze
+        except Exception:
+            pass
+        # 每 100ms 轮询一次
+        self._poll_after_id = self.window.after(100, self._poll_result_queue)
+
     # ----------------------------------------------------------
-    # 锁定控制面板
+    # 控制面板
     # ----------------------------------------------------------
 
-    def open_lock_control_panel(self) -> None:
-        """打开锁定控制面板，可独立锁定/解锁双眼的半径和中心参数。"""
+    def _open_control_panel(self) -> None:
+        """打开控制面板，提供锁定/解锁等轨迹控制功能。"""
+        # 若已有面板打开，先销毁
+        if self._control_panel is not None:
+            try:
+                self._control_panel.destroy()
+            except tk.TclError:
+                pass
         panel = tk.Toplevel(self.window)
-        panel.title("锁定控制面板")
+        self._control_panel = panel
+        panel.title("控制面板")
         panel.resizable(False, False)
 
         # 状态变量（初始值从实例跟踪状态读取）
@@ -615,7 +667,7 @@ class MainWindow:
             return btn
 
         # 布局
-        tk.Label(panel, text="眼球追踪锁定控制", font=("", 12, "bold")).pack(
+        tk.Label(panel, text="眼球追踪控制面板", font=("", 12, "bold")).pack(
             pady=(10, 5)
         )
 
@@ -635,7 +687,57 @@ class MainWindow:
             panel, self.cmd_queue_right, var_right_center, "右眼中心", "_lock_right_center"
         ).pack(pady=2)
 
-        tk.Button(panel, text="关闭面板", command=panel.destroy).pack(pady=(10, 10))
+        # --- 极限注视向量保存 ---
+        def _read_current_vector(side: str) -> Optional[List[float]]:
+            """从子进程回传的缓存中获取最新 gaze_rotated 向量。"""
+            return self._latest_gaze.get(side)
+
+        def _save_extreme_vector(side: str, direction: str) -> None:
+            """保存当前侧的方向向量到 extream_vectors.yaml。"""
+            vector = _read_current_vector(side)
+            if vector is None:
+                logger.warning(f"未能获取 {side} 眼当前向量，跳过保存")
+                return
+            key = f"{side}_{direction}"   # e.g. "left_up"
+            yaml_file = "extream_vectors.yaml"
+            try:
+                with open(yaml_file, 'r', encoding='utf-8') as f:
+                    data = yaml.safe_load(f) or {}
+            except FileNotFoundError:
+                data = {}
+            data[key] = vector
+            try:
+                with open(yaml_file, 'w', encoding='utf-8') as f:
+                    yaml.dump(data, f, allow_unicode=True)
+                logger.info(f"已保存 {key}: {vector}")
+            except Exception as e:
+                logger.error(f"保存 {key} 失败: {e}")
+
+        tk.Label(panel, text="极限注视向量", font=("", 10, "bold")).pack(pady=(10, 5))
+        directions = [
+            ("仰视", "up"),
+            ("俯视", "down"),
+            ("内眼角", "inner"),
+            ("外眼角", "outer"),
+        ]
+        for eye_side in ("left", "right"):
+            eye_label = "左眼" if eye_side == "left" else "右眼"
+            tk.Label(panel, text=eye_label).pack(anchor="w", padx=20, pady=(5, 0))
+            for label, dir_key in directions:
+                btn = tk.Button(
+                    panel,
+                    text=f"保存{eye_label}{label}向量",
+                    command=lambda s=eye_side, d=dir_key: _save_extreme_vector(s, d),
+                    width=22,
+                )
+                btn.pack(pady=1)
+
+        def _on_panel_close() -> None:
+            panel.destroy()
+            self._control_panel = None
+
+        panel.protocol("WM_DELETE_WINDOW", _on_panel_close)
+        tk.Button(panel, text="关闭面板", command=_on_panel_close).pack(pady=(10, 10))
 
     # ----------------------------------------------------------
     # 生命周期
