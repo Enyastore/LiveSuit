@@ -70,6 +70,18 @@ class Normalizer:
         except Exception as e:
             logger.error(f"保存极值向量失败: {e}")
 
+    def clear_extremes(self, side: str) -> None:
+        """清除指定眼（left/right）的所有极值向量，并从 YAML 文件中移除。"""
+        keys_to_remove = [k for k in self._extremes if k.startswith(f"{side}_")]
+        for k in keys_to_remove:
+            del self._extremes[k]
+        try:
+            with open(self._extreme_file, 'w', encoding='utf-8') as f:
+                yaml.dump(self._extremes, f, allow_unicode=True)
+            logger.info("已清除 %s 眼 %d 个极值向量", side, len(keys_to_remove))
+        except Exception as e:
+            logger.error(f"保存清除后的极值向量文件失败: {e}")
+        # 也清除受影响的侧键以便 reload 能获取最新状态
     def normalize(self, side: str, gaze_rotated: List[float]) -> Dict[str, Optional[float]]:
         result = {"eye_x": None, "eye_y": None, "missing": []}
         if not gaze_rotated or len(gaze_rotated) != 3:
@@ -303,6 +315,8 @@ class GazeVectorTracker:
                             self._switch_headless_off()
                         elif cmd == "reload_extremes":
                             self._normalizer.reload()
+                        elif cmd == "clear_extremes":
+                            self._normalizer.clear_extremes(self.side)
                         elif isinstance(cmd, tuple) and cmd[0] == "save_extreme":
                             direction, vector = cmd[1], cmd[2]
                             self._normalizer.set_extreme(self.side, direction, vector)

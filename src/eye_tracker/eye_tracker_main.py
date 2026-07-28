@@ -659,6 +659,23 @@ class ControlPanel:
                     width=22,
                 ).pack(pady=1)
 
+        # 清除极值向量按钮
+        tk.Label(self._window, text="清除极值向量", font=("", 10, "bold")).pack(pady=(10, 5))
+        btn_clear_left = tk.Button(
+            self._window,
+            text="清除左眼极值向量",
+            command=lambda: self._clear_extremes("left"),
+            width=22,
+        )
+        btn_clear_left.pack(pady=1)
+        btn_clear_right = tk.Button(
+            self._window,
+            text="清除右眼极值向量",
+            command=lambda: self._clear_extremes("right"),
+            width=22,
+        )
+        btn_clear_right.pack(pady=1)
+
         def _on_close():
             self._window.destroy()
             self._window = None
@@ -703,6 +720,18 @@ class ControlPanel:
                 logger.error(f"发送极值向量到子进程失败: {e}")
         else:
             logger.warning(f"[{side}] 追踪尚未启动，无法保存")
+
+    def _clear_extremes(self, side: str) -> None:
+        """清除指定眼（left/right）的所有极值向量。"""
+        q = self._cmd_queue_left if side == "left" else self._cmd_queue_right
+        if q is not None:
+            try:
+                q.put_nowait("clear_extremes")
+                logger.info(f"已发送清除 {side} 眼极值向量命令到子进程")
+            except Exception as e:
+                logger.error(f"发送清除极值向量命令到子进程失败: {e}")
+        else:
+            logger.warning(f"[{side}] 追踪尚未启动，无法清除极值向量")
 
     def destroy(self) -> None:
         if self._window is not None:
