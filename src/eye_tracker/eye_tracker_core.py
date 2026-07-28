@@ -1,73 +1,177 @@
-"""GazeVectorTracker：封装瞳孔检测与注视方向计算。
+"""眼球追踪核心算法模块。
 
-在 EyeTracker 基础上增加了 headless 模式支持，可在无 X11 显示
-服务器的生产环境中运行。核心算法与原版完全一致。
-
-Headless 模式下：
-  - 不创建任何 OpenCV GUI 窗口
-  - 不调用 cv2.imshow / cv2.namedWindow / cv2.getWindowProperty
-  - 主循环退出仅依赖 self.running 标志和连续帧失败计数
-  - 注视向量通过 result_queue 实时回传
-
-文件写入（gaze_vector_*.txt）已移除，由上层 Normalizer / GazeConsumer
-统一管理归一化与数据管道。
+职责分层：
+  1) Normalizer        — 归一化器（基于极值向量将 3D 注视向量映射到 [-1, 1]²）
+  2) GazeVectorTracker — 瞳孔检测 + 视线向量计算 + 归一化 + 调试绘制
 """
 
 import cv2
-import random
 import math
+import random
 import time
+import yaml
+import os
+import logging
 import numpy as np
+from typing import Optional, List, Dict, Tuple
+
+logger = logging.getLogger(__name__)
 
 
-class GazeVectorTracker:
-    """眼球追踪类：瞳孔检测 → 视线方向计算 → 实时输出 gaze_rotated 向量。
+# ============================================================
+# Normalizer：基于极值向量的正交投影归一化
+# ============================================================
 
-    设计目标：
-      - 可 headless 运行（无 X11 环境）
-      - 算法逻辑与原 EyeTracker 完全一致
-      - 默认通过 result_queue 回传数据，不写文件
+class Normalizer:
+    """将 3D 注视向量（gaze_rotated）映射为屏幕坐标 [-1, 1]² 的归一化器。
+
+    标定文件（extreme_vectors.yaml）需包含四个极值点：
+      {side}_inner, {side}_outer, {side}_up, {side}_down
+
+    无此文件时 normalize() 返回 eye_x / eye_y 均为 None，
+    下游调用者须自行降级处理。
     """
 
-    def __init__(self, cam_index=0, flip=False, crop=None, side="left"):
-        """
-        Parameters
-        ----------
-        cam_index : int
-            摄像机索引。
-        flip : bool
-            是否垂直翻转画面。
-        crop : list | None
-            剪裁区域 [x1, y1, x2, y2]，None 则默认 [0, 0, 640, 480]。
-        side : str
-            标识 "left" 或 "right"。
-        """
+    def __init__(self, extreme_file: str = "extreme_vectors.yaml"):
+        self._extreme_file = os.path.join(os.path.dirname(__file__), extreme_file)
+        self._extremes: Dict[str, List[float]] = {}
+        self._load_extremes()
+
+    def _load_extremes(self) -> None:
+        try:
+            with open(self._extreme_file, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f) or {}
+            self._extremes = {k: list(v) for k, v in data.items()}
+            logger.info("已加载 %d 个极值向量", len(self._extremes))
+        except FileNotFoundError:
+            self._extremes = {}
+            logger.info("极值向量文件不存在，归一化将返回 None")
+
+    def reload(self) -> None:
+        """重新加载极值文件。主进程保存新极值后调用此方法刷新缓存。"""
+        self._load_extremes()
+
+    def set_extreme(self, side: str, direction: str, vector: List[float]) -> None:
+        key = f"{side}_{direction}"
+        self._extremes[key] = vector
+        try:
+            with open(self._extreme_file, 'w', encoding='utf-8') as f:
+                yaml.dump(self._extremes, f, allow_unicode=True)
+        except Exception as e:
+            logger.error(f"保存极值向量失败: {e}")
+
+    def normalize(self, side: str, gaze_rotated: List[float]) -> Dict[str, Optional[float]]:
+        result = {"eye_x": None, "eye_y": None, "missing": []}
+        if not gaze_rotated or len(gaze_rotated) != 3:
+            return result
+        inner_key = f"{side}_inner"
+        outer_key = f"{side}_outer"
+        up_key = f"{side}_up"
+        down_key = f"{side}_down"
+        expected = [inner_key, outer_key, up_key, down_key]
+        missing = [k.split("_", 1)[1] for k in expected if k not in self._extremes]
+        if missing:
+            result["missing"] = missing
+            return result
+        eye_x, eye_y = self._orthogonal_project(
+            gaze_rotated,
+            self._extremes[inner_key], self._extremes[outer_key],
+            self._extremes[up_key], self._extremes[down_key],
+        )
+        result["eye_x"] = eye_x
+        result["eye_y"] = eye_y
+        return result
+
+    @staticmethod
+    def _orthogonal_project(current, inner, outer, up, down):
+        cx = inner[0] + outer[0] + up[0] + down[0]
+        cy = inner[1] + outer[1] + up[1] + down[1]
+        cz = inner[2] + outer[2] + up[2] + down[2]
+        c_len = math.sqrt(cx * cx + cy * cy + cz * cz)
+        if c_len < 1e-12:
+            return None, None
+        cx /= c_len; cy /= c_len; cz /= c_len
+
+        raw_ex = [inner[0] - outer[0], inner[1] - outer[1], inner[2] - outer[2]]
+        d_ex = raw_ex[0] * cx + raw_ex[1] * cy + raw_ex[2] * cz
+        ex = [raw_ex[0] - d_ex * cx, raw_ex[1] - d_ex * cy, raw_ex[2] - d_ex * cz]
+        ex_len = math.sqrt(ex[0]**2 + ex[1]**2 + ex[2]**2)
+        if ex_len < 1e-12:
+            return None, None
+        ex = [ex[0] / ex_len, ex[1] / ex_len, ex[2] / ex_len]
+
+        ey = [cy * ex[2] - cz * ex[1], cz * ex[0] - cx * ex[2], cx * ex[1] - cy * ex[0]]
+        ey_len = math.sqrt(ey[0]**2 + ey[1]**2 + ey[2]**2)
+        if ey_len < 1e-12:
+            return None, None
+        ey = [ey[0] / ey_len, ey[1] / ey_len, ey[2] / ey_len]
+
+        def dot(a, b):
+            return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+        outer_x, inner_x = dot(outer, ex), dot(inner, ex)
+        down_y, up_y = dot(down, ey), dot(up, ey)
+        cur_x, cur_y = dot(current, ex), dot(current, ey)
+
+        def clamp_map(val, lo, hi):
+            if hi - lo < 1e-12:
+                return 0.0
+            val = max(lo, min(val, hi))
+            return 2.0 * (val - lo) / (hi - lo) - 1.0
+
+        return clamp_map(cur_x, outer_x, inner_x), clamp_map(cur_y, down_y, up_y)
+
+
+# ============================================================
+# GazeVectorTracker：瞳孔检测 + 视线向量计算
+# ============================================================
+
+class GazeVectorTracker:
+    """瞳孔检测 → 视线方向计算 → 归一化 → 结果回传。
+
+    通过 multiprocessing.Queue 与主进程通信：
+      - result_queue: 每帧产出 {side, gaze_rotated, eye_x, eye_y, confidence}
+      - command_queue: 接收锁定/解锁定/headless 切换/极值重载命令
+
+    可在 headless 模式下运行（无 X11 环境），不创建 OpenCV 窗口。
+    """
+
+    def __init__(
+        self,
+        cam_index: int = 0,
+        flip: bool = False,
+        crop: Optional[List[int]] = None,
+        side: str = "left",
+        frame_width: int = 640,
+        frame_height: int = 480,
+        extreme_file: str = "extreme_vectors.yaml",
+        use_recommended_resolution: bool = True,
+    ):
         self.cam_index = cam_index
         self.flip = flip
-        self.crop = crop if crop is not None else [0, 0, 640, 480]
+        self.crop = crop if crop is not None else [0, 0, frame_width, frame_height]
         self.side = side
+        self.frame_width = frame_width
+        self.frame_height = frame_height
+        self._use_recommended_resolution = use_recommended_resolution
 
-        # ---- 帧尺寸固定为 640x480，算法在该分辨率下效果最佳 ----
-        self.frame_width = 640
-        self.frame_height = 480
+        # ---- 归一化器 ----
+        self._normalizer = Normalizer(extreme_file)
 
-        # ---- 追踪状态变量 ----
-        self.ray_lines: list = []                      # 近期瞳孔椭圆射线
-        self.model_centers: list = []                  # 近期估计的眼球中心
-        self.min_model_centers = 30                    # 最少眼球中心数量
-        self.max_rays = 100                            # 最多存储的射线数
-        self.prev_model_center_avg = (
-            self.frame_width // 2,
-            self.frame_height // 2,
-        )                                              # 上一个有效眼球中心
-        self.max_observed_distance = 0                 # 自适应眼球半径
-        self.last_sphere_radius_ellipse = None         # 上一个用于扩展半径的椭圆
-        self.pupil_confidence_threshold = 0.85         # 存储射线的最低置信度
-        self.pupil_confidence_threshold_sphere = 0.65  # 更新眼球半径的最低置信度
-        self.intersection_ray_count = 4                # 每次交集估计采样的射线数
-        self.minimum_intersection_angle_degrees = 8    # 采样射线间最小角度
-        self.last_tracking_result = None               # 最新追踪结果
-        self.stored_intersections: list = []           # 历史交集点
+        # ---- 追踪状态 ----
+        self.ray_lines: list = []
+        self.model_centers: list = []
+        self.min_model_centers = 30
+        self.max_rays = 100
+        self.prev_model_center_avg = (self.frame_width // 2, self.frame_height // 2)
+        self.max_observed_distance = 0
+        self.last_sphere_radius_ellipse = None
+        self.pupil_confidence_threshold = 0.85
+        self.pupil_confidence_threshold_sphere = 0.65
+        self.intersection_ray_count = 4
+        self.minimum_intersection_angle_degrees = 8
+        self.last_tracking_result = None
+        self.stored_intersections: list = []
 
         # ---- 锁定状态 ----
         self.sphere_radius_locked = False
@@ -78,41 +182,37 @@ class GazeVectorTracker:
         # ---- 运行状态 ----
         self.cap = None
         self.running = False
-        self._headless = False           # 是否跳过所有 GUI 调用
+        self._headless = False
         self.result_queue = None
-        self._win_name = None            # OpenCV 窗口名，延迟到 start_tracking 初始化
+        self._win_name = None
 
     # ==================== 锁定函数 ====================
 
     def lock_sphere_radius(self):
-        """锁定当前眼球半径（max_observed_distance），之后不再自适应更新。"""
         if self.max_observed_distance > 0:
             self.sphere_radius_locked = True
             self.locked_sphere_radius = self.max_observed_distance
             print(f"[{self.side}] 眼球半径已锁定: {self.locked_sphere_radius:.1f}")
         else:
-            print(f"[{self.side}] 眼球半径仍为0，无法锁定，请先让追踪稳定。")
+            print(f"[{self.side}] 眼球半径仍为0，无法锁定")
 
     def unlock_sphere_radius(self):
-        """解锁眼球半径，恢复自适应更新。"""
         self.sphere_radius_locked = False
         print(f"[{self.side}] 眼球半径已解锁")
 
     def lock_eye_center(self):
-        """锁定当前眼球中心，之后不再通过射线交集更新。"""
         if self.prev_model_center_avg[0] != self.frame_width // 2:
             self.eye_center_locked = True
             self.locked_eye_center = self.prev_model_center_avg
             print(f"[{self.side}] 眼球中心已锁定: {self.locked_eye_center}")
         else:
-            print(f"[{self.side}] 眼球中心尚未稳定，无法锁定。")
+            print(f"[{self.side}] 眼球中心尚未稳定，无法锁定")
 
     def unlock_eye_center(self):
-        """解锁眼球中心，恢复射线交集更新。"""
         self.eye_center_locked = False
         print(f"[{self.side}] 眼球中心已解锁")
 
-    # ==================== 核心处理流程 ====================
+    # ==================== 核心主循环 ====================
 
     def start_tracking(
         self,
@@ -125,19 +225,17 @@ class GazeVectorTracker:
         Parameters
         ----------
         command_queue : multiprocessing.Queue | None
-            接收来自主进程的锁定/解锁命令队列。
-            支持的命令: 'lock_radius', 'unlock_radius', 'lock_center', 'unlock_center',
-                        'headless_on', 'headless_off'
+            支持命令: lock_radius, unlock_radius, lock_center, unlock_center,
+                      headless_on, headless_off,
+                      ("save_extreme", direction_str, [x,y,z])
         result_queue : multiprocessing.Queue | None
-            回传最新 gaze_rotated 向量的队列。
-            每帧置信度达标时将 {'side': str, 'gaze_rotated': [x,y,z]} 放入队列。
+            每帧回传: {side, gaze_rotated, eye_x, eye_y, confidence}
         headless : bool
-            True 时跳过所有 OpenCV GUI 操作，可在无 X11 环境中运行。
+            True 时跳过所有 OpenCV GUI 操作。
         """
         self._headless = headless
         self._reset_tracking_state()
 
-        # 优先使用 V4L2 后端（Linux），失败则回退默认
         for backend in [cv2.CAP_V4L2, cv2.CAP_ANY]:
             self.cap = cv2.VideoCapture(self.cam_index, backend)
             if self.cap.isOpened():
@@ -154,18 +252,17 @@ class GazeVectorTracker:
 
         self.result_queue = result_queue
 
-        # ---- GUI 模式：创建调试窗口 ----
         win_name = f"Eye Tracker - {self.side.upper()} Eye"
-        self._win_name = win_name  # 保存以便 headless_off 时重建
+        self._win_name = win_name
         if not self._headless:
             cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-            cv2.waitKey(1)  # 触发窗口系统初始化
+            cv2.waitKey(1)
 
         frame_fail_count = 0
         max_fail = 10
 
         while self.running:
-            # ---- 处理来自主进程的命令 ----
+            # ---- 处理命令队列 ----
             if command_queue is not None:
                 while not command_queue.empty():
                     try:
@@ -182,8 +279,13 @@ class GazeVectorTracker:
                             self._switch_headless_on()
                         elif cmd == "headless_off":
                             self._switch_headless_off()
+                        elif cmd == "reload_extremes":
+                            self._normalizer.reload()
+                        elif isinstance(cmd, tuple) and cmd[0] == "save_extreme":
+                            direction, vector = cmd[1], cmd[2]
+                            self._normalizer.set_extreme(self.side, direction, vector)
                     except Exception:
-                        pass  # 队列已空或其他读取错误，忽略
+                        pass
 
             ret, frame = self.cap.read()
             if not ret:
@@ -192,27 +294,23 @@ class GazeVectorTracker:
                     print(f"警告：连续 {max_fail} 次无法读取帧，退出")
                     break
                 if self._headless:
-                    time.sleep(0.05)  # 等待后重试
+                    time.sleep(0.05)
                 else:
                     cv2.waitKey(50)
                 continue
-            frame_fail_count = 0  # 成功读取，重置计数
+            frame_fail_count = 0
 
-            # ---- 垂直翻转 ----
             if self.flip:
                 frame = cv2.flip(frame, 0)
 
-            # ---- 剪裁（crop 格式: [x1, y1, x2, y2]） ----
             x1, y1, x2, y2 = self.crop
             if y2 > frame.shape[0] or x2 > frame.shape[1]:
                 print(f"警告：crop {self.crop} 超出帧尺寸 {frame.shape}")
                 continue
             frame = frame[y1:y2, x1:x2]
 
-            # ---- 核心处理 ----
             self._process_frame(frame)
 
-            # ---- 退出检测 + 窗口异常自动降级 ----
             if not self._headless:
                 key = cv2.waitKey(1) & 0xFF
                 if key == 27 or key == ord('q'):
@@ -220,38 +318,28 @@ class GazeVectorTracker:
                     break
                 try:
                     if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
-                        # 窗口被关闭（如 VNC 断开），自动降级为 headless
                         print(f"[{self.side}] OpenCV 窗口丢失，自动切换为 headless 模式")
                         self._switch_headless_on()
                 except cv2.error:
-                    # X11 连接异常，自动降级为 headless
                     print(f"[{self.side}] X11 异常，自动切换为 headless 模式")
                     self._switch_headless_on()
 
         self._cleanup()
 
     def _switch_headless_on(self):
-        """运行时切换为 headless 模式：销毁 OpenCV 窗口，停止 GUI 调用。
-        
-        cv2.destroyAllWindows() 是异步的，窗口管理器需要事件循环泵送
-        才能完成实际销毁。此处主动泵送最多 10 轮（~500ms）以确保窗口
-        即时消失，避免按下"关闭全部 GUI"后 OpenCV 窗口残留 1 秒多的现象。
-        """
         if self._headless:
             return
         try:
             cv2.destroyAllWindows()
-            # 主动泵送事件循环，驱动窗口管理器完成异步销毁
             for _ in range(20):
                 if cv2.waitKey(1) < 0:
                     break
         except cv2.error:
-            pass  # X11 已断开时的安全清理
+            pass
         self._headless = True
         print(f"[{self.side}] 已切换到 headless 模式")
 
     def _switch_headless_off(self):
-        """运行时退出 headless 模式：重建 OpenCV 窗口，恢复 GUI 绘制。"""
         if not self._headless:
             return
         self._headless = False
@@ -262,16 +350,13 @@ class GazeVectorTracker:
                 cv2.waitKey(1)
         except cv2.error as e:
             print(f"[{self.side}] 无法重建 OpenCV 窗口: {e}")
-            # 如果失败则退回头 headless
             self._headless = True
 
     def stop(self):
-        """停止追踪并释放资源。"""
         self.running = False
         self._cleanup()
 
     def _cleanup(self):
-        """释放摄像头并（仅非 headless 时）销毁窗口。"""
         self.running = False
         if self.cap is not None:
             self.cap.release()
@@ -283,14 +368,19 @@ class GazeVectorTracker:
                 pass
 
     def get_last_tracking_result(self):
-        """返回最近一次的追踪结果字典。"""
         return self.last_tracking_result
 
     # ==================== 单帧处理 ====================
 
     def _process_frame(self, frame):
-        """处理单帧图像。"""
-        frame = cv2.resize(frame, (self.frame_width, self.frame_height))
+        if self._use_recommended_resolution:
+            frame = cv2.resize(frame, (self.frame_width, self.frame_height))
+        else:
+            h, w = frame.shape[:2]
+            if h > w:
+                frame = cv2.resize(frame, (480, int(480 * h / w)))
+            else:
+                frame = cv2.resize(frame, (640, int(640 * h / w)))
         darkest_point = self._get_darkest_area(frame)
         if darkest_point is None:
             self.last_tracking_result = None
@@ -298,7 +388,6 @@ class GazeVectorTracker:
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         darkest_pixel_value = gray_frame[darkest_point[1], darkest_point[0]]
 
-        # 三种阈值强度
         thresholded_strict = self._apply_binary_threshold(
             gray_frame, darkest_pixel_value, 5
         )
@@ -336,7 +425,6 @@ class GazeVectorTracker:
         thresholded_relaxed,
         frame,
     ):
-        """对三种阈值图像分别检测瞳孔，选出最佳椭圆并计算视线。"""
         kernel = np.ones((5, 5), np.uint8)
         image_array = [thresholded_relaxed, thresholded_medium, thresholded_strict]
 
@@ -379,7 +467,6 @@ class GazeVectorTracker:
         center_x = best_center_x
         center_y = best_center_y
 
-        # 角度优化
         final_contours = [self._optimize_contours_by_angle(final_contours)]
 
         if (
@@ -395,7 +482,6 @@ class GazeVectorTracker:
                 if len(self.ray_lines) > self.max_rays:
                     self.ray_lines = self.ray_lines[-self.max_rays:]
 
-        # 计算眼球中心均值
         if self.eye_center_locked:
             model_center_average = self.locked_eye_center
         else:
@@ -422,14 +508,12 @@ class GazeVectorTracker:
             self.last_tracking_result = None
             return
 
-        # 更新眼球半径
         self._update_eye_sphere_radius(
             model_center_average,
             final_rotated_rect,
             best_ratio_under_ellipse,
         )
 
-        # 存储最新追踪结果
         self.last_tracking_result = {
             "pupil_ellipse": {
                 "center": (
@@ -454,14 +538,12 @@ class GazeVectorTracker:
             "sphere_radius": float(self.max_observed_distance),
         }
 
-        # 计算并输出视线向量（始终通过 queue 回传）
-        center_3d, gaze_rotated = self._compute_gaze_vector(
+        center_3d, gaze_rotated, norm_result = self._compute_gaze_vector(
             center_x, center_y,
             model_center_average[0], model_center_average[1],
             best_ratio_under_ellipse,
         )
 
-        # ============ 绘制（仅非 headless 模式） ============
         if not self._headless:
             self._draw_debug_overlay(
                 frame,
@@ -470,6 +552,7 @@ class GazeVectorTracker:
                 center_x, center_y,
                 center_3d, gaze_rotated,
                 best_ratio_under_ellipse,
+                norm_result,
             )
 
     # ==================== 调试绘制 ====================
@@ -482,8 +565,8 @@ class GazeVectorTracker:
         center_x, center_y,
         center_3d, gaze_rotated,
         best_ratio_under_ellipse,
+        norm_result,
     ):
-        """在帧上绘制所有调试信息（仅在非 headless 模式下调用）。"""
         cv2.circle(
             frame,
             model_center_average,
@@ -505,7 +588,6 @@ class GazeVectorTracker:
         if final_rotated_rect is not None:
             cv2.ellipse(frame, final_rotated_rect, (20, 255, 255), 2)
 
-        # 延长视线
         if final_rotated_rect is not None and center_x is not None and center_y is not None:
             dx = center_x - model_center_average[0]
             dy = center_y - model_center_average[1]
@@ -519,7 +601,6 @@ class GazeVectorTracker:
                 3,
             )
 
-        # 视线向量文本
         if center_3d is not None and gaze_rotated is not None:
             origin_text = (
                 f"Origin: ({center_3d[0]:.2f}, "
@@ -552,7 +633,32 @@ class GazeVectorTracker:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2,
             )
 
-        # 置信度
+        # ---- 归一化状态 HUD（左下角） ----
+        eye_x = norm_result.get("eye_x")
+        eye_y = norm_result.get("eye_y")
+        missing = norm_result.get("missing", [])
+
+        if missing:
+            msg = f"Insufficient extreme vectors! ({', '.join(missing)}) is missing."
+            cv2.putText(
+                frame, msg, (10, frame.shape[0] - 65),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3,
+            )
+            cv2.putText(
+                frame, msg, (10, frame.shape[0] - 65),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2,
+            )
+        elif eye_x is not None and eye_y is not None:
+            norm_text = f"Eye X: {eye_x:+.3f}   Eye Y: {eye_y:+.3f}"
+            cv2.putText(
+                frame, norm_text, (10, frame.shape[0] - 65),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3,
+            )
+            cv2.putText(
+                frame, norm_text, (10, frame.shape[0] - 65),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2,
+            )
+
         ratio_text = f"{best_ratio_under_ellipse * 100:.2f}%"
         cv2.putText(
             frame, ratio_text, (12, 32),
@@ -563,17 +669,16 @@ class GazeVectorTracker:
             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
         )
 
-        # 最终结果窗口
         cv2.imshow(f"Eye Tracker - {self.side.upper()} Eye", frame)
 
-    # ==================== 视线向量计算 ====================
+    # ==================== 视线向量计算与归一化 ====================
 
     def _compute_gaze_vector(
         self, x, y, center_x, center_y, confidence_ratio=0.0
     ):
         """根据瞳孔屏幕坐标和眼球中心计算 3D 视线方向。
 
-        结果通过 result_queue 回传（若有），不再写入文件。
+        结果（含归一化后的 eye_x/eye_y）通过 result_queue 回传。
         """
         viewport_width = self.frame_width
         viewport_height = self.frame_height
@@ -673,31 +778,35 @@ class GazeVectorTracker:
             gaze_rotated = rotation_matrix @ gaze_local
             gaze_rotated /= np.linalg.norm(gaze_rotated)
 
-        # ---- 回传至主进程（主要数据通道） ----
+        # ---- 归一化 ----
+        gaze_list = [float(v) for v in gaze_rotated]
+        norm_result = self._normalizer.normalize(self.side, gaze_list)
+
+        # ---- 回传 ----
         if self.result_queue is not None:
             try:
                 self.result_queue.put_nowait({
                     "side": self.side,
-                    "gaze_rotated": [float(v) for v in gaze_rotated],
+                    "gaze_rotated": gaze_list,
+                    "eye_x": norm_result["eye_x"],
+                    "eye_y": norm_result["eye_y"],
                     "confidence": confidence_ratio,
                 })
             except Exception:
                 pass
 
-        return sphere_center, gaze_rotated
+        return sphere_center, gaze_rotated, norm_result
 
     # ==================== 阈值与遮罩 ====================
 
     @staticmethod
     def _apply_binary_threshold(image, darkest_pixel_value, added_threshold):
-        """对图像做二值化逆阈值处理。"""
         threshold = darkest_pixel_value + added_threshold
         _, thresholded = cv2.threshold(image, threshold, 255, cv2.THRESH_BINARY_INV)
         return thresholded
 
     @staticmethod
     def _get_darkest_area(image):
-        """寻找图像中最暗的方形区域中心。"""
         ignore_bounds = 20
         image_skip_size = 10
         search_area = 20
@@ -730,7 +839,6 @@ class GazeVectorTracker:
 
     @staticmethod
     def _mask_outside_square(image, center, size):
-        """保留以 center 为中心、size 为边长的方形区域，其余置零。"""
         x, y = center
         half = size // 2
         mask = np.zeros_like(image)
@@ -747,7 +855,6 @@ class GazeVectorTracker:
     def _filter_contours_by_area_and_return_largest(
         contours, pixel_thresh, ratio_thresh
     ):
-        """返回面积≥pixel_thresh且长宽比≤ratio_thresh的最大轮廓。"""
         max_area = 0
         largest_contour = None
 
@@ -765,7 +872,6 @@ class GazeVectorTracker:
 
     @staticmethod
     def _optimize_contours_by_angle(contours):
-        """根据点与质心的角度过滤轮廓点。"""
         if len(contours) < 1:
             return contours
 
@@ -808,7 +914,6 @@ class GazeVectorTracker:
 
     @staticmethod
     def _check_ellipse_goodness(binary_image, contour):
-        """评估椭圆与二值图像的重合度。返回 [覆盖率, ?, 偏心率]。"""
         if len(contour) < 5:
             return [0, 0, 0]
 
@@ -831,7 +936,6 @@ class GazeVectorTracker:
 
     @staticmethod
     def _check_contour_pixels(contour, image_shape):
-        """统计轮廓落在拟合椭圆内的像素数及比例。"""
         if len(contour) < 5:
             return [0, 0]
 
@@ -864,7 +968,6 @@ class GazeVectorTracker:
 
     @staticmethod
     def _distance_to_pupil_outer_edge(eye_center, pupil_ellipse):
-        """计算眼球中心到瞳孔椭圆远侧边缘的距离。"""
         pupil_center, axes, angle_degrees = pupil_ellipse
         direction_x = pupil_center[0] - eye_center[0]
         direction_y = pupil_center[1] - eye_center[1]
@@ -892,7 +995,6 @@ class GazeVectorTracker:
     def _update_eye_sphere_radius(
         self, eye_center, current_pupil_ellipse, current_pupil_confidence
     ):
-        """自适应更新眼球半径（如果未锁定）。"""
         if self.sphere_radius_locked:
             self.max_observed_distance = self.locked_sphere_radius
             return
@@ -926,13 +1028,11 @@ class GazeVectorTracker:
 
     @staticmethod
     def _angle_diff(a, b):
-        """返回 [0, 180) 范围内两个角度的最小夹角差。"""
         diff = abs(a - b) % 180
         return min(diff, 180 - diff)
 
     @staticmethod
     def _find_line_intersection(ellipse1, ellipse2):
-        """计算两条椭圆短轴方向直线的交点。"""
         (cx1, cy1), (_, minor_axis1), angle1 = ellipse1
         (cx2, cy2), (_, minor_axis2), angle2 = ellipse2
 
@@ -959,7 +1059,6 @@ class GazeVectorTracker:
     def _compute_average_intersection(
         self, frame, ray_lines, number_lines, total_lines, minimum_angle_degrees
     ):
-        """从射线中采样、求交集，并返回滑动平均后的交点。"""
         pixel_limit = 30
         angle_threshold = 5
 
@@ -1024,14 +1123,12 @@ class GazeVectorTracker:
 
     @staticmethod
     def _prune_intersections(intersections, maximum_intersections):
-        """只保留最后 maximum_intersections 个交集点。"""
         if len(intersections) <= maximum_intersections:
             return intersections
         return intersections[-maximum_intersections:]
 
     @staticmethod
     def _update_and_average_point(point_list, new_point, N):
-        """向列表添加新点并返回最近 N 个点的均值。"""
         point_list.append(new_point)
         if len(point_list) > N:
             point_list.pop(0)
@@ -1044,7 +1141,6 @@ class GazeVectorTracker:
     # ==================== 状态重置 ====================
 
     def _reset_tracking_state(self):
-        """重置所有追踪状态变量。"""
         self.ray_lines = []
         self.model_centers = []
         self.prev_model_center_avg = (self.frame_width // 2, self.frame_height // 2)

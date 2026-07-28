@@ -1,8 +1,14 @@
 left:
   camera_index: 2
-  crop: [226, 104, 426, 254]
+  crop: [199, 38, 385, 363]
   flip: true
+  frame_height: 480
+  frame_width: 640
+  use_recommended_resolution: false
 right:
   camera_index: 0
-  crop: [216, 68, 368, 182]
-  flip: false
+  crop: [131, 63, 465, 313]
+  flip: true
+  frame_height: 480
+  frame_width: 640
+  use_recommended_resolution: true

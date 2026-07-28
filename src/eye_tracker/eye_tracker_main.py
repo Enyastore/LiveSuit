@@ -1,27 +1,22 @@
-"""眼球追踪模块主封装。
+"""眼球追踪模块主入口。
 
 职责分层：
   1) 数据模型: CameraConfig, AppConfig
   2) 配置持久化: ConfigPersistence
-  3) 调试 UI: CropDebugWindow, ControlPanel, DebugMainWindow
-  4) 批处理管线: Normalizer, GazeConsumer
-  5) 核心编排: EyeTrackingModule
-  6) 独立入口: __main__
+  3) 调试 UI: CropDebugWindow, ControlPanel
+  4) 核心编排: EyeTrackingModule
+  5) 独立入口: __main__
 
 对外接口：
   module = EyeTrackingModule()
   module.start()
-  state = module.get_normalized_eye_state()  # {"left": {"eye_x":..., "eye_y":...}, "right":...}
+  state = module.get_normalized_eye_state()
   module.stop()
 
-  调试画面控制（隐藏/显示子进程 OpenCV 窗口）：
-    module.enter_headless_mode()   # 隐藏 OpenCV 调试窗口
-    module.exit_headless_mode()    # 显示 OpenCV 调试窗口
-    module.headless_runtime        # bool，查询当前状态
-
-  ⚠️ 归一化依赖 extreme_vectors.yaml 标定文件（通过控制面板录制极值向量）。
-     无此文件时 get_normalized_eye_state() 返回的 eye_x / eye_y 均为 None，
-     下游调用者须自行处理降级（保持上一帧有效值 / 使用 get_raw_gaze_vector() / 输出 0.0）。
+调试画面控制（隐藏/显示子进程 OpenCV 窗口）：
+  module.enter_headless_mode()
+  module.exit_headless_mode()
+  module.headless_runtime
 """
 
 __all__ = [
@@ -46,13 +41,13 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
 
 # 内部依赖
-from gaze_vector_tracker import GazeVectorTracker
+from eye_tracker_core import GazeVectorTracker, Normalizer
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# 0. 工具函数
+# 工具函数
 # ============================================================
 
 def _setup_camera(index: int) -> Optional[cv2.VideoCapture]:
@@ -66,7 +61,7 @@ def _setup_camera(index: int) -> Optional[cv2.VideoCapture]:
 
 
 # ============================================================
-# 1. 数据模型
+# 数据模型
 # ============================================================
 
 @dataclass
@@ -75,6 +70,9 @@ class CameraConfig:
     index: int = 0
     crop: List[int] = field(default_factory=lambda: [0, 0, 640, 480])
     flip: bool = False
+    frame_width: int = 640
+    frame_height: int = 480
+    use_recommended_resolution: bool = True
 
 
 @dataclass
@@ -85,7 +83,7 @@ class AppConfig:
 
 
 # ============================================================
-# 2. 配置持久化（与数据模型解耦）
+# 配置持久化（与数据模型解耦）
 # ============================================================
 
 class ConfigPersistence:
@@ -119,11 +117,17 @@ class ConfigPersistence:
                     index=left_data.get('camera_index', 0),
                     crop=left_data.get('crop', [0, 0, 640, 480]),
                     flip=left_data.get('flip', False),
+                    frame_width=left_data.get('frame_width', 640),
+                    frame_height=left_data.get('frame_height', 480),
+                    use_recommended_resolution=left_data.get('use_recommended_resolution', True),
                 ),
                 right=CameraConfig(
                     index=right_data.get('camera_index', 0),
                     crop=right_data.get('crop', [0, 0, 640, 480]),
                     flip=right_data.get('flip', False),
+                    frame_width=right_data.get('frame_width', 640),
+                    frame_height=right_data.get('frame_height', 480),
+                    use_recommended_resolution=right_data.get('use_recommended_resolution', True),
                 ),
             )
         except Exception as e:
@@ -139,11 +143,17 @@ class ConfigPersistence:
                 'camera_index': config.left.index,
                 'crop': config.left.crop,
                 'flip': config.left.flip,
+                'frame_width': config.left.frame_width,
+                'frame_height': config.left.frame_height,
+                'use_recommended_resolution': config.left.use_recommended_resolution,
             },
             'right': {
                 'camera_index': config.right.index,
                 'crop': config.right.crop,
                 'flip': config.right.flip,
+                'frame_width': config.right.frame_width,
+                'frame_height': config.right.frame_height,
+                'use_recommended_resolution': config.right.use_recommended_resolution,
             },
         }
         try:
@@ -155,7 +165,7 @@ class ConfigPersistence:
 
 
 # ============================================================
-# 3. 调试预览窗口
+# 调试预览窗口
 # ============================================================
 
 class CropDebugWindow:
@@ -209,6 +219,11 @@ class CropDebugWindow:
         self._btn_crop = tk.Button(btn_frame, text="剪裁", command=self._toggle_crop)
         self._btn_crop.pack(side=tk.LEFT, padx=5)
 
+        self._recommended_var = tk.BooleanVar(value=self._cam_config.use_recommended_resolution)
+        tk.Checkbutton(btn_frame, text="使用推荐宽高比(4:3)", variable=self._recommended_var).pack(
+            side=tk.LEFT, padx=5
+        )
+
         tk.Button(btn_frame, text="保存剪裁配置", command=self._save_crop_config).pack(
             side=tk.LEFT, padx=5
         )
@@ -235,6 +250,7 @@ class CropDebugWindow:
             logger.info(f"剪裁区域: x1={x1}, y1={y1}, x2={x2}, y2={y2}")
             self._cam_config.crop = [x1, y1, x2, y2]
             self._cam_config.flip = self._flip_var.get()
+            self._cam_config.use_recommended_resolution = self._recommended_var.get()
             if self._on_config_changed:
                 self._on_config_changed()
             logger.info(f"{self._side}眼相机配置已保存")
@@ -252,22 +268,29 @@ class CropDebugWindow:
     def _on_drag(self, event: tk.Event) -> None:
         if not self._crop_mode or not self._drawing:
             return
+        enforce = self._recommended_var.get()
         self._crop_rect = self._constrain_rect(
-            self._start_x, self._start_y, event.x, event.y
+            self._start_x, self._start_y, event.x, event.y,
+            enforce_ratio=enforce,
         )
 
     def _on_release(self, event: tk.Event) -> None:
         if not self._crop_mode:
             return
         self._drawing = False
+        enforce = self._recommended_var.get()
         self._crop_rect = self._constrain_rect(
-            self._start_x, self._start_y, event.x, event.y
+            self._start_x, self._start_y, event.x, event.y,
+            enforce_ratio=enforce,
         )
 
     @classmethod
     def _constrain_rect(
-        cls, x1: int, y1: int, x2: int, y2: int
+        cls, x1: int, y1: int, x2: int, y2: int,
+        enforce_ratio: bool = True,
     ) -> Optional[Tuple[int, int, int, int]]:
+        if not enforce_ratio:
+            return [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
         w = abs(x2 - x1)
         h = abs(y2 - y1)
         if w == 0 and h == 0:
@@ -320,11 +343,14 @@ class CropDebugWindow:
 
 
 # ============================================================
-# 4. 控制面板
+# 控制面板
 # ============================================================
 
 class ControlPanel:
-    """Toplevel 控制面板：锁定/解锁眼球参数 + 保存极限注视向量。"""
+    """Toplevel 控制面板：锁定/解锁眼球参数 + 保存极限注视向量。
+
+    极值向量通过命令队列发送到子进程，由子进程内部的 Normalizer 处理。
+    """
 
     def __init__(
         self,
@@ -332,13 +358,12 @@ class ControlPanel:
         cmd_queue_left: Optional[multiprocessing.Queue],
         cmd_queue_right: Optional[multiprocessing.Queue],
         gaze_reader: "callable",
-        normalizer: "Normalizer",
+        side: str = "left",
     ):
         self._master = master
         self._cmd_queue_left = cmd_queue_left
         self._cmd_queue_right = cmd_queue_right
         self._gaze_reader = gaze_reader
-        self._normalizer = normalizer
         self._locks: Dict[str, bool] = {
             "left_radius": False, "left_center": False,
             "right_radius": False, "right_center": False,
@@ -410,8 +435,16 @@ class ControlPanel:
         if vector is None:
             logger.warning(f"未能获取 {side} 眼当前向量，跳过保存")
             return
-        self._normalizer.set_extreme(side, direction, vector)
-        logger.info(f"已保存 {side}_{direction}: {vector}")
+        # 通过命令队列发送到子进程，由子进程的 Normalizer 处理
+        q = self._cmd_queue_left if side == "left" else self._cmd_queue_right
+        if q is not None:
+            try:
+                q.put_nowait(("save_extreme", direction, vector))
+                logger.info(f"已发送 {side}_{direction} 到子进程保存")
+            except Exception as e:
+                logger.error(f"发送极值向量到子进程失败: {e}")
+        else:
+            logger.warning(f"[{side}] 追踪尚未启动，无法保存")
 
     def destroy(self) -> None:
         if self._window is not None:
@@ -423,193 +456,27 @@ class ControlPanel:
 
 
 # ============================================================
-# 5. 归一化器
-# ============================================================
-
-class Normalizer:
-    def __init__(self, extreme_file: str = "extreme_vectors.yaml"):
-        self._extreme_file = os.path.join(os.path.dirname(__file__), extreme_file)
-        self._extremes: Dict[str, List[float]] = {}
-        self._load_extremes()
-
-    def _load_extremes(self) -> None:
-        try:
-            with open(self._extreme_file, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
-            self._extremes = {k: list(v) for k, v in data.items()}
-        except FileNotFoundError:
-            self._extremes = {}
-            logger.info("极值向量文件不存在，归一化将返回 None")
-
-    def set_extreme(self, side: str, direction: str, vector: List[float]) -> None:
-        key = f"{side}_{direction}"
-        self._extremes[key] = vector
-        try:
-            with open(self._extreme_file, 'w', encoding='utf-8') as f:
-                yaml.dump(self._extremes, f, allow_unicode=True)
-        except Exception as e:
-            logger.error(f"保存极值向量失败: {e}")
-
-    def normalize(self, side: str, gaze_rotated: List[float]) -> Dict[str, Optional[float]]:
-        result = {"eye_x": None, "eye_y": None}
-        if not gaze_rotated or len(gaze_rotated) != 3:
-            return result
-        inner_key, outer_key = f"{side}_inner", f"{side}_outer"
-        up_key, down_key = f"{side}_up", f"{side}_down"
-        if not all(k in self._extremes for k in (inner_key, outer_key, up_key, down_key)):
-            return result
-        eye_x, eye_y = self._orthogonal_project(
-            gaze_rotated,
-            self._extremes[inner_key], self._extremes[outer_key],
-            self._extremes[up_key], self._extremes[down_key],
-        )
-        result["eye_x"] = eye_x
-        result["eye_y"] = eye_y
-        return result
-
-    @staticmethod
-    def _orthogonal_project(current, inner, outer, up, down):
-        import math
-        cx = inner[0] + outer[0] + up[0] + down[0]
-        cy = inner[1] + outer[1] + up[1] + down[1]
-        cz = inner[2] + outer[2] + up[2] + down[2]
-        c_len = math.sqrt(cx * cx + cy * cy + cz * cz)
-        if c_len < 1e-12:
-            return None, None
-        cx /= c_len; cy /= c_len; cz /= c_len
-
-        raw_ex = [inner[0] - outer[0], inner[1] - outer[1], inner[2] - outer[2]]
-        d_ex = raw_ex[0] * cx + raw_ex[1] * cy + raw_ex[2] * cz
-        ex = [raw_ex[0] - d_ex * cx, raw_ex[1] - d_ex * cy, raw_ex[2] - d_ex * cz]
-        ex_len = math.sqrt(ex[0]**2 + ex[1]**2 + ex[2]**2)
-        if ex_len < 1e-12:
-            return None, None
-        ex = [ex[0] / ex_len, ex[1] / ex_len, ex[2] / ex_len]
-
-        ey = [cy * ex[2] - cz * ex[1], cz * ex[0] - cx * ex[2], cx * ex[1] - cy * ex[0]]
-        ey_len = math.sqrt(ey[0]**2 + ey[1]**2 + ey[2]**2)
-        if ey_len < 1e-12:
-            return None, None
-        ey = [ey[0] / ey_len, ey[1] / ey_len, ey[2] / ey_len]
-
-        def dot(a, b):
-            return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-
-        outer_x, inner_x = dot(outer, ex), dot(inner, ex)
-        down_y, up_y = dot(down, ey), dot(up, ey)
-        cur_x, cur_y = dot(current, ex), dot(current, ey)
-
-        def clamp_map(val, lo, hi):
-            if hi - lo < 1e-12:
-                return 0.0
-            val = max(lo, min(val, hi))
-            return 2.0 * (val - lo) / (hi - lo) - 1.0
-
-        return clamp_map(cur_x, outer_x, inner_x), clamp_map(cur_y, down_y, up_y)
-
-
-# ============================================================
-# 6. 注视向量消费者线程
-# ============================================================
-
-class GazeConsumer:
-    def __init__(self, normalizer: Normalizer):
-        self._normalizer = normalizer
-        self._queue: Optional[multiprocessing.Queue] = None
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._lock = threading.Lock()
-        self._raw_gaze: Dict = {"left": None, "right": None}
-        self._normalized: Dict = {
-            "left": {"eye_x": None, "eye_y": None, "confidence": None},
-            "right": {"eye_x": None, "eye_y": None, "confidence": None},
-        }
-        self._last_update: float = 0.0
-
-    def start(self, result_queue: multiprocessing.Queue) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._queue = result_queue
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-        logger.info("注视向量消费者线程已启动")
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2)
-            if self._thread.is_alive():
-                logger.warning("消费者线程未能及时终止")
-            self._thread = None
-        self._queue = None
-        with self._lock:
-            self._raw_gaze = {"left": None, "right": None}
-            self._normalized = {
-                "left": {"eye_x": None, "eye_y": None, "confidence": None},
-                "right": {"eye_x": None, "eye_y": None, "confidence": None},
-            }
-
-    def _loop(self) -> None:
-        import numpy as np
-        while not self._stop_event.is_set():
-            try:
-                data = self._queue.get(timeout=0.001)
-                self._process(data)
-            except queue.Empty:
-                pass
-            except Exception:
-                pass
-
-    def _process(self, data: dict) -> None:
-        side = data.get("side")
-        gaze = data.get("gaze_rotated")
-        if side is None or gaze is None:
-            return
-        with self._lock:
-            self._raw_gaze[side] = gaze
-            self._normalized[side] = self._normalizer.normalize(side, gaze)
-            self._normalized[side]["confidence"] = data.get("confidence", None)
-            self._last_update = time.time()
-
-    def get_raw_gaze(self, side: str) -> Optional[List[float]]:
-        with self._lock:
-            return self._raw_gaze.get(side)
-
-    def get_normalized_state(self) -> dict:
-        with self._lock:
-            return {
-                "left": dict(self._normalized["left"]),
-                "right": dict(self._normalized["right"]),
-                "timestamp": self._last_update,
-            }
-
-
-# ============================================================
-# 7. 核心编排：EyeTrackingModule
+# 核心编排：EyeTrackingModule
 # ============================================================
 
 class EyeTrackingModule:
     """眼球追踪核心模块 —— 对外唯一入口。
 
     使用方式：
-        # 头模式（作为大软件的子模块）
         mod = EyeTrackingModule(headless=True)
         mod.start()
         state = mod.get_normalized_eye_state()
         mod.stop()
 
-        # 调试模式（独立运行 GUI）
+    调试模式：
         mod = EyeTrackingModule(headless=False, master=root)
         mod.start()
         mod.open_control_panel()
-        ...
-        mod.stop()
 
     调试画面控制（仅隐藏/显示子进程 OpenCV 窗口，tkinter 窗口不受影响）：
-        mod.enter_headless_mode()   # 隐藏 OpenCV 调试窗口
-        mod.exit_headless_mode()    # 显示 OpenCV 调试窗口
-        mod.headless_runtime        # 查询当前状态
+        mod.enter_headless_mode()
+        mod.exit_headless_mode()
+        mod.headless_runtime
 
     Parameters
     ----------
@@ -631,6 +498,7 @@ class EyeTrackingModule:
         extreme_file: str = "extreme_vectors.yaml",
     ):
         self._headless = headless
+        self._extreme_file = extreme_file
 
         if headless:
             self._master: Optional[tk.Tk] = None
@@ -642,8 +510,6 @@ class EyeTrackingModule:
 
         self._persistence = ConfigPersistence(config_path)
         self.config: AppConfig = self._persistence.load()
-        self._normalizer = Normalizer(extreme_file)
-        self._consumer = GazeConsumer(self._normalizer)
 
         self._process_left: Optional[multiprocessing.Process] = None
         self._process_right: Optional[multiprocessing.Process] = None
@@ -651,11 +517,20 @@ class EyeTrackingModule:
         self._cmd_queue_right: Optional[multiprocessing.Queue] = None
         self._result_queue: Optional[multiprocessing.Queue] = None
 
+        # 结果收集
+        self._latest_state: dict = {
+            "left": {"eye_x": None, "eye_y": None, "confidence": None},
+            "right": {"eye_x": None, "eye_y": None, "confidence": None},
+            "timestamp": 0.0,
+        }
+        self._raw_gaze: Dict[str, Optional[List[float]]] = {"left": None, "right": None}
+        self._result_thread: Optional[threading.Thread] = None
+        self._result_stop = threading.Event()
+
         self._crop_window_left: Optional[CropDebugWindow] = None
         self._crop_window_right: Optional[CropDebugWindow] = None
         self._control_panel: Optional[ControlPanel] = None
 
-        # 运行时无头状态（仅控制子进程 OpenCV 窗口）
         self._headless_runtime: bool = False
 
     # ----------------------------------------------------------
@@ -701,16 +576,24 @@ class EyeTrackingModule:
 
         self._process_left = multiprocessing.Process(
             target=_run_tracker_in_process,
-            args=(self.config.left.index, self.config.left.flip, self.config.left.crop,
-                  "left", self._cmd_queue_left, self._result_queue, self._headless),
+            args=(
+                self.config.left.index, self.config.left.flip, self.config.left.crop,
+                "left", self._cmd_queue_left, self._result_queue, self._headless,
+                self.config.left.frame_width, self.config.left.frame_height,
+                self._extreme_file, self.config.left.use_recommended_resolution,
+            ),
             daemon=True,
         )
         self._process_left.start()
 
         self._process_right = multiprocessing.Process(
             target=_run_tracker_in_process,
-            args=(self.config.right.index, self.config.right.flip, self.config.right.crop,
-                  "right", self._cmd_queue_right, self._result_queue, self._headless),
+            args=(
+                self.config.right.index, self.config.right.flip, self.config.right.crop,
+                "right", self._cmd_queue_right, self._result_queue, self._headless,
+                self.config.right.frame_width, self.config.right.frame_height,
+                self._extreme_file, self.config.right.use_recommended_resolution,
+            ),
             daemon=True,
         )
         self._process_right.start()
@@ -728,16 +611,49 @@ class EyeTrackingModule:
                 failed_side.append("右眼")
             raise RuntimeError(f"{'、'.join(failed_side)}追踪子进程启动失败（相机不可用或索引错误）")
 
-        self._consumer.start(self._result_queue)
+        # 启动结果收集线程
+        self._start_result_collector()
         logger.info("双眼眼球追踪已启动")
 
     def stop(self) -> None:
         self._stop_internal()
 
+    def _start_result_collector(self) -> None:
+        """启动轻量线程，从 result_queue 读取数据并更新 latest_state。"""
+        self._result_stop.clear()
+        self._result_thread = threading.Thread(target=self._collect_results, daemon=True)
+        self._result_thread.start()
+
+    def _collect_results(self) -> None:
+        while not self._result_stop.is_set():
+            try:
+                data = self._result_queue.get(timeout=0.01)
+            except queue.Empty:
+                continue
+            except Exception:
+                continue
+
+            side = data.get("side")
+            if side is None:
+                continue
+            self._raw_gaze[side] = data.get("gaze_rotated")
+            self._latest_state[side] = {
+                "eye_x": data.get("eye_x"),
+                "eye_y": data.get("eye_y"),
+                "confidence": data.get("confidence"),
+            }
+            self._latest_state["timestamp"] = time.time()
+
     def _stop_internal(self) -> None:
         if self._control_panel is not None:
             self._control_panel.destroy()
             self._control_panel = None
+
+        # 停止结果收集线程
+        self._result_stop.set()
+        if self._result_thread is not None:
+            self._result_thread.join(timeout=2)
+            self._result_thread = None
 
         for proc in (self._process_left, self._process_right):
             if proc is not None and proc.is_alive():
@@ -749,15 +665,20 @@ class EyeTrackingModule:
         self._process_right = None
         self._cmd_queue_left = None
         self._cmd_queue_right = None
-        self._consumer.stop()
         self._result_queue = None
+        self._raw_gaze = {"left": None, "right": None}
+        self._latest_state = {
+            "left": {"eye_x": None, "eye_y": None, "confidence": None},
+            "right": {"eye_x": None, "eye_y": None, "confidence": None},
+            "timestamp": 0.0,
+        }
         logger.info("眼球追踪已停止")
 
     def get_normalized_eye_state(self) -> dict:
-        return self._consumer.get_normalized_state()
+        return dict(self._latest_state)
 
     def get_raw_gaze_vector(self, side: str) -> Optional[List[float]]:
-        return self._consumer.get_raw_gaze(side)
+        return self._raw_gaze.get(side)
 
     def is_running(self) -> bool:
         return (
@@ -815,7 +736,7 @@ class EyeTrackingModule:
             self._control_panel.destroy()
         self._control_panel = ControlPanel(
             self._master, self._cmd_queue_left, self._cmd_queue_right,
-            self.get_raw_gaze_vector, self._normalizer,
+            self.get_raw_gaze_vector,
         )
 
     def save_config(self) -> None:
@@ -836,22 +757,29 @@ class EyeTrackingModule:
 
 
 # ============================================================
-# 8. 子进程入口
+# 子进程入口
 # ============================================================
 
 def _run_tracker_in_process(
     cam_index: int, flip: bool, crop: List[int], side: str,
     command_queue: multiprocessing.Queue,
     result_queue: multiprocessing.Queue, headless: bool,
+    frame_width: int, frame_height: int, extreme_file: str,
+    use_recommended_resolution: bool = True,
 ) -> None:
-    tracker = GazeVectorTracker(cam_index=cam_index, flip=flip, crop=crop, side=side)
+    tracker = GazeVectorTracker(
+        cam_index=cam_index, flip=flip, crop=crop, side=side,
+        frame_width=frame_width, frame_height=frame_height,
+        extreme_file=extreme_file,
+        use_recommended_resolution=use_recommended_resolution,
+    )
     tracker.start_tracking(
         command_queue=command_queue, result_queue=result_queue, headless=headless,
     )
 
 
 # ============================================================
-# 9. 工具函数
+# 工具函数
 # ============================================================
 
 def detect_cameras(max_cams: int = 6) -> List[int]:
@@ -865,7 +793,7 @@ def detect_cameras(max_cams: int = 6) -> List[int]:
 
 
 # ============================================================
-# 10. 调试入口
+# 调试入口
 # ============================================================
 
 if __name__ == "__main__":
@@ -931,8 +859,17 @@ if __name__ == "__main__":
     def _stop():
         module.stop()
 
-    tk.Button(frame_action, text="开始眼球追踪", command=_start).pack(side=tk.LEFT, padx=10)
-    tk.Button(frame_action, text="停止眼球追踪", command=_stop).pack(side=tk.LEFT, padx=10)
+    btn_text = tk.StringVar(value="开始眼球追踪")
+
+    def _toggle():
+        if module.is_running():
+            _stop()
+            btn_text.set("开始眼球追踪")
+        else:
+            _start()
+            btn_text.set("停止眼球追踪")
+
+    tk.Button(frame_action, textvariable=btn_text, command=_toggle, width=14).pack(side=tk.LEFT, padx=10)
     tk.Button(
         frame_action, text="保存配置",
         command=lambda: (module.set_left_camera(int(cam_left.get())),
@@ -940,18 +877,17 @@ if __name__ == "__main__":
                          module.save_config())
     ).pack(side=tk.LEFT, padx=10)
 
-    # ---- 调试画面隐藏/显示按钮 ----
     frame_display = tk.Frame(root)
     frame_display.pack(pady=(0, 10))
 
-    display_btn_text = tk.StringVar(value="隐藏OpenCV（无头模式）")
+    display_btn_text = tk.StringVar(value="隐藏OpenCV")
     def _toggle_display():
         if module.headless_runtime:
             module.exit_headless_mode()
-            display_btn_text.set("隐藏OpenCV（无头模式）")
+            display_btn_text.set("隐藏OpenCV")
         else:
             module.enter_headless_mode()
-            display_btn_text.set("显示OpenCV（调试模式）")
+            display_btn_text.set("显示OpenCV")
 
     tk.Button(
         frame_display, textvariable=display_btn_text, command=_toggle_display, width=14

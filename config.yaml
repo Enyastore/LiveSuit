@@ -1,0 +1,12 @@
+left:
+  camera_index: 0
+  crop: [0, 0, 640, 480]
+  flip: false
+  frame_height: 480
+  frame_width: 640
+right:
+  camera_index: 0
+  crop: [0, 0, 640, 480]
+  flip: false
+  frame_height: 480
+  frame_width: 640
