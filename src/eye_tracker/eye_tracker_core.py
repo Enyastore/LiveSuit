@@ -378,9 +378,12 @@ class GazeVectorTracker:
         else:
             h, w = frame.shape[:2]
             if h > w:
-                frame = cv2.resize(frame, (480, int(480 * h / w)))
+                new_w, new_h = 480, int(480 * h / w)
             else:
-                frame = cv2.resize(frame, (640, int(640 * h / w)))
+                new_w, new_h = 640, int(640 * h / w)
+            frame = cv2.resize(frame, (new_w, new_h))
+            self.frame_width = new_w
+            self.frame_height = new_h
         darkest_point = self._get_darkest_area(frame)
         if darkest_point is None:
             self.last_tracking_result = None
