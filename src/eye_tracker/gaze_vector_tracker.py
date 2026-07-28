@@ -38,13 +38,13 @@ class GazeVectorTracker:
         flip : bool
             是否垂直翻转画面。
         crop : list | None
-            剪裁区域 [x1, x2, y1, y2]，None 则默认 [0, 640, 0, 480]。
+            剪裁区域 [x1, y1, x2, y2]，None 则默认 [0, 0, 640, 480]。
         side : str
             标识 "left" 或 "right"。
         """
         self.cam_index = cam_index
         self.flip = flip
-        self.crop = crop if crop is not None else [0, 640, 0, 480]
+        self.crop = crop if crop is not None else [0, 0, 640, 480]
         self.side = side
 
         # ---- 帧尺寸固定为 640x480，算法在该分辨率下效果最佳 ----
@@ -80,6 +80,7 @@ class GazeVectorTracker:
         self.running = False
         self._headless = False           # 是否跳过所有 GUI 调用
         self.result_queue = None
+        self._win_name = None            # OpenCV 窗口名，延迟到 start_tracking 初始化
 
     # ==================== 锁定函数 ====================
 
@@ -125,7 +126,8 @@ class GazeVectorTracker:
         ----------
         command_queue : multiprocessing.Queue | None
             接收来自主进程的锁定/解锁命令队列。
-            支持的命令: 'lock_radius', 'unlock_radius', 'lock_center', 'unlock_center'
+            支持的命令: 'lock_radius', 'unlock_radius', 'lock_center', 'unlock_center',
+                        'headless_on', 'headless_off'
         result_queue : multiprocessing.Queue | None
             回传最新 gaze_rotated 向量的队列。
             每帧置信度达标时将 {'side': str, 'gaze_rotated': [x,y,z]} 放入队列。
@@ -154,6 +156,7 @@ class GazeVectorTracker:
 
         # ---- GUI 模式：创建调试窗口 ----
         win_name = f"Eye Tracker - {self.side.upper()} Eye"
+        self._win_name = win_name  # 保存以便 headless_off 时重建
         if not self._headless:
             cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
             cv2.waitKey(1)  # 触发窗口系统初始化
@@ -175,6 +178,10 @@ class GazeVectorTracker:
                             self.lock_eye_center()
                         elif cmd == "unlock_center":
                             self.unlock_eye_center()
+                        elif cmd == "headless_on":
+                            self._switch_headless_on()
+                        elif cmd == "headless_off":
+                            self._switch_headless_off()
                     except Exception:
                         pass  # 队列已空或其他读取错误，忽略
 
@@ -195,8 +202,8 @@ class GazeVectorTracker:
             if self.flip:
                 frame = cv2.flip(frame, 0)
 
-            # ---- 剪裁 ----
-            x1, x2, y1, y2 = self.crop
+            # ---- 剪裁（crop 格式: [x1, y1, x2, y2]） ----
+            x1, y1, x2, y2 = self.crop
             if y2 > frame.shape[0] or x2 > frame.shape[1]:
                 print(f"警告：crop {self.crop} 超出帧尺寸 {frame.shape}")
                 continue
@@ -205,7 +212,7 @@ class GazeVectorTracker:
             # ---- 核心处理 ----
             self._process_frame(frame)
 
-            # ---- 退出检测 ----
+            # ---- 退出检测 + 窗口异常自动降级 ----
             if not self._headless:
                 key = cv2.waitKey(1) & 0xFF
                 if key == 27 or key == ord('q'):
@@ -213,11 +220,50 @@ class GazeVectorTracker:
                     break
                 try:
                     if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
-                        break
+                        # 窗口被关闭（如 VNC 断开），自动降级为 headless
+                        print(f"[{self.side}] OpenCV 窗口丢失，自动切换为 headless 模式")
+                        self._switch_headless_on()
                 except cv2.error:
-                    break
+                    # X11 连接异常，自动降级为 headless
+                    print(f"[{self.side}] X11 异常，自动切换为 headless 模式")
+                    self._switch_headless_on()
 
         self._cleanup()
+
+    def _switch_headless_on(self):
+        """运行时切换为 headless 模式：销毁 OpenCV 窗口，停止 GUI 调用。
+        
+        cv2.destroyAllWindows() 是异步的，窗口管理器需要事件循环泵送
+        才能完成实际销毁。此处主动泵送最多 10 轮（~500ms）以确保窗口
+        即时消失，避免按下"关闭全部 GUI"后 OpenCV 窗口残留 1 秒多的现象。
+        """
+        if self._headless:
+            return
+        try:
+            cv2.destroyAllWindows()
+            # 主动泵送事件循环，驱动窗口管理器完成异步销毁
+            for _ in range(20):
+                if cv2.waitKey(1) < 0:
+                    break
+        except cv2.error:
+            pass  # X11 已断开时的安全清理
+        self._headless = True
+        print(f"[{self.side}] 已切换到 headless 模式")
+
+    def _switch_headless_off(self):
+        """运行时退出 headless 模式：重建 OpenCV 窗口，恢复 GUI 绘制。"""
+        if not self._headless:
+            return
+        self._headless = False
+        print(f"[{self.side}] 已退出 headless 模式")
+        try:
+            if self._win_name:
+                cv2.namedWindow(self._win_name, cv2.WINDOW_NORMAL)
+                cv2.waitKey(1)
+        except cv2.error as e:
+            print(f"[{self.side}] 无法重建 OpenCV 窗口: {e}")
+            # 如果失败则退回头 headless
+            self._headless = True
 
     def stop(self):
         """停止追踪并释放资源。"""
@@ -231,7 +277,10 @@ class GazeVectorTracker:
             self.cap.release()
             self.cap = None
         if not self._headless:
-            cv2.destroyAllWindows()
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
 
     def get_last_tracking_result(self):
         """返回最近一次的追踪结果字典。"""

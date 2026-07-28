@@ -1,14 +1,8 @@
-left_cam_crop:
-- 176
-- 385
-- 117
-- 274
-left_cam_flip: true
-left_cam_i: 2
-right_cam_crop:
-- 317
-- 506
-- 142
-- 284
-right_cam_flip: true
-right_cam_i: 0
+left:
+  camera_index: 2
+  crop: [226, 104, 426, 254]
+  flip: true
+right:
+  camera_index: 0
+  crop: [216, 68, 368, 182]
+  flip: false

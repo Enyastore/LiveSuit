@@ -8,12 +8,28 @@
   5) 核心编排: EyeTrackingModule
   6) 独立入口: __main__
 
-提供对外接口：
+对外接口：
   module = EyeTrackingModule()
   module.start()
   state = module.get_normalized_eye_state()  # {"left": {"eye_x":..., "eye_y":...}, "right":...}
   module.stop()
+
+  调试画面控制（隐藏/显示子进程 OpenCV 窗口）：
+    module.enter_headless_mode()   # 隐藏 OpenCV 调试窗口
+    module.exit_headless_mode()    # 显示 OpenCV 调试窗口
+    module.headless_runtime        # bool，查询当前状态
+
+  ⚠️ 归一化依赖 extreme_vectors.yaml 标定文件（通过控制面板录制极值向量）。
+     无此文件时 get_normalized_eye_state() 返回的 eye_x / eye_y 均为 None，
+     下游调用者须自行处理降级（保持上一帧有效值 / 使用 get_raw_gaze_vector() / 输出 0.0）。
 """
+
+__all__ = [
+    "EyeTrackingModule",
+    "detect_cameras",
+    "AppConfig",
+    "CameraConfig",
+]
 
 import tkinter as tk
 import cv2
@@ -28,7 +44,6 @@ import time
 import logging
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
-from pathlib import Path
 
 # 内部依赖
 from gaze_vector_tracker import GazeVectorTracker
@@ -37,14 +52,28 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
+# 0. 工具函数
+# ============================================================
+
+def _setup_camera(index: int) -> Optional[cv2.VideoCapture]:
+    """打开指定索引的相机并设置基本参数。"""
+    cap = cv2.VideoCapture(index)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    if not cap.isOpened():
+        cap.release()
+        return None
+    return cap
+
+
+# ============================================================
 # 1. 数据模型
 # ============================================================
 
 @dataclass
 class CameraConfig:
-    """单个相机的配置。"""
+    """单个相机的配置。crop 格式: [x1, y1, x2, y2]。"""
     index: int = 0
-    crop: List[int] = field(default_factory=lambda: [0, 640, 0, 480])
+    crop: List[int] = field(default_factory=lambda: [0, 0, 640, 480])
     flip: bool = False
 
 
@@ -82,44 +111,51 @@ class ConfigPersistence:
         if data is None:
             return AppConfig()
 
-        config = AppConfig()
         try:
-            if 'left_cam_i' in data:
-                config.left.index = int(data['left_cam_i'])
-            if 'right_cam_i' in data:
-                config.right.index = int(data['right_cam_i'])
-            if 'left_cam_crop' in data and isinstance(data['left_cam_crop'], list):
-                config.left.crop = data['left_cam_crop']
-            if 'right_cam_crop' in data and isinstance(data['right_cam_crop'], list):
-                config.right.crop = data['right_cam_crop']
-            if 'left_cam_flip' in data:
-                config.left.flip = bool(data['left_cam_flip'])
-            if 'right_cam_flip' in data:
-                config.right.flip = bool(data['right_cam_flip'])
+            left_data = data.get('left', {})
+            right_data = data.get('right', {})
+            config = AppConfig(
+                left=CameraConfig(
+                    index=left_data.get('camera_index', 0),
+                    crop=left_data.get('crop', [0, 0, 640, 480]),
+                    flip=left_data.get('flip', False),
+                ),
+                right=CameraConfig(
+                    index=right_data.get('camera_index', 0),
+                    crop=right_data.get('crop', [0, 0, 640, 480]),
+                    flip=right_data.get('flip', False),
+                ),
+            )
         except Exception as e:
             logger.warning(f"配置数据格式有误，部分使用默认值: {e}")
+            return AppConfig()
+
         return config
 
     def save(self, config: AppConfig) -> None:
         """保存配置到文件。"""
         data = {
-            'left_cam_i': config.left.index,
-            'right_cam_i': config.right.index,
-            'left_cam_crop': config.left.crop,
-            'right_cam_crop': config.right.crop,
-            'left_cam_flip': config.left.flip,
-            'right_cam_flip': config.right.flip,
+            'left': {
+                'camera_index': config.left.index,
+                'crop': config.left.crop,
+                'flip': config.left.flip,
+            },
+            'right': {
+                'camera_index': config.right.index,
+                'crop': config.right.crop,
+                'flip': config.right.flip,
+            },
         }
         try:
             with open(self._filepath, 'w', encoding='utf-8') as f:
-                yaml.dump(data, f, allow_unicode=True)
+                yaml.dump(data, f, allow_unicode=True, default_flow_style=None)
             logger.info("配置已保存")
         except Exception as e:
             logger.error(f"保存配置文件失败: {e}")
 
 
 # ============================================================
-# 3. 调试预览窗口（封装原 _setup_cam 逻辑）
+# 3. 调试预览窗口
 # ============================================================
 
 class CropDebugWindow:
@@ -129,51 +165,31 @@ class CropDebugWindow:
 
     def __init__(
         self,
-        parent: tk.Tk,
+        master: tk.Tk,
         cam_index: int,
         side: str,
         cam_config: CameraConfig,
         on_config_changed: "callable" = None,
     ):
-        """
-        Parameters
-        ----------
-        parent : tk.Tk
-            父窗口。
-        cam_index : int
-            相机索引。
-        side : str
-            "left" 或 "right"。
-        cam_config : CameraConfig
-            当前相机配置（将被原地修改）。
-        on_config_changed : callable | None
-            配置发生变更时的回调。
-        """
-        self._parent = parent
+        self._master = master
         self._side = side
         self._cam_config = cam_config
         self._on_config_changed = on_config_changed
 
-        # 视频捕获
-        self._cap = cv2.VideoCapture(cam_index)
-        self._cap.set(cv2.CAP_PROP_FPS, 30)
-        if not self._cap.isOpened():
+        self._cap = _setup_camera(cam_index)
+        if self._cap is None:
             raise RuntimeError(f"无法打开相机 {cam_index}")
 
-        # 窗口
-        self._window = tk.Toplevel(parent)
+        self._window = tk.Toplevel(master)
         self._window.title(
             f"调试 - {'左眼' if side == 'left' else '右眼'}相机 (索引 {cam_index})"
         )
 
-        # 裁剪状态
         self._crop_mode: bool = False
-        self._crop_rect: Optional[List[int]] = None  # [x1, y1, x2, y2]
+        self._crop_rect: Optional[Tuple[int, int, int, int]] = None
         self._drawing: bool = False
         self._start_x: int = 0
         self._start_y: int = 0
-
-        # 运行标志
         self._running: bool = True
 
         self._build_ui()
@@ -181,12 +197,7 @@ class CropDebugWindow:
         self._window.protocol("WM_DELETE_WINDOW", self._on_close)
         self._show_frame_loop()
 
-    # ----------------------------------------------------------
-    # UI 构建
-    # ----------------------------------------------------------
-
     def _build_ui(self) -> None:
-        """构建按钮栏与视频标签。"""
         btn_frame = tk.Frame(self._window)
         btn_frame.pack(pady=(5, 0))
 
@@ -206,17 +217,11 @@ class CropDebugWindow:
         self._video_label.pack()
 
     def _bind_mouse_events(self) -> None:
-        """绑定鼠标事件用于绘制剪裁矩形。"""
         self._video_label.bind("<ButtonPress-1>", self._on_press)
         self._video_label.bind("<B1-Motion>", self._on_drag)
         self._video_label.bind("<ButtonRelease-1>", self._on_release)
 
-    # ----------------------------------------------------------
-    # 剪裁交互
-    # ----------------------------------------------------------
-
     def _toggle_crop(self) -> None:
-        """切换剪裁模式。"""
         self._crop_mode = not self._crop_mode
         if self._crop_mode:
             self._crop_rect = None
@@ -225,21 +230,16 @@ class CropDebugWindow:
             self._btn_crop.config(relief=tk.RAISED)
 
     def _save_crop_config(self) -> None:
-        """保存当前剪裁区域到配置。"""
         if self._crop_rect is not None:
             x1, y1, x2, y2 = self._crop_rect
             logger.info(f"剪裁区域: x1={x1}, y1={y1}, x2={x2}, y2={y2}")
-            self._cam_config.crop = [x1, x2, y1, y2]
+            self._cam_config.crop = [x1, y1, x2, y2]
             self._cam_config.flip = self._flip_var.get()
             if self._on_config_changed:
                 self._on_config_changed()
             logger.info(f"{self._side}眼相机配置已保存")
         else:
             logger.warning("未选择剪裁区域")
-
-    # ----------------------------------------------------------
-    # 鼠标事件
-    # ----------------------------------------------------------
 
     def _on_press(self, event: tk.Event) -> None:
         if not self._crop_mode:
@@ -267,47 +267,34 @@ class CropDebugWindow:
     @classmethod
     def _constrain_rect(
         cls, x1: int, y1: int, x2: int, y2: int
-    ) -> Optional[List[int]]:
-        """返回固定比例的矩形 [x1, y1, x2, y2]，或 None。"""
-        dx = x2 - x1
-        dy = y2 - y1
-        if dx == 0 and dy == 0:
+    ) -> Optional[Tuple[int, int, int, int]]:
+        w = abs(x2 - x1)
+        h = abs(y2 - y1)
+        if w == 0 and h == 0:
             return None
-
         ratio = cls.CROP_TARGET_RATIO
-        if abs(dx) / max(abs(dy), 1) > ratio:
-            new_w = abs(dx)
-            new_h = int(new_w / ratio)
-            y2 = y1 + new_h if dy >= 0 else y1 - new_h
-            x2 = x1 + dx
+        if w / max(h, 1) > ratio:
+            new_w = w
+            new_h = max(1, int(w / ratio))
         else:
-            new_h = abs(dy)
-            new_w = int(new_h * ratio)
-            x2 = x1 + new_w if dx >= 0 else x1 - new_w
-            y2 = y1 + dy
-
-        x1, x2 = min(x1, x2), max(x1, x2)
-        y1, y2 = min(y1, y2), max(y1, y2)
-        return [x1, y1, x2, y2]
-
-    # ----------------------------------------------------------
-    # 视频循环
-    # ----------------------------------------------------------
+            new_h = h
+            new_w = max(1, int(h * ratio))
+        end_x = x1 + new_w if x2 >= x1 else x1 - new_w
+        end_y = y1 + new_h if y2 >= y1 else y1 - new_h
+        result_x1, result_x2 = min(x1, end_x), max(x1, end_x)
+        result_y1, result_y2 = min(y1, end_y), max(y1, end_y)
+        return [result_x1, result_y1, result_x2, result_y2]
 
     def _show_frame_loop(self) -> None:
-        """读取帧、绘制剪裁框、更新 Tk Label。"""
         if not self._running:
             return
-
         ret, frame = self._cap.read()
         if self._flip_var.get():
             frame = cv2.flip(frame, 0)
-
         if ret:
             if self._crop_mode and self._crop_rect is not None:
                 x1, y1, x2, y2 = self._crop_rect
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
-
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(frame_rgb)
             imgtk = ImageTk.PhotoImage(image=img)
@@ -319,50 +306,48 @@ class CropDebugWindow:
             self._video_label.after(100, self._show_frame_loop)
 
     def _on_close(self) -> None:
-        """关闭窗口，释放相机。"""
         self._running = False
         if self._cap is not None:
             self._cap.release()
             self._cap = None
         self._window.destroy()
 
+    def close(self) -> None:
+        self._on_close()
+
     def get_window(self) -> tk.Toplevel:
-        """返回托管的 Toplevel 窗口。"""
         return self._window
 
 
 # ============================================================
-# 4. 控制面板（封装原 _open_control_panel 逻辑）
+# 4. 控制面板
 # ============================================================
 
 class ControlPanel:
-    """Toplevel 控制面板：锁定 / 解锁眼球参数 + 保存极限注视向量。"""
+    """Toplevel 控制面板：锁定/解锁眼球参数 + 保存极限注视向量。"""
 
     def __init__(
         self,
-        parent: tk.Tk,
+        master: tk.Tk,
         cmd_queue_left: Optional[multiprocessing.Queue],
         cmd_queue_right: Optional[multiprocessing.Queue],
-        gaze_reader: "callable",   # (side: str) -> Optional[List[float]]
+        gaze_reader: "callable",
         normalizer: "Normalizer",
     ):
-        self._parent = parent
+        self._master = master
         self._cmd_queue_left = cmd_queue_left
         self._cmd_queue_right = cmd_queue_right
         self._gaze_reader = gaze_reader
         self._normalizer = normalizer
-
-        # 锁定状态
-        self._lock_left_radius = False
-        self._lock_left_center = False
-        self._lock_right_radius = False
-        self._lock_right_center = False
-
+        self._locks: Dict[str, bool] = {
+            "left_radius": False, "left_center": False,
+            "right_radius": False, "right_center": False,
+        }
         self._window: Optional[tk.Toplevel] = None
         self._open()
 
     def _open(self) -> None:
-        self._window = tk.Toplevel(self._parent)
+        self._window = tk.Toplevel(self._master)
         self._window.title("控制面板")
         self._window.resizable(False, False)
 
@@ -370,105 +355,57 @@ class ControlPanel:
             pady=(10, 5)
         )
 
-        # 左眼
         tk.Label(self._window, text="左眼").pack(anchor="w", padx=20, pady=(5, 0))
-        self._make_button(
-            self._cmd_queue_left,
-            "左眼半径",
-            "_lock_left_radius",
-        ).pack(pady=2)
-        self._make_button(
-            self._cmd_queue_left,
-            "左眼中心",
-            "_lock_left_center",
-        ).pack(pady=2)
+        self._make_button(self._cmd_queue_left, "左眼半径", "left_radius").pack(pady=2)
+        self._make_button(self._cmd_queue_left, "左眼中心", "left_center").pack(pady=2)
 
-        # 右眼
         tk.Label(self._window, text="右眼").pack(anchor="w", padx=20, pady=(10, 0))
-        self._make_button(
-            self._cmd_queue_right,
-            "右眼半径",
-            "_lock_right_radius",
-        ).pack(pady=2)
-        self._make_button(
-            self._cmd_queue_right,
-            "右眼中心",
-            "_lock_right_center",
-        ).pack(pady=2)
+        self._make_button(self._cmd_queue_right, "右眼半径", "right_radius").pack(pady=2)
+        self._make_button(self._cmd_queue_right, "右眼中心", "right_center").pack(pady=2)
 
-        # 极限注视向量
-        tk.Label(
-            self._window, text="极限注视向量", font=("", 10, "bold")
-        ).pack(pady=(10, 5))
-        directions = [
-            ("仰视", "up"),
-            ("俯视", "down"),
-            ("内眼角", "inner"),
-            ("外眼角", "outer"),
-        ]
+        tk.Label(self._window, text="极限注视向量", font=("", 10, "bold")).pack(pady=(10, 5))
+        directions = [("仰视", "up"), ("俯视", "down"), ("内眼角", "inner"), ("外眼角", "outer")]
         for eye_side in ("left", "right"):
             eye_label = "左眼" if eye_side == "left" else "右眼"
-            tk.Label(self._window, text=eye_label).pack(
-                anchor="w", padx=20, pady=(5, 0)
-            )
+            tk.Label(self._window, text=eye_label).pack(anchor="w", padx=20, pady=(5, 0))
             for label, dir_key in directions:
-                btn = tk.Button(
+                tk.Button(
                     self._window,
                     text=f"保存{eye_label}{label}向量",
                     command=lambda s=eye_side, d=dir_key: self._save_extreme_vector(s, d),
                     width=22,
-                )
-                btn.pack(pady=1)
+                ).pack(pady=1)
 
-        def _on_close() -> None:
+        def _on_close():
             self._window.destroy()
             self._window = None
-
         self._window.protocol("WM_DELETE_WINDOW", _on_close)
 
-    def _make_button(
-        self,
-        queue: Optional[multiprocessing.Queue],
-        label_prefix: str,
-        lock_attr: str,
-    ) -> tk.Button:
-        """创建一个带动态文字的锁定 / 解锁按钮。"""
+    def _make_button(self, queue, label_prefix, lock_key):
         btn_text = tk.StringVar()
 
-        def update_text(*args) -> None:
-            locked = getattr(self, lock_attr)
-            btn_text.set(
-                f"解锁{label_prefix}" if locked else f"锁定{label_prefix}"
-            )
+        def update_text(*args):
+            btn_text.set(f"解锁{label_prefix}" if self._locks[lock_key] else f"锁定{label_prefix}")
 
-        def toggle() -> None:
+        def toggle():
             if queue is None:
                 logger.warning(f"[{label_prefix}] 追踪尚未启动")
                 return
-            locked = getattr(self, lock_attr)
+            locked = self._locks[lock_key]
             if locked:
-                if "半径" in label_prefix:
-                    queue.put_nowait("unlock_radius")
-                else:
-                    queue.put_nowait("unlock_center")
+                queue.put_nowait("unlock_radius" if "半径" in label_prefix else "unlock_center")
             else:
-                if "半径" in label_prefix:
-                    queue.put_nowait("lock_radius")
-                else:
-                    queue.put_nowait("lock_center")
-            setattr(self, lock_attr, not locked)
+                queue.put_nowait("lock_radius" if "半径" in label_prefix else "lock_center")
+            self._locks[lock_key] = not locked
             update_text()
 
         update_text()
-        btn = tk.Button(
-            self._window, textvariable=btn_text, command=toggle, width=18
-        )
+        btn = tk.Button(self._window, textvariable=btn_text, command=toggle, width=18)
         if queue is None:
             btn.config(state=tk.DISABLED)
         return btn
 
     def _save_extreme_vector(self, side: str, direction: str) -> None:
-        """从当前注视向量缓存中取出值并保存为极限向量。"""
         vector = self._gaze_reader(side)
         if vector is None:
             logger.warning(f"未能获取 {side} 眼当前向量，跳过保存")
@@ -490,13 +427,7 @@ class ControlPanel:
 # ============================================================
 
 class Normalizer:
-    """将 gaze_rotated 矢量映射为归一化 eye_x / eye_y 参数。
-
-    依赖极值向量文件 (extream_vectors.yaml) 进行插值。
-    若某轴的极值不全则对应轴返回 None。
-    """
-
-    def __init__(self, extreme_file: str = "extream_vectors.yaml"):
+    def __init__(self, extreme_file: str = "extreme_vectors.yaml"):
         self._extreme_file = os.path.join(os.path.dirname(__file__), extreme_file)
         self._extremes: Dict[str, List[float]] = {}
         self._load_extremes()
@@ -511,7 +442,6 @@ class Normalizer:
             logger.info("极值向量文件不存在，归一化将返回 None")
 
     def set_extreme(self, side: str, direction: str, vector: List[float]) -> None:
-        """记录一个极值向量并持久化。"""
         key = f"{side}_{direction}"
         self._extremes[key] = vector
         try:
@@ -521,74 +451,61 @@ class Normalizer:
             logger.error(f"保存极值向量失败: {e}")
 
     def normalize(self, side: str, gaze_rotated: List[float]) -> Dict[str, Optional[float]]:
-        """计算归一化参数。
-
-        Returns
-        -------
-        dict:
-            {"eye_x": float|None, "eye_y": float|None}
-            eye_x: -1=外眼角, +1=内眼角
-            eye_y: +1=仰视, -1=俯视
-        """
         result = {"eye_x": None, "eye_y": None}
-
         if not gaze_rotated or len(gaze_rotated) != 3:
             return result
-
-        # eye_x: inner ↔ outer
-        inner_key = f"{side}_inner"
-        outer_key = f"{side}_outer"
-        if inner_key in self._extremes and outer_key in self._extremes:
-            result["eye_x"] = self._angular_interpolate(
-                gaze_rotated,
-                self._extremes[outer_key],   # outer → -1
-                self._extremes[inner_key],   # inner → +1
-            )
-
-        # eye_y: up ↔ down
-        up_key = f"{side}_up"
-        down_key = f"{side}_down"
-        if up_key in self._extremes and down_key in self._extremes:
-            result["eye_y"] = self._angular_interpolate(
-                gaze_rotated,
-                self._extremes[down_key],    # down → -1
-                self._extremes[up_key],      # up → +1
-            )
-
+        inner_key, outer_key = f"{side}_inner", f"{side}_outer"
+        up_key, down_key = f"{side}_up", f"{side}_down"
+        if not all(k in self._extremes for k in (inner_key, outer_key, up_key, down_key)):
+            return result
+        eye_x, eye_y = self._orthogonal_project(
+            gaze_rotated,
+            self._extremes[inner_key], self._extremes[outer_key],
+            self._extremes[up_key], self._extremes[down_key],
+        )
+        result["eye_x"] = eye_x
+        result["eye_y"] = eye_y
         return result
 
     @staticmethod
-    def _angular_interpolate(
-        current: List[float],
-        neg_ref: List[float],
-        pos_ref: List[float],
-    ) -> float:
-        """基于向量夹角做线性插值，neg_ref → -1, pos_ref → +1。"""
-        import numpy as np
-        a = np.array(current)
-        b = np.array(neg_ref)
-        c = np.array(pos_ref)
+    def _orthogonal_project(current, inner, outer, up, down):
+        import math
+        cx = inner[0] + outer[0] + up[0] + down[0]
+        cy = inner[1] + outer[1] + up[1] + down[1]
+        cz = inner[2] + outer[2] + up[2] + down[2]
+        c_len = math.sqrt(cx * cx + cy * cy + cz * cz)
+        if c_len < 1e-12:
+            return None, None
+        cx /= c_len; cy /= c_len; cz /= c_len
 
-        a_norm = a / np.linalg.norm(a)
-        b_norm = b / np.linalg.norm(b)
-        c_norm = c / np.linalg.norm(c)
+        raw_ex = [inner[0] - outer[0], inner[1] - outer[1], inner[2] - outer[2]]
+        d_ex = raw_ex[0] * cx + raw_ex[1] * cy + raw_ex[2] * cz
+        ex = [raw_ex[0] - d_ex * cx, raw_ex[1] - d_ex * cy, raw_ex[2] - d_ex * cz]
+        ex_len = math.sqrt(ex[0]**2 + ex[1]**2 + ex[2]**2)
+        if ex_len < 1e-12:
+            return None, None
+        ex = [ex[0] / ex_len, ex[1] / ex_len, ex[2] / ex_len]
 
-        # total angle between neg and pos references
-        total_cos = np.clip(np.dot(b_norm, c_norm), -1.0, 1.0)
-        total_angle = np.arccos(total_cos)
+        ey = [cy * ex[2] - cz * ex[1], cz * ex[0] - cx * ex[2], cx * ex[1] - cy * ex[0]]
+        ey_len = math.sqrt(ey[0]**2 + ey[1]**2 + ey[2]**2)
+        if ey_len < 1e-12:
+            return None, None
+        ey = [ey[0] / ey_len, ey[1] / ey_len, ey[2] / ey_len]
 
-        if total_angle < 1e-6:
-            return 0.0
+        def dot(a, b):
+            return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 
-        # angle from neg_ref to current
-        cos_angle = np.clip(np.dot(b_norm, a_norm), -1.0, 1.0)
-        angle = np.arccos(cos_angle)
+        outer_x, inner_x = dot(outer, ex), dot(inner, ex)
+        down_y, up_y = dot(down, ey), dot(up, ey)
+        cur_x, cur_y = dot(current, ex), dot(current, ey)
 
-        # Clamp to [0, total_angle]
-        angle = max(0.0, min(angle, total_angle))
+        def clamp_map(val, lo, hi):
+            if hi - lo < 1e-12:
+                return 0.0
+            val = max(lo, min(val, hi))
+            return 2.0 * (val - lo) / (hi - lo) - 1.0
 
-        # Map: 0 → -1, total_angle → +1
-        return float(2.0 * angle / total_angle - 1.0)
+        return clamp_map(cur_x, outer_x, inner_x), clamp_map(cur_y, down_y, up_y)
 
 
 # ============================================================
@@ -596,30 +513,20 @@ class Normalizer:
 # ============================================================
 
 class GazeConsumer:
-    """守护线程：以高频轮询 result_queue，实时产出归一化眼动数据。
-
-    设计要点：
-    - 约 1ms 轮询一次队列，确保不落后于视频帧率
-    - 结果写入线程安全的缓存供外部读取
-    - 内嵌 Normalizer 管道
-    """
-
     def __init__(self, normalizer: Normalizer):
         self._normalizer = normalizer
         self._queue: Optional[multiprocessing.Queue] = None
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
-        # 缓存最新的 raw 与 normalized 数据
-        self._raw_gaze: Dict[str, Optional[List[float]]] = {"left": None, "right": None}
-        self._normalized: Dict[str, Dict[str, Optional[float]]] = {
+        self._raw_gaze: Dict = {"left": None, "right": None}
+        self._normalized: Dict = {
             "left": {"eye_x": None, "eye_y": None, "confidence": None},
             "right": {"eye_x": None, "eye_y": None, "confidence": None},
         }
         self._last_update: float = 0.0
 
     def start(self, result_queue: multiprocessing.Queue) -> None:
-        """启动消费者线程。"""
         if self._thread is not None and self._thread.is_alive():
             return
         self._queue = result_queue
@@ -629,7 +536,6 @@ class GazeConsumer:
         logger.info("注视向量消费者线程已启动")
 
     def stop(self) -> None:
-        """停止消费者线程并清空缓存。"""
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=2)
@@ -645,27 +551,21 @@ class GazeConsumer:
             }
 
     def _loop(self) -> None:
-        """主循环：消费队列 → 归一化 → 写入缓存。"""
-        import numpy as np  # local import for subprocess compatibility
-
+        import numpy as np
         while not self._stop_event.is_set():
             try:
-                while True:
-                    data = self._queue.get_nowait()
-                    self._process(data)
+                data = self._queue.get(timeout=0.001)
+                self._process(data)
             except queue.Empty:
                 pass
             except Exception:
                 pass
-            self._stop_event.wait(0.001)  # 约 1ms 轮询
 
     def _process(self, data: dict) -> None:
-        """处理单条队列消息。"""
         side = data.get("side")
         gaze = data.get("gaze_rotated")
         if side is None or gaze is None:
             return
-
         with self._lock:
             self._raw_gaze[side] = gaze
             self._normalized[side] = self._normalizer.normalize(side, gaze)
@@ -673,12 +573,10 @@ class GazeConsumer:
             self._last_update = time.time()
 
     def get_raw_gaze(self, side: str) -> Optional[List[float]]:
-        """读取某侧最新原始注视向量（线程安全）。"""
         with self._lock:
             return self._raw_gaze.get(side)
 
     def get_normalized_state(self) -> dict:
-        """读取最新归一化状态（线程安全）。"""
         with self._lock:
             return {
                 "left": dict(self._normalized["left"]),
@@ -702,99 +600,141 @@ class EyeTrackingModule:
         mod.stop()
 
         # 调试模式（独立运行 GUI）
-        mod = EyeTrackingModule(headless=False)
+        mod = EyeTrackingModule(headless=False, master=root)
         mod.start()
         mod.open_control_panel()
         ...
         mod.stop()
+
+    调试画面控制（仅隐藏/显示子进程 OpenCV 窗口，tkinter 窗口不受影响）：
+        mod.enter_headless_mode()   # 隐藏 OpenCV 调试窗口
+        mod.exit_headless_mode()    # 显示 OpenCV 调试窗口
+        mod.headless_runtime        # 查询当前状态
+
+    Parameters
+    ----------
+    headless : bool
+        True 时禁止创建任何 GUI 窗口。
+    master : tk.Tk | None
+        tkinter 父窗口实例。headless=False 时若为 None 会自动创建一个隐藏窗口。
+    config_path : str
+        相机配置文件的路径。
+    extreme_file : str
+        极值向量文件的路径（文件名部分）。
     """
 
     def __init__(
         self,
         headless: bool = False,
+        master: Optional[tk.Tk] = None,
         config_path: str = "config.yaml",
-        extreme_file: str = "extream_vectors.yaml",
+        extreme_file: str = "extreme_vectors.yaml",
     ):
         self._headless = headless
 
-        # 配置与持久化
+        if headless:
+            self._master: Optional[tk.Tk] = None
+        elif master is not None:
+            self._master = master
+        else:
+            self._master = tk.Tk()
+            self._master.withdraw()
+
         self._persistence = ConfigPersistence(config_path)
         self.config: AppConfig = self._persistence.load()
-
-        # 归一化器
         self._normalizer = Normalizer(extreme_file)
-
-        # 消费者
         self._consumer = GazeConsumer(self._normalizer)
 
-        # 进程管理
         self._process_left: Optional[multiprocessing.Process] = None
         self._process_right: Optional[multiprocessing.Process] = None
         self._cmd_queue_left: Optional[multiprocessing.Queue] = None
         self._cmd_queue_right: Optional[multiprocessing.Queue] = None
         self._result_queue: Optional[multiprocessing.Queue] = None
 
-        # 调试 UI 引用
         self._crop_window_left: Optional[CropDebugWindow] = None
         self._crop_window_right: Optional[CropDebugWindow] = None
         self._control_panel: Optional[ControlPanel] = None
+
+        # 运行时无头状态（仅控制子进程 OpenCV 窗口）
+        self._headless_runtime: bool = False
 
     # ----------------------------------------------------------
     # 公共 API
     # ----------------------------------------------------------
 
+    @property
+    def headless_runtime(self) -> bool:
+        return self._headless_runtime
+
+    def enter_headless_mode(self) -> None:
+        """隐藏子进程的 OpenCV 调试窗口。tkinter 窗口不受影响。"""
+        if self._headless_runtime:
+            return
+        for q in [self._cmd_queue_left, self._cmd_queue_right]:
+            if q is not None:
+                try:
+                    q.put_nowait("headless_on")
+                except Exception:
+                    pass
+        self._headless_runtime = True
+        logger.info("已隐藏 OpenCV 调试窗口")
+
+    def exit_headless_mode(self) -> None:
+        """恢复子进程的 OpenCV 调试窗口。"""
+        if not self._headless_runtime:
+            return
+        for q in [self._cmd_queue_left, self._cmd_queue_right]:
+            if q is not None:
+                try:
+                    q.put_nowait("headless_off")
+                except Exception:
+                    pass
+        self._headless_runtime = False
+        logger.info("已恢复 OpenCV 调试窗口")
+
     def start(self) -> None:
-        """启动双眼追踪（子进程 + 消费者线程）。"""
         self._stop_internal()
 
         self._cmd_queue_left = multiprocessing.Queue()
         self._cmd_queue_right = multiprocessing.Queue()
         self._result_queue = multiprocessing.Queue()
 
-        # 启动左眼子进程
         self._process_left = multiprocessing.Process(
             target=_run_tracker_in_process,
-            args=(
-                self.config.left.index,
-                self.config.left.flip,
-                self.config.left.crop,
-                "left",
-                self._cmd_queue_left,
-                self._result_queue,
-                self._headless,
-            ),
+            args=(self.config.left.index, self.config.left.flip, self.config.left.crop,
+                  "left", self._cmd_queue_left, self._result_queue, self._headless),
             daemon=True,
         )
         self._process_left.start()
 
-        # 启动右眼子进程
         self._process_right = multiprocessing.Process(
             target=_run_tracker_in_process,
-            args=(
-                self.config.right.index,
-                self.config.right.flip,
-                self.config.right.crop,
-                "right",
-                self._cmd_queue_right,
-                self._result_queue,
-                self._headless,
-            ),
+            args=(self.config.right.index, self.config.right.flip, self.config.right.crop,
+                  "right", self._cmd_queue_right, self._result_queue, self._headless),
             daemon=True,
         )
         self._process_right.start()
 
-        # 启动消费者线程
-        self._consumer.start(self._result_queue)
+        time.sleep(0.5)
+        left_alive = self._process_left.is_alive()
+        right_alive = self._process_right.is_alive()
 
+        if not left_alive or not right_alive:
+            self._stop_internal()
+            failed_side = []
+            if not left_alive:
+                failed_side.append("左眼")
+            if not right_alive:
+                failed_side.append("右眼")
+            raise RuntimeError(f"{'、'.join(failed_side)}追踪子进程启动失败（相机不可用或索引错误）")
+
+        self._consumer.start(self._result_queue)
         logger.info("双眼眼球追踪已启动")
 
     def stop(self) -> None:
-        """停止追踪，回收资源。"""
         self._stop_internal()
 
     def _stop_internal(self) -> None:
-        """内部停止逻辑。"""
-        # 关闭控制面板
         if self._control_panel is not None:
             self._control_panel.destroy()
             self._control_panel = None
@@ -814,117 +754,71 @@ class EyeTrackingModule:
         logger.info("眼球追踪已停止")
 
     def get_normalized_eye_state(self) -> dict:
-        """获取最新的归一化眼动参数。
-
-        Returns
-        -------
-        dict:
-            {
-                "left":  {"eye_x": float|None, "eye_y": float|None, "confidence": float|None},
-                "right": {"eye_x": float|None, "eye_y": float|None, "confidence": float|None},
-                "timestamp": float
-            }
-        """
         return self._consumer.get_normalized_state()
 
     def get_raw_gaze_vector(self, side: str) -> Optional[List[float]]:
-        """获取某侧最新的原始 gaze_rotated 向量。"""
         return self._consumer.get_raw_gaze(side)
 
     def is_running(self) -> bool:
-        """追踪是否正在运行。"""
         return (
-            self._process_left is not None
-            and self._process_left.is_alive()
-            and self._process_right is not None
-            and self._process_right.is_alive()
+            self._process_left is not None and self._process_left.is_alive()
+            and self._process_right is not None and self._process_right.is_alive()
         )
 
     # ----------------------------------------------------------
-    # 调试 UI 方法（仅非 headless 模式下使用）
+    # 调试 UI 方法
     # ----------------------------------------------------------
 
     def open_crop_window(self, side: str) -> None:
-        """打开指定侧的剪裁调试窗口。
-
-        Parameters
-        ----------
-        side : str
-            "left" / "right"
-        """
-        if self._headless:
+        if self._headless or self._master is None:
             logger.warning("headless 模式下无法打开调试窗口")
             return
-
-        import tkinter as tk
-        # 使用一个隐藏的 root 作为父窗口
-        parent = tk._default_root
-        if parent is None:
-            parent = tk.Tk()
-            parent.withdraw()
 
         if side == "left":
             if self._crop_window_left is not None:
                 self._crop_window_left.get_window().deiconify()
                 return
             self._crop_window_left = CropDebugWindow(
-                parent,
-                self.config.left.index,
-                "left",
-                self.config.left,
-                on_config_changed=lambda: None,
+                self._master, self.config.left.index, "left", self.config.left,
+                on_config_changed=self.save_config,
             )
-            def _on_left_close():
-                if self._crop_window_left is not None:
-                    self._crop_window_left._on_close()
-                self._crop_window_left = None
             self._crop_window_left.get_window().protocol(
-                "WM_DELETE_WINDOW", _on_left_close
+                "WM_DELETE_WINDOW", self._on_left_crop_close
             )
         else:
             if self._crop_window_right is not None:
                 self._crop_window_right.get_window().deiconify()
                 return
             self._crop_window_right = CropDebugWindow(
-                parent,
-                self.config.right.index,
-                "right",
-                self.config.right,
-                on_config_changed=lambda: None,
+                self._master, self.config.right.index, "right", self.config.right,
+                on_config_changed=self.save_config,
             )
-            def _on_right_close():
-                if self._crop_window_right is not None:
-                    self._crop_window_right._on_close()
-                self._crop_window_right = None
             self._crop_window_right.get_window().protocol(
-                "WM_DELETE_WINDOW", _on_right_close
+                "WM_DELETE_WINDOW", self._on_right_crop_close
             )
+
+    def _on_left_crop_close(self) -> None:
+        if self._crop_window_left is not None:
+            self._crop_window_left.close()
+        self._crop_window_left = None
+
+    def _on_right_crop_close(self) -> None:
+        if self._crop_window_right is not None:
+            self._crop_window_right.close()
+        self._crop_window_right = None
 
     def open_control_panel(self) -> None:
-        """打开控制面板（需要先 start）。"""
-        if self._headless:
+        if self._headless or self._master is None:
             logger.warning("headless 模式下无法打开控制面板")
             return
-
-        import tkinter as tk
-        parent = tk._default_root
-        if parent is None:
-            parent = tk.Tk()
-            parent.withdraw()
-
         if self._control_panel is not None and self._control_panel.is_open():
             self._control_panel.destroy()
-
         self._control_panel = ControlPanel(
-            parent,
-            self._cmd_queue_left,
-            self._cmd_queue_right,
-            self.get_raw_gaze_vector,
-            self._normalizer,
+            self._master, self._cmd_queue_left, self._cmd_queue_right,
+            self.get_raw_gaze_vector, self._normalizer,
         )
 
     def save_config(self) -> None:
-        """持久化当前配置。"""
         self._persistence.save(self.config)
 
     def set_left_camera(self, index: int) -> None:
@@ -932,10 +826,6 @@ class EyeTrackingModule:
 
     def set_right_camera(self, index: int) -> None:
         self.config.right.index = index
-
-    # ----------------------------------------------------------
-    # 生命周期
-    # ----------------------------------------------------------
 
     def __enter__(self):
         self.start()
@@ -950,22 +840,13 @@ class EyeTrackingModule:
 # ============================================================
 
 def _run_tracker_in_process(
-    cam_index: int,
-    flip: bool,
-    crop: List[int],
-    side: str,
+    cam_index: int, flip: bool, crop: List[int], side: str,
     command_queue: multiprocessing.Queue,
-    result_queue: multiprocessing.Queue,
-    headless: bool,
+    result_queue: multiprocessing.Queue, headless: bool,
 ) -> None:
-    """在独立子进程中创建并运行 GazeVectorTracker。"""
-    tracker = GazeVectorTracker(
-        cam_index=cam_index, flip=flip, crop=crop, side=side
-    )
+    tracker = GazeVectorTracker(cam_index=cam_index, flip=flip, crop=crop, side=side)
     tracker.start_tracking(
-        command_queue=command_queue,
-        result_queue=result_queue,
-        headless=headless,
+        command_queue=command_queue, result_queue=result_queue, headless=headless,
     )
 
 
@@ -974,19 +855,17 @@ def _run_tracker_in_process(
 # ============================================================
 
 def detect_cameras(max_cams: int = 6) -> List[int]:
-    """检测可用的相机索引。"""
     available: List[int] = []
     for i in range(max_cams):
-        cap = cv2.VideoCapture(i)
-        cap.set(cv2.CAP_PROP_FPS, 30)
-        if cap.isOpened():
+        cap = _setup_camera(i)
+        if cap is not None:
             available.append(i)
             cap.release()
     return available
 
 
 # ============================================================
-# 10. 调试入口（独立运行）
+# 10. 调试入口
 # ============================================================
 
 if __name__ == "__main__":
@@ -1001,18 +880,12 @@ if __name__ == "__main__":
         exit(1)
     print(f"可用相机: {cameras}")
 
-    # 创建核心模块（调试模式）
-    module = EyeTrackingModule(headless=False)
-
-    # ========================
-    # 简单调试 UI
-    # ========================
     root = tk.Tk()
     root.title("眼球追踪模块 — 调试面板")
+    module = EyeTrackingModule(headless=False, master=root)
 
     frame_select = tk.Frame(root)
     frame_select.pack(pady=(10, 5))
-
     tk.Label(frame_select, text="左眼相机").pack(side=tk.LEFT, padx=(10, 5))
     cam_left = ttk.Combobox(frame_select, values=cameras, state="readonly", width=8)
 
@@ -1032,7 +905,6 @@ if __name__ == "__main__":
     _set_combo(cam_right, module.config.right.index)
     cam_right.pack(side=tk.LEFT, padx=(0, 10))
 
-    # 调试按钮
     frame_debug = tk.Frame(root)
     frame_debug.pack(pady=5)
 
@@ -1044,14 +916,9 @@ if __name__ == "__main__":
         module.set_right_camera(int(cam_right.get()))
         module.open_crop_window("right")
 
-    tk.Button(frame_debug, text="调试剪裁左眼相机", command=_open_crop_left).pack(
-        side=tk.LEFT, padx=10
-    )
-    tk.Button(frame_debug, text="调试剪裁右眼相机", command=_open_crop_right).pack(
-        side=tk.LEFT, padx=10
-    )
+    tk.Button(frame_debug, text="调试剪裁左眼相机", command=_open_crop_left).pack(side=tk.LEFT, padx=10)
+    tk.Button(frame_debug, text="调试剪裁右眼相机", command=_open_crop_right).pack(side=tk.LEFT, padx=10)
 
-    # 功能按钮
     frame_action = tk.Frame(root)
     frame_action.pack(pady=(5, 10))
 
@@ -1064,18 +931,31 @@ if __name__ == "__main__":
     def _stop():
         module.stop()
 
-    tk.Button(frame_action, text="开始眼球追踪", command=_start).pack(
-        side=tk.LEFT, padx=10
-    )
-    tk.Button(frame_action, text="停止眼球追踪", command=_stop).pack(
-        side=tk.LEFT, padx=10
-    )
+    tk.Button(frame_action, text="开始眼球追踪", command=_start).pack(side=tk.LEFT, padx=10)
+    tk.Button(frame_action, text="停止眼球追踪", command=_stop).pack(side=tk.LEFT, padx=10)
     tk.Button(
         frame_action, text="保存配置",
         command=lambda: (module.set_left_camera(int(cam_left.get())),
                          module.set_right_camera(int(cam_right.get())),
                          module.save_config())
     ).pack(side=tk.LEFT, padx=10)
+
+    # ---- 调试画面隐藏/显示按钮 ----
+    frame_display = tk.Frame(root)
+    frame_display.pack(pady=(0, 10))
+
+    display_btn_text = tk.StringVar(value="隐藏OpenCV（无头模式）")
+    def _toggle_display():
+        if module.headless_runtime:
+            module.exit_headless_mode()
+            display_btn_text.set("隐藏OpenCV（无头模式）")
+        else:
+            module.enter_headless_mode()
+            display_btn_text.set("显示OpenCV（调试模式）")
+
+    tk.Button(
+        frame_display, textvariable=display_btn_text, command=_toggle_display, width=14
+    ).pack(side=tk.LEFT, padx=5)
 
     def _on_close():
         module.stop()
