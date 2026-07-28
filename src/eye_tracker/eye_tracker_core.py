@@ -146,6 +146,7 @@ class GazeVectorTracker:
         frame_height: int = 480,
         extreme_file: str = "extreme_vectors.yaml",
         use_recommended_resolution: bool = True,
+        dark_search_roi_scale: float = 0.70,
     ):
         self.cam_index = cam_index
         self.flip = flip
@@ -154,6 +155,7 @@ class GazeVectorTracker:
         self.frame_width = frame_width
         self.frame_height = frame_height
         self._use_recommended_resolution = use_recommended_resolution
+        self._dark_search_roi_scale = max(0.1, min(1.0, dark_search_roi_scale))
 
         # ---- 归一化器 ----
         self._normalizer = Normalizer(extreme_file)
@@ -185,6 +187,7 @@ class GazeVectorTracker:
         self._headless = False
         self.result_queue = None
         self._win_name = None
+        self._last_search_ellipse = None  # for debug overlay: (cx, cy, rx, ry)
 
     # ==================== 锁定函数 ====================
 
@@ -246,6 +249,7 @@ class GazeVectorTracker:
             return
 
         self.cap.set(cv2.CAP_PROP_FPS, 30)
+
         self.running = True
         print(f"眼球追踪已启动 (cam={self.cam_index}, side={self.side}, "
               f"headless={self._headless})")
@@ -284,6 +288,9 @@ class GazeVectorTracker:
                         elif isinstance(cmd, tuple) and cmd[0] == "save_extreme":
                             direction, vector = cmd[1], cmd[2]
                             self._normalizer.set_extreme(self.side, direction, vector)
+                        elif isinstance(cmd, tuple) and cmd[0] == "set_search_roi_scale":
+                            self._dark_search_roi_scale = max(0.1, min(1.0, float(cmd[1])))
+                            logger.info(f"[{self.side}] 搜索区域比例: {self._dark_search_roi_scale:.2f}")
                     except Exception:
                         pass
 
@@ -570,6 +577,17 @@ class GazeVectorTracker:
         best_ratio_under_ellipse,
         norm_result,
     ):
+        # ---- 绘制椭圆搜索区域 ----
+        if self._last_search_ellipse is not None:
+            cx_e, cy_e, rx_e, ry_e = self._last_search_ellipse
+            cv2.ellipse(
+                frame,
+                (cx_e, cy_e),
+                (rx_e, ry_e),
+                0, 0, 360,
+                (0, 200, 0), 2,
+            )
+
         cv2.circle(
             frame,
             model_center_average,
@@ -808,8 +826,18 @@ class GazeVectorTracker:
         _, thresholded = cv2.threshold(image, threshold, 255, cv2.THRESH_BINARY_INV)
         return thresholded
 
-    @staticmethod
-    def _get_darkest_area(image):
+    def _get_darkest_area(self, image):
+        """在椭圆 ROI 内搜索最暗区域。
+        
+        椭圆中心 = 画面中心，长轴 = 宽度/2 * scale，短轴 = 高度/2 * scale。
+        返回 (暗点坐标, 椭圆参数) — 供可视化使用。
+        """
+        h, w = image.shape[:2]
+        cx_roi, cy_roi = w // 2, h // 2
+        rx = int((w / 2) * self._dark_search_roi_scale)
+        ry = int((h / 2) * self._dark_search_roi_scale)
+        self._last_search_ellipse = (cx_roi, cy_roi, rx, ry)
+
         ignore_bounds = 20
         image_skip_size = 10
         search_area = 20
@@ -819,24 +847,29 @@ class GazeVectorTracker:
         min_sum = float("inf")
         darkest_point = None
 
-        for y in range(ignore_bounds, gray.shape[0] - ignore_bounds, image_skip_size):
-            for x in range(
-                ignore_bounds, gray.shape[1] - ignore_bounds, image_skip_size
-            ):
+        for y in range(ignore_bounds, h - ignore_bounds, image_skip_size):
+            for x in range(ignore_bounds, w - ignore_bounds, image_skip_size):
+                # 检查采样点中心是否在椭圆内
+                sx = x + search_area // 2
+                sy = y + search_area // 2
+                if rx > 0 and ry > 0:
+                    if ((sx - cx_roi) / rx) ** 2 + ((sy - cy_roi) / ry) ** 2 > 1.0:
+                        continue  # 椭圆外，跳过
+
                 current_sum = 0
                 num_pixels = 0
                 for dy in range(0, search_area, internal_skip_size):
-                    if y + dy >= gray.shape[0]:
+                    if y + dy >= h:
                         break
                     for dx in range(0, search_area, internal_skip_size):
-                        if x + dx >= gray.shape[1]:
+                        if x + dx >= w:
                             break
                         current_sum += int(gray[y + dy][x + dx])
                         num_pixels += 1
 
                 if current_sum < min_sum and num_pixels > 0:
                     min_sum = current_sum
-                    darkest_point = (x + search_area // 2, y + search_area // 2)
+                    darkest_point = (sx, sy)
 
         return darkest_point
 

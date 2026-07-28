@@ -73,6 +73,7 @@ class CameraConfig:
     frame_width: int = 640
     frame_height: int = 480
     use_recommended_resolution: bool = True
+    dark_search_roi_scale: float = 0.70
 
 
 @dataclass
@@ -120,6 +121,7 @@ class ConfigPersistence:
                     frame_width=left_data.get('frame_width', 640),
                     frame_height=left_data.get('frame_height', 480),
                     use_recommended_resolution=left_data.get('use_recommended_resolution', True),
+                    dark_search_roi_scale=left_data.get('dark_search_roi_scale', 0.70),
                 ),
                 right=CameraConfig(
                     index=right_data.get('camera_index', 0),
@@ -128,6 +130,7 @@ class ConfigPersistence:
                     frame_width=right_data.get('frame_width', 640),
                     frame_height=right_data.get('frame_height', 480),
                     use_recommended_resolution=right_data.get('use_recommended_resolution', True),
+                    dark_search_roi_scale=right_data.get('dark_search_roi_scale', 0.70),
                 ),
             )
         except Exception as e:
@@ -146,6 +149,7 @@ class ConfigPersistence:
                 'frame_width': config.left.frame_width,
                 'frame_height': config.left.frame_height,
                 'use_recommended_resolution': config.left.use_recommended_resolution,
+                'dark_search_roi_scale': config.left.dark_search_roi_scale,
             },
             'right': {
                 'camera_index': config.right.index,
@@ -154,6 +158,7 @@ class ConfigPersistence:
                 'frame_width': config.right.frame_width,
                 'frame_height': config.right.frame_height,
                 'use_recommended_resolution': config.right.use_recommended_resolution,
+                'dark_search_roi_scale': config.right.dark_search_roi_scale,
             },
         }
         try:
@@ -180,11 +185,13 @@ class CropDebugWindow:
         side: str,
         cam_config: CameraConfig,
         on_config_changed: "callable" = None,
+        cmd_queue: Optional[multiprocessing.Queue] = None,
     ):
         self._master = master
         self._side = side
         self._cam_config = cam_config
         self._on_config_changed = on_config_changed
+        self._cmd_queue = cmd_queue
 
         self._cap = _setup_camera(cam_index)
         if self._cap is None:
@@ -224,9 +231,22 @@ class CropDebugWindow:
             side=tk.LEFT, padx=5
         )
 
-        tk.Button(btn_frame, text="保存剪裁配置", command=self._save_crop_config).pack(
+        tk.Button(btn_frame, text="保存相机配置", command=self._save_crop_config).pack(
             side=tk.LEFT, padx=5
         )
+
+        # ---- ROI 搜索区域滑块 ----
+        roi_frame = tk.Frame(self._window)
+        roi_frame.pack(fill=tk.X, padx=10, pady=(3, 0))
+        tk.Label(roi_frame, text="搜索区域:").pack(side=tk.LEFT)
+        self._roi_scale_var = tk.DoubleVar(value=self._cam_config.dark_search_roi_scale)
+        self._roi_scale = tk.Scale(
+            roi_frame, from_=0.1, to=1.0, resolution=0.05,
+            orient=tk.HORIZONTAL, variable=self._roi_scale_var,
+            length=200, showvalue=True,
+            command=self._on_roi_scale_changed,
+        )
+        self._roi_scale.pack(side=tk.LEFT, padx=(5, 0))
 
         self._video_label = tk.Label(self._window)
         self._video_label.pack()
@@ -308,6 +328,38 @@ class CropDebugWindow:
         result_y1, result_y2 = min(y1, end_y), max(y1, end_y)
         return [result_x1, result_y1, result_x2, result_y2]
 
+    def _on_roi_scale_changed(self, val: str) -> None:
+        """搜索区域滑块回调：更新配置，实时发送到子进程。"""
+        scale = float(val)
+        self._cam_config.dark_search_roi_scale = scale
+        logger.info(f"[{self._side}] 搜索区域比例: {scale:.2f}")
+
+    def _draw_search_ellipse_on_frame(self, frame, crop_w, crop_h, crop_rect=None):
+        """在帧上绘制绿色椭圆标记搜索区域。
+
+        若有 crop_rect（黄框），椭圆中心为黄框中心，轴比例匹配黄框宽高比；
+        否则椭圆在整帧中心。
+        """
+        scale = self._cam_config.dark_search_roi_scale
+        if crop_rect is not None:
+            x1, y1, x2, y2 = crop_rect
+            cw = x2 - x1
+            ch = y2 - y1
+            cx_e, cy_e = (x1 + x2) // 2, (y1 + y2) // 2
+            rx_e = int((cw / 2) * scale)
+            ry_e = int((ch / 2) * scale)
+        else:
+            cx_e, cy_e = crop_w // 2, crop_h // 2
+            rx_e = int((crop_w / 2) * scale)
+            ry_e = int((crop_h / 2) * scale)
+        cv2.ellipse(
+            frame,
+            (cx_e, cy_e),
+            (max(rx_e, 1), max(ry_e, 1)),
+            0, 0, 360,
+            (0, 220, 0), 2,
+        )
+
     def _show_frame_loop(self) -> None:
         if not self._running:
             return
@@ -315,6 +367,10 @@ class CropDebugWindow:
         if self._flip_var.get():
             frame = cv2.flip(frame, 0)
         if ret:
+            h, w = frame.shape[:2]
+            # 绘制搜索区域椭圆：有黄框时跟随黄框
+            self._draw_search_ellipse_on_frame(frame, w, h, self._crop_rect)
+
             if self._crop_mode and self._crop_rect is not None:
                 x1, y1, x2, y2 = self._crop_rect
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
@@ -581,6 +637,7 @@ class EyeTrackingModule:
                 "left", self._cmd_queue_left, self._result_queue, self._headless,
                 self.config.left.frame_width, self.config.left.frame_height,
                 self._extreme_file, self.config.left.use_recommended_resolution,
+                self.config.left.dark_search_roi_scale,
             ),
             daemon=True,
         )
@@ -593,6 +650,7 @@ class EyeTrackingModule:
                 "right", self._cmd_queue_right, self._result_queue, self._headless,
                 self.config.right.frame_width, self.config.right.frame_height,
                 self._extreme_file, self.config.right.use_recommended_resolution,
+                self.config.right.dark_search_roi_scale,
             ),
             daemon=True,
         )
@@ -702,6 +760,7 @@ class EyeTrackingModule:
             self._crop_window_left = CropDebugWindow(
                 self._master, self.config.left.index, "left", self.config.left,
                 on_config_changed=self.save_config,
+                cmd_queue=self._cmd_queue_left,
             )
             self._crop_window_left.get_window().protocol(
                 "WM_DELETE_WINDOW", self._on_left_crop_close
@@ -713,6 +772,7 @@ class EyeTrackingModule:
             self._crop_window_right = CropDebugWindow(
                 self._master, self.config.right.index, "right", self.config.right,
                 on_config_changed=self.save_config,
+                cmd_queue=self._cmd_queue_right,
             )
             self._crop_window_right.get_window().protocol(
                 "WM_DELETE_WINDOW", self._on_right_crop_close
@@ -766,12 +826,14 @@ def _run_tracker_in_process(
     result_queue: multiprocessing.Queue, headless: bool,
     frame_width: int, frame_height: int, extreme_file: str,
     use_recommended_resolution: bool = True,
+    dark_search_roi_scale: float = 0.70,
 ) -> None:
     tracker = GazeVectorTracker(
         cam_index=cam_index, flip=flip, crop=crop, side=side,
         frame_width=frame_width, frame_height=frame_height,
         extreme_file=extreme_file,
         use_recommended_resolution=use_recommended_resolution,
+        dark_search_roi_scale=dark_search_roi_scale,
     )
     tracker.start_tracking(
         command_queue=command_queue, result_queue=result_queue, headless=headless,
