@@ -35,8 +35,10 @@ import multiprocessing
 import threading
 import queue
 import os
+import subprocess
 import time
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
 
@@ -50,14 +52,105 @@ logger = logging.getLogger(__name__)
 # 工具函数
 # ============================================================
 
-def _setup_camera(index: int) -> Optional[cv2.VideoCapture]:
-    """打开指定索引的相机并设置基本参数。"""
-    cap = cv2.VideoCapture(index)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+# V4L2 四字符码整数值（比 cv2.VideoWriter_fourcc 更可靠，V4L2 原生）
+_V4L2_FOURCC_MAP = {
+    "YUYV": 0x56595559,
+    "MJPG": 0x47504A4D,
+    "NV12": 0x3231564E,
+    "H264": 0x34363248,
+    "BGR3": 0x33524742,
+    "RGB3": 0x33424752,
+}
+
+def _setup_camera(index: int, fps: int = 30, width: int = 640, height: int = 480,
+                  fourcc_str: str = "") -> Optional[cv2.VideoCapture]:
+    """打开指定索引的相机并设置基本参数。使用 CAP_V4L2 后端确保 FOURCC 兼容。"""
+    cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_FPS, fps)
+    if fourcc_str and fourcc_str in _V4L2_FOURCC_MAP:
+        cap.set(cv2.CAP_PROP_FOURCC, _V4L2_FOURCC_MAP[fourcc_str])
     if not cap.isOpened():
         cap.release()
         return None
     return cap
+
+
+def probe_camera_modes(cam_index: int) -> List[Dict]:
+    """通过 v4l2-ctl 探测相机支持的 (width, height, fps, format) 模式列表。
+
+    返回的每个字典包含: width, height, fps, format (如 'YUYV', 'MJPG', '')。
+    """
+    modes: List[Dict] = []
+    try:
+        proc = subprocess.run(
+            ["v4l2-ctl", "-d", f"/dev/video{cam_index}", "--list-formats-ext"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if proc.returncode != 0:
+            logger.warning(f"v4l2-ctl 查询相机 {cam_index} 失败: {proc.stderr.strip()}")
+            return modes
+
+        current_fmt = ""
+        current_w = current_h = None
+        for line in proc.stdout.splitlines():
+            # 解析像素格式行: [0]: 'YUYV' (YUYV 4:2:2)
+            fmt_m = re.search(r"'(\w+)'\s+\(", line)
+            if fmt_m:
+                current_fmt = fmt_m.group(1)
+                current_w = current_h = None
+                continue
+            m = re.search(r"Size:\s+Discrete\s+(\d+)x(\d+)", line)
+            if m:
+                current_w, current_h = int(m.group(1)), int(m.group(2))
+                continue
+            m = re.search(r"Interval:\s+Discrete\s+[\d.]+\w*\s*\(\s*([\d.]+)\s+fps\)", line)
+            if m and current_w is not None and current_h is not None:
+                fps = round(float(m.group(1)))
+                modes.append({
+                    "width": current_w, "height": current_h,
+                    "fps": fps, "format": current_fmt,
+                })
+
+        # 去重（含格式去重）
+        seen = set()
+        unique_modes = []
+        for m in modes:
+            key = (m["width"], m["height"], m["fps"], m["format"])
+            if key not in seen:
+                seen.add(key)
+                unique_modes.append(m)
+        return unique_modes
+    except FileNotFoundError:
+        logger.warning("v4l2-ctl 未安装，无法探测相机模式")
+        return modes
+    except subprocess.TimeoutExpired:
+        logger.warning(f"v4l2-ctl 查询相机 {cam_index} 超时")
+        return modes
+    except Exception as e:
+        logger.error(f"探测相机模式失败: {e}")
+        return modes
+
+
+def mode_to_label(mode: Dict) -> str:
+    """将模式字典转换为显示文本，如 '640x480 @30fps (YUYV)'。"""
+    fmt = mode.get("format", "")
+    label = f"{mode['width']}x{mode['height']} @{mode['fps']}fps"
+    if fmt:
+        label += f" ({fmt})"
+    return label
+
+
+def match_current_mode(modes: List[Dict], w: int, h: int, fps: int, fmt: str = "") -> Optional[int]:
+    """在模式列表中查找匹配当前配置的索引。"""
+    for i, m in enumerate(modes):
+        if m["width"] == w and m["height"] == h and m["fps"] == fps:
+            # 优先完全匹配格式，如果 fmt 为空则仅匹配宽高帧率
+            mode_fmt = m.get("format", "")
+            if not fmt or not mode_fmt or mode_fmt == fmt:
+                return i
+    return None
 
 
 # ============================================================
@@ -72,6 +165,8 @@ class CameraConfig:
     flip: bool = False
     frame_width: int = 640
     frame_height: int = 480
+    frame_rate: int = 30
+    fourcc: str = ""  # 像素格式，如 'YUYV', 'MJPG'
     use_recommended_resolution: bool = True
     dark_search_roi_scale: float = 0.70
 
@@ -120,6 +215,8 @@ class ConfigPersistence:
                     flip=left_data.get('flip', False),
                     frame_width=left_data.get('frame_width', 640),
                     frame_height=left_data.get('frame_height', 480),
+                    frame_rate=left_data.get('frame_rate', 30),
+                    fourcc=left_data.get('fourcc', ''),
                     use_recommended_resolution=left_data.get('use_recommended_resolution', True),
                     dark_search_roi_scale=left_data.get('dark_search_roi_scale', 0.70),
                 ),
@@ -129,6 +226,8 @@ class ConfigPersistence:
                     flip=right_data.get('flip', False),
                     frame_width=right_data.get('frame_width', 640),
                     frame_height=right_data.get('frame_height', 480),
+                    frame_rate=right_data.get('frame_rate', 30),
+                    fourcc=right_data.get('fourcc', ''),
                     use_recommended_resolution=right_data.get('use_recommended_resolution', True),
                     dark_search_roi_scale=right_data.get('dark_search_roi_scale', 0.70),
                 ),
@@ -148,6 +247,8 @@ class ConfigPersistence:
                 'flip': config.left.flip,
                 'frame_width': config.left.frame_width,
                 'frame_height': config.left.frame_height,
+                'frame_rate': config.left.frame_rate,
+                'fourcc': config.left.fourcc,
                 'use_recommended_resolution': config.left.use_recommended_resolution,
                 'dark_search_roi_scale': config.left.dark_search_roi_scale,
             },
@@ -157,6 +258,8 @@ class ConfigPersistence:
                 'flip': config.right.flip,
                 'frame_width': config.right.frame_width,
                 'frame_height': config.right.frame_height,
+                'frame_rate': config.right.frame_rate,
+                'fourcc': config.right.fourcc,
                 'use_recommended_resolution': config.right.use_recommended_resolution,
                 'dark_search_roi_scale': config.right.dark_search_roi_scale,
             },
@@ -193,7 +296,13 @@ class CropDebugWindow:
         self._on_config_changed = on_config_changed
         self._cmd_queue = cmd_queue
 
-        self._cap = _setup_camera(cam_index)
+        self._cap = _setup_camera(
+            cam_index,
+            fps=cam_config.frame_rate,
+            width=cam_config.frame_width,
+            height=cam_config.frame_height,
+            fourcc_str=cam_config.fourcc,
+        )
         if self._cap is None:
             raise RuntimeError(f"无法打开相机 {cam_index}")
 
@@ -202,8 +311,9 @@ class CropDebugWindow:
             f"调试 - {'左眼' if side == 'left' else '右眼'}相机 (索引 {cam_index})"
         )
 
-        self._crop_mode: bool = False
-        self._crop_rect: Optional[Tuple[int, int, int, int]] = None
+        self._crop_rect: Optional[Tuple[int, int, int, int]] = (
+            [0, 0, cam_config.frame_width, cam_config.frame_height]
+        )  # 默认全画面黄框
         self._drawing: bool = False
         self._start_x: int = 0
         self._start_y: int = 0
@@ -223,7 +333,7 @@ class CropDebugWindow:
             side=tk.LEFT, padx=5
         )
 
-        self._btn_crop = tk.Button(btn_frame, text="剪裁", command=self._toggle_crop)
+        self._btn_crop = tk.Button(btn_frame, text="重置剪裁", command=self._reset_crop)
         self._btn_crop.pack(side=tk.LEFT, padx=5)
 
         self._recommended_var = tk.BooleanVar(value=self._cam_config.use_recommended_resolution)
@@ -248,6 +358,37 @@ class CropDebugWindow:
         )
         self._roi_scale.pack(side=tk.LEFT, padx=(5, 0))
 
+        # ---- 帧率/分辨率切换下拉框 ----
+        res_frame = tk.Frame(self._window)
+        res_frame.pack(fill=tk.X, padx=10, pady=(3, 5))
+        tk.Label(res_frame, text="帧率/分辨率:").pack(side=tk.LEFT)
+        self._modes = probe_camera_modes(self._cam_config.index)
+        mode_labels = [mode_to_label(m) for m in self._modes]
+        self._mode_var = tk.StringVar()
+        self._mode_combo = ttk.Combobox(
+            res_frame, values=mode_labels, state="readonly", width=30,
+            textvariable=self._mode_var,
+        )
+        self._mode_combo.pack(side=tk.LEFT, padx=(5, 0))
+        # 选中当前配置匹配的模式
+        idx = match_current_mode(
+            self._modes,
+            self._cam_config.frame_width,
+            self._cam_config.frame_height,
+            self._cam_config.frame_rate,
+            self._cam_config.fourcc,
+        )
+        if idx is not None:
+            self._mode_combo.current(idx)
+        elif self._modes:
+            self._mode_combo.current(0)
+            m = self._modes[0]
+            self._cam_config.frame_width = m["width"]
+            self._cam_config.frame_height = m["height"]
+            self._cam_config.frame_rate = m["fps"]
+            self._cam_config.fourcc = m.get("format", "")
+        self._mode_combo.bind("<<ComboboxSelected>>", self._on_resolution_changed)
+
         self._video_label = tk.Label(self._window)
         self._video_label.pack()
 
@@ -256,37 +397,39 @@ class CropDebugWindow:
         self._video_label.bind("<B1-Motion>", self._on_drag)
         self._video_label.bind("<ButtonRelease-1>", self._on_release)
 
-    def _toggle_crop(self) -> None:
-        self._crop_mode = not self._crop_mode
-        if self._crop_mode:
-            self._crop_rect = None
-            self._btn_crop.config(relief=tk.SUNKEN)
-        else:
-            self._btn_crop.config(relief=tk.RAISED)
+    def _reset_crop(self) -> None:
+        """重置剪裁黄框为整个画面范围。"""
+        self._crop_rect = [0, 0, self._cam_config.frame_width, self._cam_config.frame_height]
 
     def _save_crop_config(self) -> None:
-        if self._crop_rect is not None:
-            x1, y1, x2, y2 = self._crop_rect
-            logger.info(f"剪裁区域: x1={x1}, y1={y1}, x2={x2}, y2={y2}")
-            self._cam_config.crop = [x1, y1, x2, y2]
-            self._cam_config.flip = self._flip_var.get()
-            self._cam_config.use_recommended_resolution = self._recommended_var.get()
-            if self._on_config_changed:
-                self._on_config_changed()
-            logger.info(f"{self._side}眼相机配置已保存")
-        else:
-            logger.warning("未选择剪裁区域")
+        # 若用户从未拖动，则默认保存全画面 crop
+        if self._crop_rect is None:
+            self._crop_rect = [0, 0, self._cam_config.frame_width, self._cam_config.frame_height]
+        x1, y1, x2, y2 = self._crop_rect
+        logger.info(f"剪裁区域: x1={x1}, y1={y1}, x2={y2}, y2={y2}")
+        self._cam_config.crop = [x1, y1, x2, y2]
+        self._cam_config.flip = self._flip_var.get()
+        self._cam_config.use_recommended_resolution = self._recommended_var.get()
+        # 保存分辨率/帧率/格式
+        idx = self._mode_combo.current()
+        if 0 <= idx < len(self._modes):
+            m = self._modes[idx]
+            self._cam_config.frame_width = m["width"]
+            self._cam_config.frame_height = m["height"]
+            self._cam_config.frame_rate = m["fps"]
+            self._cam_config.fourcc = m.get("format", "")
+        if self._on_config_changed:
+            self._on_config_changed()
+        logger.info(f"{self._side}眼相机配置已保存")
 
     def _on_press(self, event: tk.Event) -> None:
-        if not self._crop_mode:
-            return
         self._drawing = True
         self._start_x = event.x
         self._start_y = event.y
         self._crop_rect = None
 
     def _on_drag(self, event: tk.Event) -> None:
-        if not self._crop_mode or not self._drawing:
+        if not self._drawing:
             return
         enforce = self._recommended_var.get()
         self._crop_rect = self._constrain_rect(
@@ -295,8 +438,6 @@ class CropDebugWindow:
         )
 
     def _on_release(self, event: tk.Event) -> None:
-        if not self._crop_mode:
-            return
         self._drawing = False
         enforce = self._recommended_var.get()
         self._crop_rect = self._constrain_rect(
@@ -327,6 +468,64 @@ class CropDebugWindow:
         result_x1, result_x2 = min(x1, end_x), max(x1, end_x)
         result_y1, result_y2 = min(y1, end_y), max(y1, end_y)
         return [result_x1, result_y1, result_x2, result_y2]
+
+    def _on_resolution_changed(self, event: tk.Event = None) -> None:
+        """下拉框选择分辨率/帧率时回调：更新配置并重启相机预览，同时通知子进程。"""
+        idx = self._mode_combo.current()
+        if idx < 0 or idx >= len(self._modes):
+            return
+        m = self._modes[idx]
+        new_fmt = m.get("format", "")
+
+        # 重启预览相机
+        if self._cap is not None:
+            self._cap.release()
+        new_cap = _setup_camera(
+            self._cam_config.index,
+            fps=m["fps"],
+            width=m["width"],
+            height=m["height"],
+            fourcc_str=new_fmt,
+        )
+        if new_cap is None:
+            # 切换失败，回退到原模式
+            logger.warning(f"[{self._side}] 切换分辨率 {mode_to_label(m)} 失败，已还原")
+            self._cap = _setup_camera(
+                self._cam_config.index,
+                fps=self._cam_config.frame_rate,
+                width=self._cam_config.frame_width,
+                height=self._cam_config.frame_height,
+                fourcc_str=self._cam_config.fourcc,
+            )
+            # 回退下拉框选中项
+            fallback_idx = match_current_mode(
+                self._modes,
+                self._cam_config.frame_width,
+                self._cam_config.frame_height,
+                self._cam_config.frame_rate,
+                self._cam_config.fourcc,
+            )
+            if fallback_idx is not None:
+                self._mode_combo.current(fallback_idx)
+            return
+
+        self._cap = new_cap
+        self._cam_config.frame_width = m["width"]
+        self._cam_config.frame_height = m["height"]
+        self._cam_config.frame_rate = m["fps"]
+        self._cam_config.fourcc = new_fmt
+        logger.info(f"[{self._side}] 切换分辨率: {mode_to_label(m)}")
+
+        # 通知子进程动态切换相机参数
+        if self._cmd_queue is not None:
+            try:
+                self._cmd_queue.put_nowait((
+                    "restart_capture",
+                    m["width"], m["height"], m["fps"], new_fmt,
+                ))
+                logger.info(f"[{self._side}] 已通知子进程切换分辨率")
+            except Exception as e:
+                logger.error(f"[{self._side}] 通知子进程切换失败: {e}")
 
     def _on_roi_scale_changed(self, val: str) -> None:
         """搜索区域滑块回调：更新配置，实时发送到子进程。"""
@@ -363,6 +562,9 @@ class CropDebugWindow:
     def _show_frame_loop(self) -> None:
         if not self._running:
             return
+        if self._cap is None:
+            self._video_label.after(100, self._show_frame_loop)
+            return
         ret, frame = self._cap.read()
         if self._flip_var.get():
             frame = cv2.flip(frame, 0)
@@ -371,7 +573,7 @@ class CropDebugWindow:
             # 绘制搜索区域椭圆：有黄框时跟随黄框
             self._draw_search_ellipse_on_frame(frame, w, h, self._crop_rect)
 
-            if self._crop_mode and self._crop_rect is not None:
+            if self._crop_rect is not None:
                 x1, y1, x2, y2 = self._crop_rect
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -636,8 +838,10 @@ class EyeTrackingModule:
                 self.config.left.index, self.config.left.flip, self.config.left.crop,
                 "left", self._cmd_queue_left, self._result_queue, self._headless,
                 self.config.left.frame_width, self.config.left.frame_height,
+                self.config.left.frame_rate,
                 self._extreme_file, self.config.left.use_recommended_resolution,
                 self.config.left.dark_search_roi_scale,
+                self.config.left.fourcc,
             ),
             daemon=True,
         )
@@ -649,8 +853,10 @@ class EyeTrackingModule:
                 self.config.right.index, self.config.right.flip, self.config.right.crop,
                 "right", self._cmd_queue_right, self._result_queue, self._headless,
                 self.config.right.frame_width, self.config.right.frame_height,
+                self.config.right.frame_rate,
                 self._extreme_file, self.config.right.use_recommended_resolution,
                 self.config.right.dark_search_roi_scale,
+                self.config.right.fourcc,
             ),
             daemon=True,
         )
@@ -824,16 +1030,19 @@ def _run_tracker_in_process(
     cam_index: int, flip: bool, crop: List[int], side: str,
     command_queue: multiprocessing.Queue,
     result_queue: multiprocessing.Queue, headless: bool,
-    frame_width: int, frame_height: int, extreme_file: str,
+    frame_width: int, frame_height: int, frame_rate: int,
+    extreme_file: str,
     use_recommended_resolution: bool = True,
     dark_search_roi_scale: float = 0.70,
+    fourcc_str: str = "",
 ) -> None:
     tracker = GazeVectorTracker(
         cam_index=cam_index, flip=flip, crop=crop, side=side,
         frame_width=frame_width, frame_height=frame_height,
-        extreme_file=extreme_file,
+        frame_rate=frame_rate, extreme_file=extreme_file,
         use_recommended_resolution=use_recommended_resolution,
         dark_search_roi_scale=dark_search_roi_scale,
+        fourcc_str=fourcc_str,
     )
     tracker.start_tracking(
         command_queue=command_queue, result_queue=result_queue, headless=headless,
@@ -898,6 +1107,11 @@ if __name__ == "__main__":
     frame_debug = tk.Frame(root)
     frame_debug.pack(pady=5)
 
+    btn_debug_left = tk.Button(frame_debug, text="调试剪裁左眼相机", command=lambda: _open_crop_left())
+    btn_debug_left.pack(side=tk.LEFT, padx=10)
+    btn_debug_right = tk.Button(frame_debug, text="调试剪裁右眼相机", command=lambda: _open_crop_right())
+    btn_debug_right.pack(side=tk.LEFT, padx=10)
+
     def _open_crop_left():
         module.set_left_camera(int(cam_left.get()))
         module.open_crop_window("left")
@@ -906,8 +1120,13 @@ if __name__ == "__main__":
         module.set_right_camera(int(cam_right.get()))
         module.open_crop_window("right")
 
-    tk.Button(frame_debug, text="调试剪裁左眼相机", command=_open_crop_left).pack(side=tk.LEFT, padx=10)
-    tk.Button(frame_debug, text="调试剪裁右眼相机", command=_open_crop_right).pack(side=tk.LEFT, padx=10)
+    def _set_debug_enabled(enabled: bool) -> None:
+        """启用/禁用调试相关控件。"""
+        state = tk.NORMAL if enabled else tk.DISABLED
+        cam_left.config(state=state)
+        cam_right.config(state=state)
+        btn_debug_left.config(state=state)
+        btn_debug_right.config(state=state)
 
     frame_action = tk.Frame(root)
     frame_action.pack(pady=(5, 10))
@@ -917,9 +1136,11 @@ if __name__ == "__main__":
         module.set_right_camera(int(cam_right.get()))
         module.start()
         module.open_control_panel()
+        _set_debug_enabled(False)
 
     def _stop():
         module.stop()
+        _set_debug_enabled(True)
 
     btn_text = tk.StringVar(value="开始眼球追踪")
 
@@ -932,12 +1153,6 @@ if __name__ == "__main__":
             btn_text.set("停止眼球追踪")
 
     tk.Button(frame_action, textvariable=btn_text, command=_toggle, width=14).pack(side=tk.LEFT, padx=10)
-    tk.Button(
-        frame_action, text="保存配置",
-        command=lambda: (module.set_left_camera(int(cam_left.get())),
-                         module.set_right_camera(int(cam_right.get())),
-                         module.save_config())
-    ).pack(side=tk.LEFT, padx=10)
 
     frame_display = tk.Frame(root)
     frame_display.pack(pady=(0, 10))

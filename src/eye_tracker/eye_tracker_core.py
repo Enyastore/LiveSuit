@@ -17,6 +17,16 @@ from typing import Optional, List, Dict, Tuple
 
 logger = logging.getLogger(__name__)
 
+# V4L2 四字符码整数值（直接设置 CAP_PROP_FOURCC 使用）
+_V4L2_FOURCC_MAP = {
+    "YUYV": 0x56595559,
+    "MJPG": 0x47504A4D,
+    "NV12": 0x3231564E,
+    "H264": 0x34363248,
+    "BGR3": 0x33524742,
+    "RGB3": 0x33424752,
+}
+
 
 # ============================================================
 # Normalizer：基于极值向量的正交投影归一化
@@ -144,9 +154,11 @@ class GazeVectorTracker:
         side: str = "left",
         frame_width: int = 640,
         frame_height: int = 480,
+        frame_rate: int = 30,
         extreme_file: str = "extreme_vectors.yaml",
         use_recommended_resolution: bool = True,
         dark_search_roi_scale: float = 0.70,
+        fourcc_str: str = "",
     ):
         self.cam_index = cam_index
         self.flip = flip
@@ -154,6 +166,8 @@ class GazeVectorTracker:
         self.side = side
         self.frame_width = frame_width
         self.frame_height = frame_height
+        self.frame_rate = frame_rate
+        self._fourcc_str = fourcc_str
         self._use_recommended_resolution = use_recommended_resolution
         self._dark_search_roi_scale = max(0.1, min(1.0, dark_search_roi_scale))
 
@@ -248,7 +262,11 @@ class GazeVectorTracker:
             print(f"错误：无法打开摄像机 (索引 {self.cam_index})")
             return
 
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
+        self.cap.set(cv2.CAP_PROP_FPS, self.frame_rate)
+        if self._fourcc_str and self._fourcc_str in _V4L2_FOURCC_MAP:
+            self.cap.set(cv2.CAP_PROP_FOURCC, _V4L2_FOURCC_MAP[self._fourcc_str])
 
         self.running = True
         print(f"眼球追踪已启动 (cam={self.cam_index}, side={self.side}, "
@@ -291,6 +309,10 @@ class GazeVectorTracker:
                         elif isinstance(cmd, tuple) and cmd[0] == "set_search_roi_scale":
                             self._dark_search_roi_scale = max(0.1, min(1.0, float(cmd[1])))
                             logger.info(f"[{self.side}] 搜索区域比例: {self._dark_search_roi_scale:.2f}")
+                        elif isinstance(cmd, tuple) and cmd[0] == "restart_capture":
+                            # 动态重启相机 (w, h, fps, fourcc_str)
+                            w, h, fps, fcc = cmd[1], cmd[2], cmd[3], cmd[4]
+                            self._restart_camera(w, h, fps, fcc)
                     except Exception:
                         pass
 
@@ -373,6 +395,55 @@ class GazeVectorTracker:
                 cv2.destroyAllWindows()
             except cv2.error:
                 pass
+
+    def _restart_camera(self, w: int, h: int, fps: int, fourcc_str: str):
+        """动态重启相机，切换分辨率/帧率/像素格式。"""
+        logger.info(f"[{self.side}] 重启相机: {w}x{h} @{fps}fps fourcc={fourcc_str}")
+        old_cap = self.cap
+        self.cap = None
+
+        for backend in [cv2.CAP_V4L2, cv2.CAP_ANY]:
+            new_cap = cv2.VideoCapture(self.cam_index, backend)
+            if new_cap.isOpened():
+                break
+        else:
+            logger.error(f"[{self.side}] 重启相机失败，保留旧相机")
+            self.cap = old_cap
+            return
+
+        new_cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+        new_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+        new_cap.set(cv2.CAP_PROP_FPS, fps)
+        if fourcc_str and fourcc_str in _V4L2_FOURCC_MAP:
+            new_cap.set(cv2.CAP_PROP_FOURCC, _V4L2_FOURCC_MAP[fourcc_str])
+
+        # 验证实际生效的尺寸
+        actual_w = int(new_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(new_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if actual_w != w or actual_h != h:
+            logger.warning(f"[{self.side}] 期望 {w}x{h}，实际 {actual_w}x{actual_h}")
+
+        # 按比例缩放 crop（原 crop 基于旧分辨率）
+        old_w = self.frame_width
+        old_h = self.frame_height
+        if old_w > 0 and old_h > 0:
+            self.crop = [
+                self.crop[0] * w // old_w,
+                self.crop[1] * h // old_h,
+                self.crop[2] * w // old_w,
+                self.crop[3] * h // old_h,
+            ]
+
+        self.frame_width = w
+        self.frame_height = h
+        self.frame_rate = fps
+        self._fourcc_str = fourcc_str
+        self._reset_tracking_state()
+
+        if old_cap is not None:
+            old_cap.release()
+        self.cap = new_cap
+        logger.info(f"[{self.side}] 相机重启完成: {w}x{h} @{fps}fps")
 
     def get_last_tracking_result(self):
         return self.last_tracking_result
