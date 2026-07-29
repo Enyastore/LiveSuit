@@ -219,3 +219,6 @@ __marimo__/
 
 # User Configs
 *.yaml
+
+#Experimental Content
+experiment/
