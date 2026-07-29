@@ -369,7 +369,7 @@ class CropDebugWindow:
         self._openness_low = cam_config.openness_threshold_low
         self._openness_high = cam_config.openness_threshold_high
         self._openness_blur = 3
-        self._openness_aggregation = "median"
+        self._openness_aggregation = "中位数"
 
         # 瞳孔调试参数（双阈值偏移）
         self._pupil_low = cam_config.pupil_threshold_low
@@ -486,7 +486,7 @@ class CropDebugWindow:
         sliders_frame = tk.Frame(openness_frame)
         sliders_frame.pack(fill=tk.X, pady=(3, 0))
 
-        tk.Label(sliders_frame, text="low:", font=("", 7)).pack(side=tk.LEFT)
+        tk.Label(sliders_frame, text="下界：", font=("", 7)).pack(side=tk.LEFT)
         self._open_low_var = tk.IntVar(value=self._openness_low)
         tk.Scale(
             sliders_frame, from_=0, to=255, resolution=1,
@@ -495,7 +495,7 @@ class CropDebugWindow:
             command=self._on_open_low_changed,
         ).pack(side=tk.LEFT)
 
-        tk.Label(sliders_frame, text="high:", font=("", 7)).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Label(sliders_frame, text="上界：", font=("", 7)).pack(side=tk.LEFT, padx=(8, 0))
         self._open_high_var = tk.IntVar(value=self._openness_high)
         tk.Scale(
             sliders_frame, from_=0, to=255, resolution=1,
@@ -506,7 +506,7 @@ class CropDebugWindow:
 
         params_frame = tk.Frame(openness_frame)
         params_frame.pack(fill=tk.X, pady=(2, 0))
-        tk.Label(params_frame, text="模糊核:").pack(side=tk.LEFT)
+        tk.Label(params_frame, text="模糊核大小:").pack(side=tk.LEFT)
         self._open_blur_var = tk.IntVar(value=self._openness_blur)
         tk.Scale(
             params_frame, from_=1, to=15, resolution=2,
@@ -514,10 +514,10 @@ class CropDebugWindow:
             length=100, showvalue=True,
             command=self._on_openness_blur_changed,
         ).pack(side=tk.LEFT, padx=(2, 10))
-        tk.Label(params_frame, text="聚合:").pack(side=tk.LEFT)
+        tk.Label(params_frame, text="聚合方式:").pack(side=tk.LEFT)
         self._open_agg_var = tk.StringVar(value=self._openness_aggregation)
         agg_combo = ttk.Combobox(
-            params_frame, values=["median", "average"], state="readonly",
+            params_frame, values=["中位数", "平均值"], state="readonly",
             textvariable=self._open_agg_var, width=8,
         )
         agg_combo.pack(side=tk.LEFT, padx=(2, 0))
@@ -538,7 +538,7 @@ class CropDebugWindow:
         pupil_sliders = tk.Frame(pupil_frame)
         pupil_sliders.pack(fill=tk.X, pady=(3, 0))
 
-        tk.Label(pupil_sliders, text="low offset:", font=("", 7)).pack(side=tk.LEFT)
+        tk.Label(pupil_sliders, text="下界：", font=("", 7)).pack(side=tk.LEFT)
         self._pupil_low_var = tk.IntVar(value=self._pupil_low)
         tk.Scale(
             pupil_sliders, from_=0, to=50, resolution=1,
@@ -547,7 +547,7 @@ class CropDebugWindow:
             command=self._on_pupil_low_changed,
         ).pack(side=tk.LEFT)
 
-        tk.Label(pupil_sliders, text="high offset:", font=("", 7)).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Label(pupil_sliders, text="上界：", font=("", 7)).pack(side=tk.LEFT, padx=(8, 0))
         self._pupil_high_var = tk.IntVar(value=self._pupil_high)
         tk.Scale(
             pupil_sliders, from_=1, to=100, resolution=1,
@@ -816,10 +816,10 @@ class CropDebugWindow:
         raw_distance = 0.0
         if top_pts and bottom_pts:
             agg = self._open_agg_var.get()
-            if agg == "average":
+            if agg == "平均值":
                 top_agg = np.mean(top_pts)
                 bottom_agg = np.mean(bottom_pts)
-            else:  # median
+            else:  # 中位数
                 top_agg = float(np.median(top_pts))
                 bottom_agg = float(np.median(bottom_pts))
             raw_distance = max(0.0, bottom_agg - top_agg)
@@ -892,7 +892,7 @@ class CropDebugWindow:
         raw_distance = 0.0
         if top_pts and bottom_pts:
             agg = self._open_agg_var.get()
-            if agg == "average":
+            if agg == "平均值":
                 top_agg = np.mean(top_pts)
                 bottom_agg = np.mean(bottom_pts)
             else:
@@ -1063,8 +1063,7 @@ class CropDebugWindow:
             open_imgtk = self._resize_binary_view(open_bin)
             self._openness_binary_label.imgtk = open_imgtk
             self._openness_binary_label.configure(image=open_imgtk)
-            info = f"raw={raw_dist:.1f}px  top={top_y:.0f}  bot={bottom_y:.0f}"
-            info += f"\nagg={self._open_agg_var.get()}  blur={self._open_blur_var.get()}"
+            info = f"距离={raw_dist:.1f}px  高处={top_y:.0f}  低处={bottom_y:.0f}"
             self._openness_info_label.config(text=info)
         except Exception:
             pass
@@ -1077,11 +1076,11 @@ class CropDebugWindow:
             pupil_imgtk = self._resize_binary_view(pupil_bin)
             self._pupil_binary_label.imgtk = pupil_imgtk
             self._pupil_binary_label.configure(image=pupil_imgtk)
-            pinfo = f"darkest={darkest_val}  lo={self._pupil_low_var.get()}  hi={self._pupil_high_var.get()}"
+            pinfo = f"darkest={darkest_val}"
             if ellipse_info is not None:
-                pinfo += f"\ngoodness: cover={g_cover:.2f}  aspect={g_aspect:.2f}  total={g_total:.1f}"
+                pinfo += f"\n椭圆拟合优度：覆盖率={g_cover:.2f}  纵横比={g_aspect:.2f}  总体={g_total:.1f}"
             else:
-                pinfo += "\nno ellipse fitted"
+                pinfo += "\n无法拟合椭圆！"
             self._pupil_info_label.config(text=pinfo)
         except Exception:
             pass
@@ -1095,7 +1094,7 @@ class CropDebugWindow:
             try:
                 self._cmd_queue.put_nowait(("set_openness_threshold_low", self._openness_low))
             except Exception as e:
-                logger.error(f"[{self._side}] 发送开闭 low 阈值失败: {e}")
+                logger.error(f"[{self._side}] 发送开闭下界阈值失败: {e}")
 
     def _on_open_high_changed(self, val: str) -> None:
         self._openness_high = int(val)
@@ -1103,7 +1102,7 @@ class CropDebugWindow:
             try:
                 self._cmd_queue.put_nowait(("set_openness_threshold_high", self._openness_high))
             except Exception as e:
-                logger.error(f"[{self._side}] 发送开闭 high 阈值失败: {e}")
+                logger.error(f"[{self._side}] 发送开闭上界阈值失败: {e}")
 
     def _on_openness_blur_changed(self, val: str) -> None:
         blur = int(val)
@@ -1132,7 +1131,7 @@ class CropDebugWindow:
             try:
                 self._cmd_queue.put_nowait(("set_pupil_threshold_low", self._pupil_low))
             except Exception as e:
-                logger.error(f"[{self._side}] 发送瞳孔 low 阈值失败: {e}")
+                logger.error(f"[{self._side}] 发送瞳孔下界阈值失败: {e}")
 
     def _on_pupil_high_changed(self, val: str) -> None:
         self._pupil_high = int(val)
@@ -1140,7 +1139,7 @@ class CropDebugWindow:
             try:
                 self._cmd_queue.put_nowait(("set_pupil_threshold_high", self._pupil_high))
             except Exception as e:
-                logger.error(f"[{self._side}] 发送瞳孔 high 阈值失败: {e}")
+                logger.error(f"[{self._side}] 发送瞳孔上界阈值失败: {e}")
 
     def _on_close(self) -> None:
         self._running = False
@@ -1239,8 +1238,8 @@ class ControlPanel:
         btn_clear_right.pack(pady=1)
 
         # ---- 眼睛开度跳过阈值 ----
-        tk.Label(self._window, text="低开度跳过阈值", font=("", 10, "bold")).pack(pady=(10, 5))
-        tk.Label(self._window, text="开度低于此值时跳过眼追省电 (0=无)", font=("", 8)).pack()
+        tk.Label(self._window, text="开度距离阈值", font=("", 10, "bold")).pack(pady=(10, 5))
+        tk.Label(self._window, text="当开度距离低于该阈值时，暂停追踪", font=("", 8)).pack()
 
         skip_frame = tk.Frame(self._window)
         skip_frame.pack(pady=(5, 0))
@@ -1264,7 +1263,7 @@ class ControlPanel:
         ).pack(side=tk.LEFT, padx=(0, 10))
 
         # ---- 保存开度参考值 ----
-        tk.Label(self._window, text="眼睛开度标定", font=("", 10, "bold")).pack(pady=(10, 5))
+        tk.Label(self._window, text="眼睑开度距离", font=("", 10, "bold")).pack(pady=(10, 5))
 
         # 当前 raw 值显示
         self._raw_label = tk.Label(self._window, text="", font=("", 8))
@@ -1292,7 +1291,7 @@ class ControlPanel:
             ).pack(side=tk.LEFT, padx=5)
 
         # ---- 最终输出值（eye_x, eye_y, eye_o）----
-        tk.Label(self._window, text="最终输出2", font=("", 10, "bold")).pack(pady=(10, 5))
+        tk.Label(self._window, text="最终输出", font=("", 10, "bold")).pack(pady=(10, 5))
         self._final_output_label = tk.Label(self._window, text="", font=("", 9), justify=tk.LEFT)
         self._final_output_label.pack()
         self._update_raw_display()
@@ -1377,7 +1376,7 @@ class ControlPanel:
                 logger.error(f"发送右眼跳过阈值失败: {e}")
 
     def _update_raw_display(self) -> None:
-        """定时更新当前 raw 开度显示，以及最终输出 eye_x/eye_y/eye_o。"""
+        """定时更新当前开度距离显示，以及最终输出 eye_x/eye_y/eye_o。"""
         if self._window is None or not self._window.winfo_exists():
             return
         if self._module is not None:
@@ -1386,8 +1385,8 @@ class ControlPanel:
             # --- raw 显示（仅开度，2 位小数） ---
             left_raw = state["left"].get("raw_eye_openness", "N/A")
             right_raw = state["right"].get("raw_eye_openness", "N/A")
-            text = f"左: raw={left_raw:.2f}" if isinstance(left_raw, (int, float)) else f"左: raw={left_raw}"
-            text += f"  右: raw={right_raw:.2f}" if isinstance(right_raw, (int, float)) else f"  右: raw={right_raw}"
+            text = f"左: {left_raw:.2f}" if isinstance(left_raw, (int, float)) else f"左: {left_raw}"
+            text += f"  右: {right_raw:.2f}" if isinstance(right_raw, (int, float)) else f"  右: {right_raw}"
             self._raw_label.config(text=text)
 
             # --- 最终输出显示（eye_x, eye_y, eye_o，各 2 位小数） ---
