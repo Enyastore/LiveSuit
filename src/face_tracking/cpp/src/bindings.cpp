@@ -1,6 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/complex.h>
+#include <pybind11/functional.h>
 #include "tracker.h"
 #include "normalizer.h"
 
@@ -18,7 +19,12 @@ PYBIND11_MODULE(eye_tracker_core_cpp, m) {
              py::arg("side"), py::arg("direction"), py::arg("vector"))
         .def("clear_extremes", &Normalizer::clear_extremes, py::arg("side"))
         .def("normalize", &Normalizer::normalize,
-             py::arg("side"), py::arg("gaze_rotated"));
+             py::arg("side"), py::arg("gaze_rotated"))
+        // 眼睛开度标定
+        .def("set_openness_ref", &Normalizer::set_openness_ref,
+             py::arg("side"), py::arg("ref_type"), py::arg("value"))
+        .def("get_openness_ref", &Normalizer::get_openness_ref,
+             py::arg("side"), py::arg("ref_type"));
 
     // ---- NormalizeResult ----
     py::class_<NormalizeResult>(m, "NormalizeResult")

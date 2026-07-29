@@ -41,6 +41,8 @@ class Normalizer:
 
     无此文件时 normalize() 返回 eye_x / eye_y 均为 None，
     下游调用者须自行降级处理。
+
+    此外支持眼睛开度标定参考值的存取（{side}_open_ref / {side}_close_ref）。
     """
 
     def __init__(self, extreme_file: str = "extreme_vectors.yaml"):
@@ -62,6 +64,31 @@ class Normalizer:
             "eye_y": result.eye_y,
             "missing": list(result.missing),
         }
+
+    # ---- 眼睛开度标定 ----
+
+    def set_openness_ref(self, side: str, ref_type: str, value: float) -> None:
+        """保存眼睛开度参考距离到 YAML 文件。
+
+        Parameters
+        ----------
+        side : str
+            "left" 或 "right"
+        ref_type : str
+            "open"（全睁）或 "close"（全闭）
+        value : float
+            raw_eye_openness 的当前值
+        """
+        self._impl.set_openness_ref(side, ref_type, value)
+
+    def get_openness_ref(self, side: str, ref_type: str):
+        """读取眼睛开度参考距离。
+
+        Returns
+        -------
+        float 或 None
+        """
+        return self._impl.get_openness_ref(side, ref_type)
 
 
 # ============================================================

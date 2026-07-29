@@ -39,6 +39,7 @@ import subprocess
 import time
 import logging
 import re
+import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
 
@@ -287,9 +288,18 @@ class ConfigPersistence:
 # ============================================================
 
 class CropDebugWindow:
-    """Toplevel 调试窗口：显示相机画面，支持垂直翻转与固定比例剪裁。"""
+    """Toplevel 调试窗口：显示相机画面，支持垂直翻转与固定比例剪裁。
+
+    右半部分包含：
+      - 二值化调试视口（实时显示模糊+二值化+椭圆掩膜结果及水平参考线）
+      - 开度检测参数滑块（阈值、模糊核、聚合方式）
+    """
 
     CROP_TARGET_RATIO: float = 4.0 / 3.0
+
+    # 二值化调试视口大小（缩放后显示）
+    BINARY_VIEW_WIDTH: int = 320
+    BINARY_VIEW_HEIGHT: int = 240
 
     def __init__(
         self,
@@ -329,47 +339,56 @@ class CropDebugWindow:
         self._start_y: int = 0
         self._running: bool = True
 
+        # 开度调试参数
+        self._openness_threshold = 80
+        self._openness_blur = 3
+        self._openness_aggregation = "median"
+
         self._build_ui()
         self._bind_mouse_events()
         self._window.protocol("WM_DELETE_WINDOW", self._on_close)
         self._show_frame_loop()
 
     def _build_ui(self) -> None:
-        btn_frame = tk.Frame(self._window)
-        btn_frame.pack(pady=(5, 0))
+        # === 主水平容器：左(主画面+控制) | 右(二值化调试+开度控制) ===
+        main_horizontal = tk.Frame(self._window)
+        main_horizontal.pack(fill=tk.BOTH, expand=True)
 
+        # ---- 左侧：主画面 + 控制条 ----
+        left_panel = tk.Frame(main_horizontal)
+        left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # 左控制条 1
+        btn_frame = tk.Frame(left_panel)
+        btn_frame.pack(pady=(5, 0))
         self._flip_var = tk.BooleanVar(value=self._cam_config.flip)
         tk.Checkbutton(btn_frame, text="垂直翻转", variable=self._flip_var).pack(
             side=tk.LEFT, padx=5
         )
-
         self._btn_crop = tk.Button(btn_frame, text="重置剪裁", command=self._reset_crop)
         self._btn_crop.pack(side=tk.LEFT, padx=5)
-
         self._recommended_var = tk.BooleanVar(value=self._cam_config.use_recommended_resolution)
         tk.Checkbutton(btn_frame, text="使用推荐宽高比(4:3)", variable=self._recommended_var).pack(
             side=tk.LEFT, padx=5
         )
-
         tk.Button(btn_frame, text="保存相机配置", command=self._save_crop_config).pack(
             side=tk.LEFT, padx=5
         )
 
-        # ---- ROI 搜索区域滑块 ----
-        roi_frame = tk.Frame(self._window)
+        # 左控制条 2：搜索区域 + 帧率/分辨率
+        roi_frame = tk.Frame(left_panel)
         roi_frame.pack(fill=tk.X, padx=10, pady=(3, 0))
         tk.Label(roi_frame, text="搜索区域:").pack(side=tk.LEFT)
         self._roi_scale_var = tk.DoubleVar(value=self._cam_config.dark_search_roi_scale)
         self._roi_scale = tk.Scale(
             roi_frame, from_=0.1, to=1.0, resolution=0.05,
             orient=tk.HORIZONTAL, variable=self._roi_scale_var,
-            length=200, showvalue=True,
+            length=150, showvalue=True,
             command=self._on_roi_scale_changed,
         )
         self._roi_scale.pack(side=tk.LEFT, padx=(5, 0))
 
-        # ---- 帧率/分辨率切换下拉框 ----
-        res_frame = tk.Frame(self._window)
+        res_frame = tk.Frame(left_panel)
         res_frame.pack(fill=tk.X, padx=10, pady=(3, 5))
         tk.Label(res_frame, text="帧率/分辨率:").pack(side=tk.LEFT)
         self._modes = probe_camera_modes(self._cam_config.index)
@@ -380,7 +399,6 @@ class CropDebugWindow:
             textvariable=self._mode_var,
         )
         self._mode_combo.pack(side=tk.LEFT, padx=(5, 0))
-        # 选中当前配置匹配的模式
         idx = match_current_mode(
             self._modes,
             self._cam_config.frame_width,
@@ -399,28 +417,67 @@ class CropDebugWindow:
             self._cam_config.fourcc = m.get("format", "")
         self._mode_combo.bind("<<ComboboxSelected>>", self._on_resolution_changed)
 
-        # ---- 明度/对比度滑块 ----
-        pp_frame = tk.Frame(self._window)
+        # 左控制条 3：明度/对比度
+        pp_frame = tk.Frame(left_panel)
         pp_frame.pack(fill=tk.X, padx=10, pady=(3, 0))
         tk.Label(pp_frame, text="明度:").pack(side=tk.LEFT)
         self._brightness_var = tk.DoubleVar(value=self._cam_config.brightness)
         tk.Scale(
             pp_frame, from_=-100, to=100, resolution=1,
             orient=tk.HORIZONTAL, variable=self._brightness_var,
-            length=150, showvalue=True,
+            length=120, showvalue=True,
             command=self._on_postprocess_changed,
-        ).pack(side=tk.LEFT, padx=(5, 20))
+        ).pack(side=tk.LEFT, padx=(5, 10))
         tk.Label(pp_frame, text="对比度:").pack(side=tk.LEFT)
         self._contrast_var = tk.DoubleVar(value=self._cam_config.contrast)
         tk.Scale(
             pp_frame, from_=0.0, to=5.0, resolution=0.1,
             orient=tk.HORIZONTAL, variable=self._contrast_var,
-            length=150, showvalue=True,
+            length=120, showvalue=True,
             command=self._on_postprocess_changed,
         ).pack(side=tk.LEFT, padx=(5, 0))
 
-        self._video_label = tk.Label(self._window)
+        # 主画面标签
+        self._video_label = tk.Label(left_panel)
         self._video_label.pack()
+
+        # ---- 右侧：二值化调试视口 + 开度参数控制 ----
+        right_panel = tk.Frame(main_horizontal, padx=10, pady=5)
+        right_panel.pack(side=tk.RIGHT, fill=tk.Y)
+
+        tk.Label(right_panel, text="二值化调试", font=("", 10, "bold")).pack(pady=(0, 3))
+        self._binary_label = tk.Label(right_panel, bg="black")
+        self._binary_label.pack()
+
+        tk.Label(right_panel, text="二值化阈值:", font=("", 8)).pack(anchor="w", pady=(8, 0))
+        self._open_threshold_var = tk.IntVar(value=self._openness_threshold)
+        tk.Scale(
+            right_panel, from_=0, to=255, resolution=1,
+            orient=tk.HORIZONTAL, variable=self._open_threshold_var,
+            length=200, showvalue=True,
+            command=self._on_openness_threshold_changed,
+        ).pack()
+
+        tk.Label(right_panel, text="模糊核:", font=("", 8)).pack(anchor="w")
+        self._open_blur_var = tk.IntVar(value=self._openness_blur)
+        tk.Scale(
+            right_panel, from_=1, to=15, resolution=2,  # 奇数：1,3,5,7,9,11,13,15
+            orient=tk.HORIZONTAL, variable=self._open_blur_var,
+            length=200, showvalue=True,
+            command=self._on_openness_blur_changed,
+        ).pack()
+
+        tk.Label(right_panel, text="聚合方式:", font=("", 8)).pack(anchor="w")
+        self._open_agg_var = tk.StringVar(value=self._openness_aggregation)
+        agg_combo = ttk.Combobox(
+            right_panel, values=["median", "average"], state="readonly",
+            textvariable=self._open_agg_var, width=10,
+        )
+        agg_combo.pack(anchor="w", pady=(0, 5))
+        agg_combo.bind("<<ComboboxSelected>>", self._on_openness_aggregation_changed)
+
+        self._openness_info_label = tk.Label(right_panel, text="", font=("", 8), justify=tk.LEFT)
+        self._openness_info_label.pack(anchor="w")
 
     def _bind_mouse_events(self) -> None:
         self._video_label.bind("<ButtonPress-1>", self._on_press)
@@ -602,6 +659,99 @@ class CropDebugWindow:
             (0, 220, 0), 2,
         )
 
+    def _compute_binary_debug(self, frame, crop_rect=None):
+        """对一帧执行与 C++ compute_eye_openness 相同的流程，返回二值图+参考线。
+
+        椭圆中心与 _draw_search_ellipse_on_frame 一致（跟随 crop_rect）。
+
+        Parameters
+        ----------
+        frame : np.ndarray (BGR)
+        crop_rect : None 或 [x1, y1, x2, y2]，用于定位椭圆中心
+
+        Returns
+        -------
+        binary_bgr : np.ndarray
+            带参考线的彩色二值图，用于显示
+        top_agg, bottom_agg : float
+            聚合后的高点/低点 y 坐标（原始帧坐标系）
+        raw_distance : float
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = frame.shape[:2]
+        scale = self._cam_config.dark_search_roi_scale
+
+        # 椭圆中心与半径必须与 _draw_search_ellipse_on_frame 完全一致
+        if crop_rect is not None:
+            x1, y1, x2, y2 = crop_rect
+            cx_roi = (x1 + x2) // 2
+            cy_roi = (y1 + y2) // 2
+            cw = x2 - x1
+            ch = y2 - y1
+            rx = int((cw / 2.0) * scale)
+            ry = int((ch / 2.0) * scale)
+        else:
+            cx_roi, cy_roi = w // 2, h // 2
+            rx = int((w / 2.0) * scale)
+            ry = int((h / 2.0) * scale)
+
+        # 模糊
+        blur = self._open_blur_var.get()
+        if blur % 2 == 0:
+            blur += 1
+        blurred = gray
+        if blur > 1:
+            blurred = cv2.GaussianBlur(gray, (blur, blur), 0)
+
+        # 二值化
+        threshold = self._open_threshold_var.get()
+        _, binary = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY_INV)
+
+        # 椭圆掩膜
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.ellipse(mask, (cx_roi, cy_roi), (max(rx, 1), max(ry, 1)), 0, 0, 360, 255, -1)
+        masked = cv2.bitwise_and(binary, mask)
+
+        # 逐列扫描
+        min_x = max(0, cx_roi - rx)
+        max_x = min(w, cx_roi + rx)
+        min_y = max(0, cy_roi - ry)
+        max_y = min(h, cy_roi + ry)
+
+        top_pts, bottom_pts = [], []
+        for col in range(min_x, max_x):
+            col_slice = masked[min_y:max_y, col]
+            fg = np.where(col_slice > 0)[0]
+            if len(fg) >= 2:
+                top_pts.append(float(min_y + fg[0]))
+                bottom_pts.append(float(min_y + fg[-1]))
+
+        top_agg, bottom_agg = 0.0, 0.0
+        raw_distance = 0.0
+        if top_pts and bottom_pts:
+            agg = self._open_agg_var.get()
+            if agg == "average":
+                top_agg = np.mean(top_pts)
+                bottom_agg = np.mean(bottom_pts)
+            else:  # median
+                top_agg = float(np.median(top_pts))
+                bottom_agg = float(np.median(bottom_pts))
+            raw_distance = max(0.0, bottom_agg - top_agg)
+
+        # 构建彩色二值图
+        binary_bgr = cv2.cvtColor(masked, cv2.COLOR_GRAY2BGR)
+        # 画椭圆边框
+        cv2.ellipse(binary_bgr, (cx_roi, cy_roi), (max(rx, 1), max(ry, 1)), 0, 0, 360, (0, 200, 0), 1)
+        # 画聚合水平线
+        if top_agg > 0 and bottom_agg > 0:
+            cv2.line(binary_bgr, (min_x, int(top_agg)), (max_x, int(top_agg)), (0, 255, 0), 2)  # 绿-高点
+            cv2.line(binary_bgr, (min_x, int(bottom_agg)), (max_x, int(bottom_agg)), (0, 0, 255), 2)  # 红-低点
+            # 两点连线
+            mid_x = (min_x + max_x) // 2
+            cv2.line(binary_bgr, (mid_x, int(top_agg)), (mid_x, int(bottom_agg)), (255, 255, 0), 1)
+
+        return binary_bgr, top_agg, bottom_agg, raw_distance
+
     def _show_frame_loop(self) -> None:
         if not self._running:
             return
@@ -609,30 +759,96 @@ class CropDebugWindow:
             self._video_label.after(100, self._show_frame_loop)
             return
         ret, frame = self._cap.read()
-        if self._flip_var.get():
-            frame = cv2.flip(frame, 0)
-        if ret:
-            # 后处理：明度/对比度调整（预览与最终效果保持一致）
-            alpha = self._cam_config.contrast
-            beta = self._cam_config.brightness
-            if alpha != 1.0 or beta != 0.0:
-                frame = cv2.convertScaleAbs(frame, alpha=alpha, beta=beta)
-            h, w = frame.shape[:2]
-            # 绘制搜索区域椭圆：有黄框时跟随黄框
-            self._draw_search_ellipse_on_frame(frame, w, h, self._crop_rect)
-
-            if self._crop_rect is not None:
-                x1, y1, x2, y2 = self._crop_rect
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(frame_rgb)
-            imgtk = ImageTk.PhotoImage(image=img)
-            self._video_label.imgtk = imgtk
-            self._video_label.configure(image=imgtk)
-            self._video_label.after(30, self._show_frame_loop)
-        else:
+        if not ret:
             logger.warning("无法读取帧")
             self._video_label.after(100, self._show_frame_loop)
+            return
+
+        if self._flip_var.get():
+            frame = cv2.flip(frame, 0)
+
+        # 后处理：明度/对比度调整（预览与最终效果保持一致）
+        alpha = self._cam_config.contrast
+        beta = self._cam_config.brightness
+        if alpha != 1.0 or beta != 0.0:
+            frame = cv2.convertScaleAbs(frame, alpha=alpha, beta=beta)
+        h, w = frame.shape[:2]
+
+        # 绘制搜索区域椭圆：有黄框时跟随黄框
+        self._draw_search_ellipse_on_frame(frame, w, h, self._crop_rect)
+        if self._crop_rect is not None:
+            x1, y1, x2, y2 = self._crop_rect
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+
+        # 更新主画面
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(frame_rgb)
+        imgtk = ImageTk.PhotoImage(image=img)
+        self._video_label.imgtk = imgtk
+        self._video_label.configure(image=imgtk)
+
+        # 更新二值化调试视口（用帧副本，避免主画面上的椭圆/黄框污染二值化）
+        try:
+            binary_frame = frame.copy()
+            binary_debug, top_y, bottom_y, raw_dist = self._compute_binary_debug(
+                binary_frame, crop_rect=self._crop_rect)
+            debug_h, debug_w = binary_debug.shape[:2]
+            scale_x = self.BINARY_VIEW_WIDTH / debug_w
+            scale_y = self.BINARY_VIEW_HEIGHT / debug_h
+            scale = min(scale_x, scale_y)
+            new_w = int(debug_w * scale)
+            new_h = int(debug_h * scale)
+            binary_resized = cv2.resize(binary_debug, (new_w, new_h))
+
+            binary_rgb = cv2.cvtColor(binary_resized, cv2.COLOR_BGR2RGB)
+            bin_img = Image.fromarray(binary_rgb)
+            bin_imgtk = ImageTk.PhotoImage(image=bin_img)
+            self._binary_label.imgtk = bin_imgtk
+            self._binary_label.configure(image=bin_imgtk)
+
+            # 也计算与 C++ 一致的 raw_eye_openness（使用聚合方式）
+            info_text = f"raw: {raw_dist:.1f}px"
+            info_text += f"\ntop: {top_y:.0f}  bot: {bottom_y:.0f}"
+            info_text += f"\nagg: {self._open_agg_var.get()}"
+            info_text += f"\nthr: {self._open_threshold_var.get()}"
+            info_text += f"\nblur: {blur}" if (blur := self._open_blur_var.get()) > 1 else "\nblur: off"
+            self._openness_info_label.config(text=info_text)
+        except Exception:
+            pass  # debug display is optional
+
+        self._video_label.after(30, self._show_frame_loop)
+
+    def _on_openness_threshold_changed(self, val: str) -> None:
+        """二值化阈值滑块回调：更新本地参数并发送到子进程。"""
+        threshold = int(val)
+        self._openness_threshold = threshold
+        if self._cmd_queue is not None:
+            try:
+                self._cmd_queue.put_nowait(("set_openness_threshold", threshold))
+            except Exception as e:
+                logger.error(f"[{self._side}] 发送开度阈值失败: {e}")
+
+    def _on_openness_blur_changed(self, val: str) -> None:
+        """模糊核滑块回调：更新本地参数并发送到子进程。"""
+        blur = int(val)
+        if blur % 2 == 0:
+            blur += 1
+        self._openness_blur = blur
+        if self._cmd_queue is not None:
+            try:
+                self._cmd_queue.put_nowait(("set_openness_blur", blur))
+            except Exception as e:
+                logger.error(f"[{self._side}] 发送开度模糊核失败: {e}")
+
+    def _on_openness_aggregation_changed(self, event: tk.Event = None) -> None:
+        """聚合方式下拉框回调：更新本地参数并发送到子进程。"""
+        agg = self._open_agg_var.get()
+        self._openness_aggregation = agg
+        if self._cmd_queue is not None:
+            try:
+                self._cmd_queue.put_nowait(("set_openness_aggregation", agg))
+            except Exception as e:
+                logger.error(f"[{self._side}] 发送开度聚合方式失败: {e}")
 
     def _on_close(self) -> None:
         self._running = False
@@ -653,7 +869,7 @@ class CropDebugWindow:
 # ============================================================
 
 class ControlPanel:
-    """Toplevel 控制面板：锁定/解锁眼球参数 + 保存极限注视向量。
+    """Toplevel 控制面板：锁定/解锁眼球参数 + 保存极限注视向量 + 眼睛开度标定。
 
     极值向量通过命令队列发送到子进程，由子进程内部的 Normalizer 处理。
     """
@@ -665,11 +881,15 @@ class ControlPanel:
         cmd_queue_right: Optional[multiprocessing.Queue],
         gaze_reader: "callable",
         side: str = "left",
+        openness_normalizer: "Normalizer" = None,
+        module: "EyeTrackingModule" = None,
     ):
         self._master = master
         self._cmd_queue_left = cmd_queue_left
         self._cmd_queue_right = cmd_queue_right
         self._gaze_reader = gaze_reader
+        self._openness_normalizer = openness_normalizer
+        self._module = module
         self._locks: Dict[str, bool] = {
             "left_radius": False, "left_center": False,
             "right_radius": False, "right_center": False,
@@ -698,14 +918,16 @@ class ControlPanel:
         directions = [("仰视", "up"), ("俯视", "down"), ("内眼角", "inner"), ("外眼角", "outer")]
         for eye_side in ("left", "right"):
             eye_label = "左眼" if eye_side == "left" else "右眼"
-            tk.Label(self._window, text=eye_label).pack(anchor="w", padx=20, pady=(5, 0))
+            row = tk.Frame(self._window)
+            row.pack(pady=(2, 0))
+            tk.Label(row, text=eye_label, width=4).pack(side=tk.LEFT)
             for label, dir_key in directions:
                 tk.Button(
-                    self._window,
-                    text=f"保存{eye_label}{label}向量",
+                    row,
+                    text=label,
                     command=lambda s=eye_side, d=dir_key: self._save_extreme_vector(s, d),
-                    width=22,
-                ).pack(pady=1)
+                    width=10,
+                ).pack(side=tk.LEFT, padx=2)
 
         # 清除极值向量按钮
         tk.Label(self._window, text="清除极值向量", font=("", 10, "bold")).pack(pady=(10, 5))
@@ -723,6 +945,60 @@ class ControlPanel:
             width=22,
         )
         btn_clear_right.pack(pady=1)
+
+        # ---- 眼睛开度跳过阈值 ----
+        tk.Label(self._window, text="低开度跳过阈值", font=("", 10, "bold")).pack(pady=(10, 5))
+        tk.Label(self._window, text="开度低于此值时跳过眼追省电 (0=无)", font=("", 8)).pack()
+
+        skip_frame = tk.Frame(self._window)
+        skip_frame.pack(pady=(5, 0))
+
+        tk.Label(skip_frame, text="左眼").pack(side=tk.LEFT, padx=(10, 2))
+        self._skip_left_var = tk.DoubleVar(value=0.0)
+        tk.Scale(
+            skip_frame, from_=0, to=200, resolution=1,
+            orient=tk.HORIZONTAL, variable=self._skip_left_var,
+            length=200, showvalue=True,
+            command=self._on_skip_left_changed,
+        ).pack(side=tk.LEFT, padx=(0, 15))
+
+        tk.Label(skip_frame, text="右眼").pack(side=tk.LEFT, padx=(10, 2))
+        self._skip_right_var = tk.DoubleVar(value=0.0)
+        tk.Scale(
+            skip_frame, from_=0, to=200, resolution=1,
+            orient=tk.HORIZONTAL, variable=self._skip_right_var,
+            length=200, showvalue=True,
+            command=self._on_skip_right_changed,
+        ).pack(side=tk.LEFT, padx=(0, 10))
+
+        # ---- 保存开度参考值 ----
+        tk.Label(self._window, text="眼睛开度标定", font=("", 10, "bold")).pack(pady=(10, 5))
+
+        # 当前 raw 值显示
+        self._raw_label = tk.Label(self._window, text="", font=("", 8))
+        self._raw_label.pack()
+
+        for eye_side in ("left", "right"):
+            eye_label = "左眼" if eye_side == "left" else "右眼"
+            tk.Label(self._window, text=eye_label).pack(anchor="w", padx=20, pady=(3, 0))
+            btn_frame = tk.Frame(self._window)
+            btn_frame.pack(pady=(0, 2))
+            tk.Button(
+                btn_frame,
+                text="  保存全睁距离  ",
+                command=lambda s=eye_side: self._save_openness_ref(s, "open"),
+            ).pack(side=tk.LEFT, padx=5)
+            tk.Button(
+                btn_frame,
+                text="  保存全闭距离  ",
+                command=lambda s=eye_side: self._save_openness_ref(s, "close"),
+            ).pack(side=tk.LEFT, padx=5)
+
+        # ---- 最终输出值（eye_x, eye_y, eye_o）----
+        tk.Label(self._window, text="最终输出", font=("", 10, "bold")).pack(pady=(10, 5))
+        self._final_output_label = tk.Label(self._window, text="", font=("", 9), justify=tk.LEFT)
+        self._final_output_label.pack()
+        self._update_raw_display()
 
         def _on_close():
             self._window.destroy()
@@ -780,6 +1056,69 @@ class ControlPanel:
                 logger.error(f"发送清除极值向量命令到子进程失败: {e}")
         else:
             logger.warning(f"[{side}] 追踪尚未启动，无法清除极值向量")
+
+    def _on_skip_left_changed(self, val: str) -> None:
+        threshold = float(val)
+        if self._module is not None:
+            self._module._openness_skip_threshold_left = threshold  # store for UI
+        if self._cmd_queue_left is not None:
+            try:
+                self._cmd_queue_left.put_nowait(("set_openness_skip_threshold", threshold))
+                logger.info(f"左眼跳过阈值: {threshold:.0f}")
+            except Exception as e:
+                logger.error(f"发送左眼跳过阈值失败: {e}")
+
+    def _on_skip_right_changed(self, val: str) -> None:
+        threshold = float(val)
+        if self._module is not None:
+            self._module._openness_skip_threshold_right = threshold
+        if self._cmd_queue_right is not None:
+            try:
+                self._cmd_queue_right.put_nowait(("set_openness_skip_threshold", threshold))
+                logger.info(f"右眼跳过阈值: {threshold:.0f}")
+            except Exception as e:
+                logger.error(f"发送右眼跳过阈值失败: {e}")
+
+    def _update_raw_display(self) -> None:
+        """定时更新当前 raw 开度显示，以及最终输出 eye_x/eye_y/eye_o。"""
+        if self._window is None or not self._window.winfo_exists():
+            return
+        if self._module is not None:
+            state = self._module.get_normalized_eye_state()
+
+            # --- raw 显示（仅开度，2 位小数） ---
+            left_raw = state["left"].get("raw_eye_openness", "N/A")
+            right_raw = state["right"].get("raw_eye_openness", "N/A")
+            text = f"左: raw={left_raw:.2f}" if isinstance(left_raw, (int, float)) else f"左: raw={left_raw}"
+            text += f"  右: raw={right_raw:.2f}" if isinstance(right_raw, (int, float)) else f"  右: raw={right_raw}"
+            self._raw_label.config(text=text)
+
+            # --- 最终输出显示（eye_x, eye_y, eye_o，各 2 位小数） ---
+            if hasattr(self, '_final_output_label'):
+                final_lines = []
+                for side_key, label in [("left", "左眼"), ("right", "右眼")]:
+                    x = state[side_key].get("eye_x", None)
+                    y = state[side_key].get("eye_y", None)
+                    o = state[side_key].get("eye_o", None)
+                    parts = []
+                    parts.append(f"x={x:+.2f}" if isinstance(x, (int, float)) else "x=N/A")
+                    parts.append(f"y={y:+.2f}" if isinstance(y, (int, float)) else "y=N/A")
+                    parts.append(f"o={o:.2f}" if isinstance(o, (int, float)) else "o=N/A")
+                    final_lines.append(f"{label}: {'  '.join(parts)}")
+                self._final_output_label.config(text="\n".join(final_lines))
+
+        self._window.after(500, self._update_raw_display)
+
+    def _save_openness_ref(self, side: str, ref_type: str) -> None:
+        """保存开度参考值（全睁/全闭）到 Normalizer。"""
+        if self._module is not None:
+            state = self._module.get_normalized_eye_state()
+            raw = state[side].get("raw_eye_openness", None)
+            if raw is not None and raw > 0:
+                self._openness_normalizer.set_openness_ref(side, ref_type, raw)
+                logger.info(f"已保存 {side}_{ref_type} = {raw:.1f}")
+            else:
+                logger.warning(f"未能获取 {side} 当前开度值，跳过保存")
 
     def destroy(self) -> None:
         if self._window is not None:
@@ -854,8 +1193,10 @@ class EyeTrackingModule:
 
         # 结果收集
         self._latest_state: dict = {
-            "left": {"eye_x": None, "eye_y": None, "confidence": None},
-            "right": {"eye_x": None, "eye_y": None, "confidence": None},
+            "left": {"eye_x": None, "eye_y": None, "confidence": None,
+                     "raw_eye_openness": None, "eye_o": None},
+            "right": {"eye_x": None, "eye_y": None, "confidence": None,
+                      "raw_eye_openness": None, "eye_o": None},
             "timestamp": 0.0,
         }
         self._raw_gaze: Dict[str, Optional[List[float]]] = {"left": None, "right": None}
@@ -970,6 +1311,9 @@ class EyeTrackingModule:
         self._result_thread.start()
 
     def _collect_results(self) -> None:
+        # 创建 Normalizer 实例用于读取开度参考值
+        openness_normalizer = Normalizer(self._extreme_file)
+
         while not self._result_stop.is_set():
             try:
                 data = self._result_queue.get(timeout=0.01)
@@ -982,10 +1326,24 @@ class EyeTrackingModule:
             if side is None:
                 continue
             self._raw_gaze[side] = data.get("gaze_rotated")
+
+            raw_openness = data.get("raw_eye_openness", None)
+
+            # 计算归一化 eye_o
+            eye_o = None
+            if raw_openness is not None and isinstance(raw_openness, (int, float)) and raw_openness > 0:
+                open_ref = openness_normalizer.get_openness_ref(side, "open")
+                close_ref = openness_normalizer.get_openness_ref(side, "close")
+                if open_ref is not None and close_ref is not None and open_ref > close_ref:
+                    eye_o = (raw_openness - close_ref) / (open_ref - close_ref)
+                    eye_o = max(0.0, min(1.0, eye_o))
+
             self._latest_state[side] = {
                 "eye_x": data.get("eye_x"),
                 "eye_y": data.get("eye_y"),
                 "confidence": data.get("confidence"),
+                "raw_eye_openness": raw_openness,
+                "eye_o": eye_o,
             }
             self._latest_state["timestamp"] = time.time()
 
@@ -1081,9 +1439,12 @@ class EyeTrackingModule:
             return
         if self._control_panel is not None and self._control_panel.is_open():
             self._control_panel.destroy()
+        openness_normalizer = Normalizer(self._extreme_file)
         self._control_panel = ControlPanel(
             self._master, self._cmd_queue_left, self._cmd_queue_right,
             self.get_raw_gaze_vector,
+            openness_normalizer=openness_normalizer,
+            module=self,
         )
 
     def save_config(self) -> None:

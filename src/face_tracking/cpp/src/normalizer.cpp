@@ -11,6 +11,55 @@ Normalizer::Normalizer(const std::string& extreme_file) {
     load_extremes();
 }
 
+// Helper: save current extremes_ + openness refs to YAML file
+static void save_yaml_file(const std::string& filepath,
+                           const std::unordered_map<std::string, std::vector<double>>& extremes,
+                           const std::string& side, const std::string& ref_type, double ref_value) {
+    try {
+        YAML::Node config;
+        try {
+            config = YAML::LoadFile(filepath);
+        } catch (...) {
+            config = YAML::Node(YAML::NodeType::Map);
+        }
+
+        // Write existing extremes back
+        for (const auto& [key, vec] : extremes) {
+            config[key] = YAML::Node(vec);
+        }
+
+        // Write or update openness ref
+        std::string ref_key = side + "_" + ref_type;
+        config[ref_key] = ref_value;
+
+        std::ofstream fout(filepath);
+        if (fout.is_open()) {
+            fout << config;
+            fout.close();
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[Normalizer] Error saving YAML: " << e.what() << std::endl;
+    }
+}
+
+void Normalizer::set_openness_ref(const std::string& side, const std::string& ref_type, double value) {
+    save_yaml_file(extreme_file_path_, extremes_, side, ref_type, value);
+    std::cerr << "[Normalizer] Saved " << side << "_" << ref_type << " = " << value << std::endl;
+}
+
+std::optional<double> Normalizer::get_openness_ref(const std::string& side, const std::string& ref_type) const {
+    try {
+        YAML::Node config = YAML::LoadFile(extreme_file_path_);
+        std::string ref_key = side + "_" + ref_type;
+        if (config[ref_key]) {
+            return config[ref_key].as<double>();
+        }
+    } catch (...) {
+        // file not found or parse error
+    }
+    return std::nullopt;
+}
+
 std::string Normalizer::resolve_path(const std::string& filename) const {
     // Try the current working directory first (for absolute paths or direct files)
     if (filename.empty() || filename[0] == '/') {

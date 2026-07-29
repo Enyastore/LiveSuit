@@ -99,6 +99,15 @@ private:
     std::string win_name_;
     std::optional<cv::RotatedRect> last_search_ellipse_;
 
+    // ========== 眼睛开度检测参数 ==========
+    int eye_openness_threshold_ = 80;     // 二值化阈值 (0-255)
+    int eye_openness_blur_ = 3;           // 高斯模糊核 (奇数, 1=不模糊)
+    std::string eye_openness_aggregation_ = "median";  // "median" 或 "average"
+    double raw_eye_openness_ = 0.0;       // 每帧计算的开度 raw 值（在瞳孔检测之前）
+    double eye_openness_skip_threshold_ = 0.0;  // 低于此值跳过眼追（0=不跳过）
+    double eye_openness_top_agg_ = 0.0;   // 每帧聚合后最高点 y 坐标
+    double eye_openness_bottom_agg_ = 0.0; // 每帧聚合后最低点 y 坐标
+
     // ========== Internal Methods ==========
 
     void reset_tracking_state();
@@ -130,8 +139,8 @@ private:
                                                        const std::vector<cv::Point>& contour,
                                                        const std::optional<cv::RotatedRect>& ellipse_opt);
     static std::vector<double> check_contour_pixels(const std::vector<cv::Point>& contour,
-                                                     cv::Size image_shape,
-                                                     const std::optional<cv::RotatedRect>& ellipse_opt);
+                                                      cv::Size image_shape,
+                                                      const std::optional<cv::RotatedRect>& ellipse_opt);
 
     // Eye sphere
     static std::optional<double> distance_to_pupil_outer_edge(cv::Point eye_center,
@@ -143,15 +152,15 @@ private:
     // Ray intersections
     static double angle_diff(double a, double b);
     static std::optional<cv::Point> find_line_intersection(const cv::RotatedRect& e1,
-                                                            const cv::RotatedRect& e2);
+                                                             const cv::RotatedRect& e2);
     cv::Point compute_average_intersection(const cv::Mat& frame,
                                             const std::vector<cv::RotatedRect>& ray_lines,
                                             int number_lines, int total_lines,
                                             int minimum_angle_degrees);
     static std::vector<cv::Point> prune_intersections(const std::vector<cv::Point>& intersections,
-                                                       int maximum);
+                                                        int maximum);
     static cv::Point update_and_average_point(std::vector<cv::Point>& point_list,
-                                               cv::Point new_point, int N);
+                                                cv::Point new_point, int N);
 
     // Gaze vector computation
     std::tuple<std::optional<cv::Point3f>, std::optional<cv::Point3f>, NormalizeResult>
@@ -165,6 +174,9 @@ private:
                              const std::optional<cv::Point3f>& gaze_rotated,
                              double best_ratio_under_ellipse,
                              const NormalizeResult& norm_result);
+
+    // ========== 眼睛开度检测 ==========
+    double compute_eye_openness(const cv::Mat& gray_frame);
 
     // Command/result queue (stored as member to access from process_frames)
     pybind11::object py_cmd_queue_;

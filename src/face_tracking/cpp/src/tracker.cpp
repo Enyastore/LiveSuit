@@ -213,6 +213,15 @@ void GazeVectorTracker::process_commands(pybind11::object py_cmd_queue) {
                 else if (cmd_str == "headless_off") switch_headless_off();
                 else if (cmd_str == "reload_extremes") normalizer_.reload();
                 else if (cmd_str == "clear_extremes") normalizer_.clear_extremes(side_);
+                else if (cmd_str == "set_openness_threshold") {
+                    // Will be handled by next iteration if set via tuple
+                }
+                else if (cmd_str == "set_openness_blur") {
+                    // Will be handled by next iteration if set via tuple
+                }
+                else if (cmd_str == "set_openness_aggregation") {
+                    // Will be handled by next iteration if set via tuple
+                }
             }
             // Check if it's a tuple command (like ("save_extreme", direction, vector))
             else if (py::isinstance<py::tuple>(cmd)) {
@@ -240,6 +249,26 @@ void GazeVectorTracker::process_commands(pybind11::object py_cmd_queue) {
                 else if (cmd_type == "set_postprocess" && tup.size() >= 3) {
                     brightness_ = tup[1].cast<double>();
                     contrast_ = tup[2].cast<double>();
+                }
+                else if (cmd_type == "set_openness_threshold" && tup.size() >= 2) {
+                    eye_openness_threshold_ = std::max(0, std::min(255, tup[1].cast<int>()));
+                }
+                else if (cmd_type == "set_openness_blur" && tup.size() >= 2) {
+                    int v = tup[1].cast<int>();
+                    // Force odd number >= 1
+                    if (v < 1) v = 1;
+                    if (v % 2 == 0) v += 1;
+                    eye_openness_blur_ = v;
+                }
+                else if (cmd_type == "set_openness_aggregation" && tup.size() >= 2) {
+                    std::string agg = tup[1].cast<std::string>();
+                    if (agg == "median" || agg == "average") {
+                        eye_openness_aggregation_ = agg;
+                    }
+                }
+                else if (cmd_type == "set_openness_skip_threshold" && tup.size() >= 2) {
+                    eye_openness_skip_threshold_ = std::max(0.0, tup[1].cast<double>());
+                    std::cerr << "[" << side_ << "] 低开度跳过阈值: " << eye_openness_skip_threshold_ << std::endl;
                 }
             }
         }
@@ -384,6 +413,16 @@ void GazeVectorTracker::process_frame(const cv::Mat& frame) {
     cv::Mat gray_frame;
     cv::cvtColor(processed_frame, gray_frame, cv::COLOR_BGR2GRAY);
 
+    // 眼睛开度检测 — 在瞳孔追踪之前执行（轻量级）
+    raw_eye_openness_ = compute_eye_openness(gray_frame);
+
+    // 开度低于阈值 → 跳过整个眼追流水线，节省 CPU
+    if (eye_openness_skip_threshold_ > 0.0 && raw_eye_openness_ < eye_openness_skip_threshold_) {
+        last_tracking_result_ = TrackingResult{};
+        last_tracking_result_.raw_eye_openness = raw_eye_openness_;
+        return;
+    }
+
     auto darkest_point = get_darkest_area(processed_frame, gray_frame);
     if (!darkest_point.has_value()) {
         last_tracking_result_ = TrackingResult{};
@@ -507,6 +546,7 @@ void GazeVectorTracker::process_frames(
     }
     last_tracking_result_.eye_center = model_center_average;
     last_tracking_result_.sphere_radius = max_observed_distance_;
+    last_tracking_result_.raw_eye_openness = raw_eye_openness_;
 
     // Compute gaze vector (uses member py_result_queue_ to send result back)
     auto [center_3d, gaze_rotated, norm_result] = compute_gaze_vector(
@@ -1167,6 +1207,7 @@ GazeVectorTracker::compute_gaze_vector(
             result["eye_x"] = norm_result.eye_x.has_value() ? py::cast(*norm_result.eye_x) : py::none();
             result["eye_y"] = norm_result.eye_y.has_value() ? py::cast(*norm_result.eye_y) : py::none();
             result["confidence"] = confidence_ratio;
+            result["raw_eye_openness"] = last_tracking_result_.raw_eye_openness;
             py_result_queue_.attr("put_nowait")(result);
         } catch (...) {}
     }
@@ -1190,6 +1231,32 @@ void GazeVectorTracker::draw_debug_overlay(
     // Draw search ellipse
     if (last_search_ellipse_.has_value()) {
         cv::ellipse(frame, *last_search_ellipse_, cv::Scalar(0, 200, 0), 2);
+
+        // 在椭圆区域内绘制开度参考线
+        cv::RotatedRect ellipse = *last_search_ellipse_;
+        int cx = (int)ellipse.center.x;
+        int cy = (int)ellipse.center.y;
+        int rx = (int)(ellipse.size.width / 2);
+        int ry = (int)(ellipse.size.height / 2);
+        int line_x_min = std::max(0, cx - rx);
+        int line_x_max = std::min(frame.cols, cx + rx);
+
+        if (eye_openness_top_agg_ > 0 && eye_openness_bottom_agg_ > 0) {
+            // 绿色水平线 — 最高点
+            int top_y = (int)eye_openness_top_agg_;
+            cv::line(frame, cv::Point(line_x_min, top_y),
+                     cv::Point(line_x_max, top_y), cv::Scalar(0, 255, 0), 2);
+
+            // 红色水平线 — 最低点
+            int bottom_y = (int)eye_openness_bottom_agg_;
+            cv::line(frame, cv::Point(line_x_min, bottom_y),
+                     cv::Point(line_x_max, bottom_y), cv::Scalar(0, 0, 255), 2);
+
+            // 青色垂直线连接两点
+            int mid_x = (line_x_min + line_x_max) / 2;
+            cv::line(frame, cv::Point(mid_x, top_y),
+                     cv::Point(mid_x, bottom_y), cv::Scalar(255, 255, 0), 1);
+        }
     }
 
     // Draw eye sphere
@@ -1266,6 +1333,117 @@ void GazeVectorTracker::draw_debug_overlay(
                 cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
 
     cv::imshow(win_name_, frame);
+}
+
+// ================================================================
+// 眼睛开度检测 — 二值化 + 竖直扫描 + 中位数/平均值聚合
+// ================================================================
+
+double GazeVectorTracker::compute_eye_openness(const cv::Mat& gray_frame) {
+    int h = gray_frame.rows, w = gray_frame.cols;
+
+    // 获取 dark_search_ellipse 参数（与 get_darkest_area 一致）
+    int cx_roi = w / 2, cy_roi = h / 2;
+    int rx = (int)((w / 2.0) * dark_search_roi_scale_);
+    int ry = (int)((h / 2.0) * dark_search_roi_scale_);
+
+    if (rx <= 0 || ry <= 0) return 0.0;
+
+    // 1. 高斯模糊
+    cv::Mat blurred = gray_frame;
+    if (eye_openness_blur_ > 1) {
+        cv::GaussianBlur(gray_frame, blurred,
+                         cv::Size(eye_openness_blur_, eye_openness_blur_), 0);
+    }
+
+    // 2. 二值化（THRESH_BINARY_INV：黑色→白色前景）
+    cv::Mat binary;
+    cv::threshold(blurred, binary, eye_openness_threshold_, 255, cv::THRESH_BINARY_INV);
+
+    // 3. 椭圆掩膜：只保留 dark_search_ellipse 内的像素
+    cv::Mat mask = cv::Mat::zeros(h, w, CV_8U);
+    cv::ellipse(mask, cv::RotatedRect(cv::Point2f(cx_roi, cy_roi),
+                                       cv::Size2f(rx * 2, ry * 2), 0),
+                cv::Scalar(255), -1);
+    cv::Mat masked;
+    cv::bitwise_and(binary, mask, masked);
+
+    // 4. 逐列扫描
+    //    限定在椭圆边界框内扫描，提高效率
+    int min_x = std::max(0, cx_roi - rx);
+    int max_x = std::min(w, cx_roi + rx);
+    int min_y = std::max(0, cy_roi - ry);
+    int max_y = std::min(h, cy_roi + ry);
+
+    std::vector<double> top_points, bottom_points;
+
+    for (int x = min_x; x < max_x; ++x) {
+        int top_y = -1;
+        int bottom_y = -1;
+
+        // 从上往下找第一个白色像素
+        for (int y = min_y; y < max_y; ++y) {
+            if (masked.at<uchar>(y, x) > 0) {
+                top_y = y;
+                break;
+            }
+        }
+
+        // 从下往上找第一个白色像素
+        for (int y = max_y - 1; y >= min_y; --y) {
+            if (masked.at<uchar>(y, x) > 0) {
+                bottom_y = y;
+                break;
+            }
+        }
+
+        // 该列必须既有最高点又有最低点，且 top != bottom（高度至少 1）
+        if (top_y >= 0 && bottom_y >= 0 && bottom_y > top_y) {
+            top_points.push_back((double)top_y);
+            bottom_points.push_back((double)bottom_y);
+        }
+    }
+
+    if (top_points.empty() || bottom_points.empty()) {
+        return 0.0;
+    }
+
+    // 5. 聚合
+    double top_agg, bottom_agg;
+    if (eye_openness_aggregation_ == "average") {
+        double sum_top = 0, sum_bottom = 0;
+        for (size_t i = 0; i < top_points.size(); ++i) {
+            sum_top += top_points[i];
+            sum_bottom += bottom_points[i];
+        }
+        top_agg = sum_top / top_points.size();
+        bottom_agg = sum_bottom / bottom_points.size();
+    } else {
+        // 中位数
+        size_t n = top_points.size();
+        size_t mid = n / 2;
+        std::nth_element(top_points.begin(), top_points.begin() + mid, top_points.end());
+        std::nth_element(bottom_points.begin(), bottom_points.begin() + mid, bottom_points.end());
+        if (n % 2 == 0) {
+            // 偶数个，取中间两数的均值
+            auto mid2 = mid - 1;
+            std::nth_element(top_points.begin(), top_points.begin() + mid2, top_points.end());
+            std::nth_element(bottom_points.begin(), bottom_points.begin() + mid2, bottom_points.end());
+            top_agg = (top_points[mid] + top_points[mid2]) * 0.5;
+            bottom_agg = (bottom_points[mid] + bottom_points[mid2]) * 0.5;
+        } else {
+            top_agg = top_points[mid];
+            bottom_agg = bottom_points[mid];
+        }
+    }
+
+    double raw_distance = bottom_agg - top_agg;
+
+    // 存储聚合结果供 draw_debug_overlay 使用
+    eye_openness_top_agg_ = top_agg;
+    eye_openness_bottom_agg_ = bottom_agg;
+
+    return std::max(0.0, raw_distance);
 }
 
 } // namespace eye_tracker

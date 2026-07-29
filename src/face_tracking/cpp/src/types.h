@@ -28,6 +28,7 @@ struct TrackingResult {
     std::optional<PupilEllipse> pupil_ellipse;
     cv::Point eye_center;
     double sphere_radius;
+    double raw_eye_openness = 0.0;        // 眼睛开度原始竖直距离（像素）
 };
 
 // Result sent to Python via queue
@@ -37,6 +38,7 @@ struct GazeResult {
     std::optional<double> eye_x;
     std::optional<double> eye_y;
     double confidence;
+    double raw_eye_openness = 0.0;        // 眼睛开度原始竖直距离
 };
 
 // Command types from Python
@@ -53,6 +55,10 @@ enum class CommandType {
     SET_SEARCH_ROI_SCALE,
     RESTART_CAPTURE,
     SET_POSTPROCESS,
+    SET_OPENNESS_THRESHOLD,
+    SET_OPENNESS_BLUR,
+    SET_OPENNESS_AGGREGATION,
+    SET_OPENNESS_SKIP_THRESHOLD,
     UNKNOWN
 };
 
