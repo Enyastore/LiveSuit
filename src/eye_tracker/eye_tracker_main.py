@@ -169,6 +169,8 @@ class CameraConfig:
     fourcc: str = ""  # 像素格式，如 'YUYV', 'MJPG'
     use_recommended_resolution: bool = True
     dark_search_roi_scale: float = 0.70
+    brightness: float = 0.0    # 明度偏移 [-100, 100]，0 = 不变
+    contrast: float = 1.0       # 对比度系数 [0.0, 3.0]，1.0 = 不变
 
 
 @dataclass
@@ -219,6 +221,8 @@ class ConfigPersistence:
                     fourcc=left_data.get('fourcc', ''),
                     use_recommended_resolution=left_data.get('use_recommended_resolution', True),
                     dark_search_roi_scale=left_data.get('dark_search_roi_scale', 0.70),
+                    brightness=left_data.get('brightness', 0.0),
+                    contrast=left_data.get('contrast', 1.0),
                 ),
                 right=CameraConfig(
                     index=right_data.get('camera_index', 0),
@@ -230,6 +234,8 @@ class ConfigPersistence:
                     fourcc=right_data.get('fourcc', ''),
                     use_recommended_resolution=right_data.get('use_recommended_resolution', True),
                     dark_search_roi_scale=right_data.get('dark_search_roi_scale', 0.70),
+                    brightness=right_data.get('brightness', 0.0),
+                    contrast=right_data.get('contrast', 1.0),
                 ),
             )
         except Exception as e:
@@ -251,6 +257,8 @@ class ConfigPersistence:
                 'fourcc': config.left.fourcc,
                 'use_recommended_resolution': config.left.use_recommended_resolution,
                 'dark_search_roi_scale': config.left.dark_search_roi_scale,
+                'brightness': config.left.brightness,
+                'contrast': config.left.contrast,
             },
             'right': {
                 'camera_index': config.right.index,
@@ -262,6 +270,8 @@ class ConfigPersistence:
                 'fourcc': config.right.fourcc,
                 'use_recommended_resolution': config.right.use_recommended_resolution,
                 'dark_search_roi_scale': config.right.dark_search_roi_scale,
+                'brightness': config.right.brightness,
+                'contrast': config.right.contrast,
             },
         }
         try:
@@ -388,6 +398,26 @@ class CropDebugWindow:
             self._cam_config.frame_rate = m["fps"]
             self._cam_config.fourcc = m.get("format", "")
         self._mode_combo.bind("<<ComboboxSelected>>", self._on_resolution_changed)
+
+        # ---- 明度/对比度滑块 ----
+        pp_frame = tk.Frame(self._window)
+        pp_frame.pack(fill=tk.X, padx=10, pady=(3, 0))
+        tk.Label(pp_frame, text="明度:").pack(side=tk.LEFT)
+        self._brightness_var = tk.DoubleVar(value=self._cam_config.brightness)
+        tk.Scale(
+            pp_frame, from_=-100, to=100, resolution=1,
+            orient=tk.HORIZONTAL, variable=self._brightness_var,
+            length=150, showvalue=True,
+            command=self._on_postprocess_changed,
+        ).pack(side=tk.LEFT, padx=(5, 20))
+        tk.Label(pp_frame, text="对比度:").pack(side=tk.LEFT)
+        self._contrast_var = tk.DoubleVar(value=self._cam_config.contrast)
+        tk.Scale(
+            pp_frame, from_=0.0, to=5.0, resolution=0.1,
+            orient=tk.HORIZONTAL, variable=self._contrast_var,
+            length=150, showvalue=True,
+            command=self._on_postprocess_changed,
+        ).pack(side=tk.LEFT, padx=(5, 0))
 
         self._video_label = tk.Label(self._window)
         self._video_label.pack()
@@ -533,6 +563,19 @@ class CropDebugWindow:
         self._cam_config.dark_search_roi_scale = scale
         logger.info(f"[{self._side}] 搜索区域比例: {scale:.2f}")
 
+    def _on_postprocess_changed(self, val: str = None) -> None:
+        """明度/对比度滑块回调：更新配置，实时发送到子进程。"""
+        brightness = self._brightness_var.get()
+        contrast = self._contrast_var.get()
+        self._cam_config.brightness = brightness
+        self._cam_config.contrast = contrast
+        if self._cmd_queue is not None:
+            try:
+                self._cmd_queue.put_nowait(("set_postprocess", brightness, contrast))
+            except Exception as e:
+                logger.error(f"[{self._side}] 发送后处理参数失败: {e}")
+        logger.info(f"[{self._side}] 明度: {brightness:.0f}, 对比度: {contrast:.1f}")
+
     def _draw_search_ellipse_on_frame(self, frame, crop_w, crop_h, crop_rect=None):
         """在帧上绘制绿色椭圆标记搜索区域。
 
@@ -569,6 +612,11 @@ class CropDebugWindow:
         if self._flip_var.get():
             frame = cv2.flip(frame, 0)
         if ret:
+            # 后处理：明度/对比度调整（预览与最终效果保持一致）
+            alpha = self._cam_config.contrast
+            beta = self._cam_config.brightness
+            if alpha != 1.0 or beta != 0.0:
+                frame = cv2.convertScaleAbs(frame, alpha=alpha, beta=beta)
             h, w = frame.shape[:2]
             # 绘制搜索区域椭圆：有黄框时跟随黄框
             self._draw_search_ellipse_on_frame(frame, w, h, self._crop_rect)
@@ -871,6 +919,8 @@ class EyeTrackingModule:
                 self._extreme_file, self.config.left.use_recommended_resolution,
                 self.config.left.dark_search_roi_scale,
                 self.config.left.fourcc,
+                self.config.left.brightness,
+                self.config.left.contrast,
             ),
             daemon=True,
         )
@@ -886,6 +936,8 @@ class EyeTrackingModule:
                 self._extreme_file, self.config.right.use_recommended_resolution,
                 self.config.right.dark_search_roi_scale,
                 self.config.right.fourcc,
+                self.config.right.brightness,
+                self.config.right.contrast,
             ),
             daemon=True,
         )
@@ -1064,6 +1116,8 @@ def _run_tracker_in_process(
     use_recommended_resolution: bool = True,
     dark_search_roi_scale: float = 0.70,
     fourcc_str: str = "",
+    brightness: float = 0.0,
+    contrast: float = 1.0,
 ) -> None:
     tracker = GazeVectorTracker(
         cam_index=cam_index, flip=flip, crop=crop, side=side,
@@ -1072,6 +1126,8 @@ def _run_tracker_in_process(
         use_recommended_resolution=use_recommended_resolution,
         dark_search_roi_scale=dark_search_roi_scale,
         fourcc_str=fourcc_str,
+        brightness=brightness,
+        contrast=contrast,
     )
     tracker.start_tracking(
         command_queue=command_queue, result_queue=result_queue, headless=headless,

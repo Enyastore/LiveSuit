@@ -171,6 +171,8 @@ class GazeVectorTracker:
         use_recommended_resolution: bool = True,
         dark_search_roi_scale: float = 0.70,
         fourcc_str: str = "",
+        brightness: float = 0.0,
+        contrast: float = 1.0,
     ):
         self.cam_index = cam_index
         self.flip = flip
@@ -182,6 +184,8 @@ class GazeVectorTracker:
         self._fourcc_str = fourcc_str
         self._use_recommended_resolution = use_recommended_resolution
         self._dark_search_roi_scale = max(0.1, min(1.0, dark_search_roi_scale))
+        self._brightness = brightness
+        self._contrast = contrast
 
         # ---- 归一化器 ----
         self._normalizer = Normalizer(extreme_file)
@@ -327,6 +331,11 @@ class GazeVectorTracker:
                             # 动态重启相机 (w, h, fps, fourcc_str)
                             w, h, fps, fcc = cmd[1], cmd[2], cmd[3], cmd[4]
                             self._restart_camera(w, h, fps, fcc)
+                        elif isinstance(cmd, tuple) and cmd[0] == "set_postprocess":
+                            # 动态更新明度/对比度
+                            self._brightness = float(cmd[1])
+                            self._contrast = float(cmd[2])
+                            logger.info(f"[{self.side}] 后处理: 明度={self._brightness:.0f}, 对比度={self._contrast:.1f}")
                     except Exception:
                         pass
 
@@ -476,11 +485,15 @@ class GazeVectorTracker:
             frame = cv2.resize(frame, (new_w, new_h))
             self.frame_width = new_w
             self.frame_height = new_h
-        darkest_point = self._get_darkest_area(frame)
+        # 后处理：明度/对比度调整（影响最终瞳孔检测效果）
+        if self._contrast != 1.0 or self._brightness != 0.0:
+            frame = cv2.convertScaleAbs(frame, alpha=self._contrast, beta=self._brightness)
+        # 一次性灰度转换，后续无需重复
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        darkest_point = self._get_darkest_area(frame, gray_frame)
         if darkest_point is None:
             self.last_tracking_result = None
             return
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         darkest_pixel_value = gray_frame[darkest_point[1], darkest_point[0]]
 
         thresholded_strict = self._apply_binary_threshold(
@@ -539,11 +552,12 @@ class GazeVectorTracker:
             )
 
             if len(reduced) > 0 and len(reduced[0]) > 5:
-                current_goodness = self._check_ellipse_goodness(dilated, reduced[0])
+                # 先 fitEllipse 一次，后续函数复用结果
                 ellipse = cv2.fitEllipse(reduced[0])
                 center_x, center_y = map(int, ellipse[0])
 
-                total_pixels = self._check_contour_pixels(reduced[0], dilated.shape)
+                current_goodness = self._check_ellipse_goodness(dilated, reduced[0], ellipse)
+                total_pixels = self._check_contour_pixels(reduced[0], dilated.shape, ellipse)
 
                 final_goodness = (
                     current_goodness[0]
@@ -911,11 +925,12 @@ class GazeVectorTracker:
         _, thresholded = cv2.threshold(image, threshold, 255, cv2.THRESH_BINARY_INV)
         return thresholded
 
-    def _get_darkest_area(self, image):
-        """在椭圆 ROI 内搜索最暗区域。
+    def _get_darkest_area(self, image, gray_frame=None):
+        """在椭圆 ROI 内搜索最暗区域（向量化版本）。
         
+        用 numpy 批量采样替代四层纯 Python 循环。
         椭圆中心 = 画面中心，长轴 = 宽度/2 * scale，短轴 = 高度/2 * scale。
-        返回 (暗点坐标, 椭圆参数) — 供可视化使用。
+        返回 (暗点坐标)。
         """
         h, w = image.shape[:2]
         cx_roi, cy_roi = w // 2, h // 2
@@ -923,40 +938,54 @@ class GazeVectorTracker:
         ry = int((h / 2) * self._dark_search_roi_scale)
         self._last_search_ellipse = (cx_roi, cy_roi, rx, ry)
 
-        ignore_bounds = 20
-        image_skip_size = 10
-        search_area = 20
-        internal_skip_size = 5
+        if gray_frame is None:
+            gray_frame = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        min_sum = float("inf")
-        darkest_point = None
+        ignore_bounds, image_skip_size = 20, 10
+        search_area, internal_skip_size = 20, 5
 
-        for y in range(ignore_bounds, h - ignore_bounds, image_skip_size):
-            for x in range(ignore_bounds, w - ignore_bounds, image_skip_size):
-                # 检查采样点中心是否在椭圆内
-                sx = x + search_area // 2
-                sy = y + search_area // 2
-                if rx > 0 and ry > 0:
-                    if ((sx - cx_roi) / rx) ** 2 + ((sy - cy_roi) / ry) ** 2 > 1.0:
-                        continue  # 椭圆外，跳过
+        ys = np.arange(ignore_bounds, h - ignore_bounds, image_skip_size)
+        xs = np.arange(ignore_bounds, w - ignore_bounds, image_skip_size)
+        if len(ys) == 0 or len(xs) == 0:
+            return None
 
-                current_sum = 0
-                num_pixels = 0
-                for dy in range(0, search_area, internal_skip_size):
-                    if y + dy >= h:
-                        break
-                    for dx in range(0, search_area, internal_skip_size):
-                        if x + dx >= w:
-                            break
-                        current_sum += int(gray[y + dy][x + dx])
-                        num_pixels += 1
+        grid_y, grid_x = np.meshgrid(ys, xs, indexing='ij')
+        sy = grid_y + search_area // 2  # 采样点中心 y
+        sx = grid_x + search_area // 2  # 采样点中心 x
 
-                if current_sum < min_sum and num_pixels > 0:
-                    min_sum = current_sum
-                    darkest_point = (sx, sy)
+        # ---- 椭圆过滤 ----
+        if rx > 0 and ry > 0:
+            in_ellipse = ((sx - cx_roi) / rx) ** 2 + ((sy - cy_roi) / ry) ** 2 <= 1.0
+            if not np.any(in_ellipse):
+                return None
+            sy_v, sx_v = sy[in_ellipse], sx[in_ellipse]
+        else:
+            sy_v, sx_v = sy.ravel(), sx.ravel()
 
-        return darkest_point
+        n_points = len(sy_v)
+        if n_points == 0:
+            return None
+
+        # ---- 构建采样偏移 (0,5,10,15) × (0,5,10,15) = 16 个点 ----
+        y_offsets = np.arange(0, search_area, internal_skip_size)
+        x_offsets = np.arange(0, search_area, internal_skip_size)
+        yo, xo = np.meshgrid(y_offsets, x_offsets, indexing='ij')
+        yo, xo = yo.ravel(), xo.ravel()  # 每个长度 16
+
+        # ---- 一次性提取所有像素值 (n_points, 16) ----
+        all_y = sy_v[:, None] + yo[None, :]
+        all_x = sx_v[:, None] + xo[None, :]
+
+        # 边界裁剪
+        np.clip(all_y, 0, h - 1, out=all_y)
+        np.clip(all_x, 0, w - 1, out=all_x)
+
+        pixels = gray_frame[all_y.astype(np.int32), all_x.astype(np.int32)].astype(np.int32)
+        sums = np.sum(pixels, axis=1)
+
+        # ---- 找最小和 ----
+        min_idx = np.argmin(sums)
+        return (int(sx_v[min_idx]), int(sy_v[min_idx]))
 
     @staticmethod
     def _mask_outside_square(image, center, size):
@@ -993,60 +1022,92 @@ class GazeVectorTracker:
 
     @staticmethod
     def _optimize_contours_by_angle(contours):
+        """向量化版本：用 numpy 批量操作替代 Python 逐点循环。"""
         if len(contours) < 1:
             return contours
 
-        all_contours = np.concatenate(contours[0], axis=0)
-        spacing = int(len(all_contours) / 25)
-        filtered_points = []
-        centroid = np.mean(all_contours, axis=0)
+        all_contours = np.concatenate(contours[0], axis=0)  # (N, 2)
+        n = len(all_contours)
+        if n < 3:
+            return contours
 
-        for i in range(len(all_contours)):
-            current_point = all_contours[i]
-            prev_point = (
-                all_contours[i - spacing]
-                if i - spacing >= 0
-                else all_contours[-spacing]
-            )
-            next_point = (
-                all_contours[i + spacing]
-                if i + spacing < len(all_contours)
-                else all_contours[spacing]
-            )
+        spacing = max(1, int(n / 25))
+        centroid = np.mean(all_contours, axis=0)  # (2,)
 
-            vec1 = prev_point - current_point
-            vec2 = next_point - current_point
-            vec_to_centroid = centroid - current_point
+        # ---- 批量构建 prev/next/current 向量 ----
+        # prev_idx[i] = i - spacing, next_idx[i] = i + spacing（环形）
+        idx = np.arange(n)
+        prev_idx = (idx - spacing) % n
+        next_idx = (idx + spacing) % n
 
-            n1 = np.linalg.norm(vec_to_centroid)
-            n2 = np.linalg.norm(vec1 + vec2)
-            if n1 < 1e-6 or n2 < 1e-6:
-                continue
-            v_dir = vec_to_centroid / n1
-            v_tangent = (vec1 + vec2) / n2
+        prev_pts = all_contours[prev_idx]  # (N, 2)
+        curr_pts = all_contours[idx]       # (N, 2)
+        next_pts = all_contours[next_idx]  # (N, 2)
 
-            cos_threshold = np.cos(np.radians(60))
-            if np.dot(v_dir, v_tangent) >= cos_threshold:
-                filtered_points.append(current_point)
+        vec1 = prev_pts - curr_pts         # (N, 2)
+        vec2 = next_pts - curr_pts         # (N, 2)
+        vec_to_centroid = centroid - curr_pts  # (N, 2)
 
-        return np.array(filtered_points, dtype=np.int32).reshape((-1, 1, 2))
+        # ---- 归一化向量 ----
+        n1 = np.linalg.norm(vec_to_centroid, axis=1)  # (N,)
+        n2 = np.linalg.norm(vec1 + vec2, axis=1)       # (N,)
+
+        valid = (n1 > 1e-6) & (n2 > 1e-6)
+        if not np.any(valid):
+            return np.array([], dtype=np.int32).reshape((-1, 1, 2))
+
+        v_dir = np.zeros_like(curr_pts)
+        v_dir[valid] = vec_to_centroid[valid] / n1[valid, None]
+        v_tangent = np.zeros_like(curr_pts)
+        v_tangent[valid] = (vec1[valid] + vec2[valid]) / n2[valid, None]
+
+        # ---- 点积筛选 ----
+        cos_threshold = np.cos(np.radians(60))
+        dot_products = np.sum(v_dir * v_tangent, axis=1)  # (N,)
+        keep = valid & (dot_products >= cos_threshold)
+
+        if not np.any(keep):
+            return np.array([], dtype=np.int32).reshape((-1, 1, 2))
+
+        return all_contours[keep].reshape((-1, 1, 2)).astype(np.int32)
 
     # ==================== 椭圆质量检测 ====================
 
     @staticmethod
-    def _check_ellipse_goodness(binary_image, contour):
+    def _check_ellipse_goodness(binary_image, contour, ellipse=None):
         if len(contour) < 5:
             return [0, 0, 0]
 
-        ellipse = cv2.fitEllipse(contour)
-        mask = np.zeros_like(binary_image)
-        cv2.ellipse(mask, ellipse, (255), -1)
+        if ellipse is None:
+            ellipse = cv2.fitEllipse(contour)
+
+        # 计算包含椭圆的最小 ROI，大幅减少 mask 创建开销
+        h, w = binary_image.shape
+        cx, cy = int(ellipse[0][0]), int(ellipse[0][1])
+        axis_major = int(max(ellipse[1]) / 2) + 5  # +5 安全边距
+        x1 = max(0, cx - axis_major)
+        y1 = max(0, cy - axis_major)
+        x2 = min(w, cx + axis_major)
+        y2 = min(h, cy + axis_major)
+
+        roi_bin = binary_image[y1:y2, x1:x2]
+        if roi_bin.size == 0:
+            return [0, 0, 0]
+
+        mask = np.zeros(roi_bin.shape, dtype=np.uint8)
+        # 调整椭圆参数到 ROI 坐标
+        ellipse_roi = (
+            (ellipse[0][0] - x1, ellipse[0][1] - y1),
+            ellipse[1],
+            ellipse[2],
+        )
+        cv2.ellipse(mask, ellipse_roi, (255), -1)
 
         ellipse_area = np.sum(mask == 255)
         if ellipse_area == 0:
             return [0, 0, 0]
 
-        covered_pixels = np.sum((binary_image == 255) & (mask == 255))
+        covered_pixels = np.sum((roi_bin == 255) & (mask == 255))
         goodness = [0, 0, 0]
         goodness[0] = covered_pixels / ellipse_area
         goodness[2] = min(
@@ -1056,19 +1117,44 @@ class GazeVectorTracker:
         return goodness
 
     @staticmethod
-    def _check_contour_pixels(contour, image_shape):
+    def _check_contour_pixels(contour, image_shape, ellipse=None):
         if len(contour) < 5:
             return [0, 0]
 
-        contour_mask = np.zeros(image_shape, dtype=np.uint8)
-        cv2.drawContours(contour_mask, [contour], -1, (255), 1)
+        if ellipse is None:
+            ellipse = cv2.fitEllipse(contour)
 
-        ellipse_mask_thick = np.zeros(image_shape, dtype=np.uint8)
-        ellipse_mask_thin = np.zeros(image_shape, dtype=np.uint8)
-        ellipse = cv2.fitEllipse(contour)
+        # 计算包含轮廓和椭圆的最小 ROI
+        h, w = image_shape
+        cx, cy = int(ellipse[0][0]), int(ellipse[0][1])
+        axis_major = int(max(ellipse[1]) / 2) + 15  # +15 安全边距（含10px厚轨迹）
+        x1 = max(0, cx - axis_major)
+        y1 = max(0, cy - axis_major)
+        x2 = min(w, cx + axis_major)
+        y2 = min(h, cy + axis_major)
 
-        cv2.ellipse(ellipse_mask_thick, ellipse, (255), 10)
-        cv2.ellipse(ellipse_mask_thin, ellipse, (255), 4)
+        roi_w, roi_h = x2 - x1, y2 - y1
+        if roi_w <= 0 or roi_h <= 0:
+            return [0, 0]
+
+        # ---- 在 ROI 内创建 mask ----
+        contour_mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
+        if len(contour) > 0:
+            # 将轮廓坐标偏移到 ROI 空间
+            shifted_contour = [(pt[0][0] - x1, pt[0][1] - y1) for pt in contour]
+            shifted_contour = np.array([shifted_contour], dtype=np.int32)
+            cv2.drawContours(contour_mask, shifted_contour, -1, (255), 1)
+
+        ellipse_mask_thick = np.zeros((roi_h, roi_w), dtype=np.uint8)
+        ellipse_mask_thin = np.zeros((roi_h, roi_w), dtype=np.uint8)
+        # 调整椭圆参数到 ROI 坐标
+        ellipse_roi = (
+            (ellipse[0][0] - x1, ellipse[0][1] - y1),
+            ellipse[1],
+            ellipse[2],
+        )
+        cv2.ellipse(ellipse_mask_thick, ellipse_roi, (255), 10)
+        cv2.ellipse(ellipse_mask_thin, ellipse_roi, (255), 4)
 
         overlap_thick = cv2.bitwise_and(contour_mask, ellipse_mask_thick)
         overlap_thin = cv2.bitwise_and(contour_mask, ellipse_mask_thin)
