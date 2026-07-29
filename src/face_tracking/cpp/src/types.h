@@ -59,6 +59,10 @@ enum class CommandType {
     SET_OPENNESS_BLUR,
     SET_OPENNESS_AGGREGATION,
     SET_OPENNESS_SKIP_THRESHOLD,
+    SET_OPENNESS_THRESHOLD_LOW,    // 新增：开闭检测下界阈值
+    SET_OPENNESS_THRESHOLD_HIGH,   // 新增：开闭检测上界阈值
+    SET_PUPIL_THRESHOLD_LOW,       // 新增：瞳孔检测下界偏移
+    SET_PUPIL_THRESHOLD_HIGH,      // 新增：瞳孔检测上界偏移
     UNKNOWN
 };
 

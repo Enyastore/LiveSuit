@@ -1,4 +1,4 @@
-#include "normalizer.h"
+ #include "normalizer.h"
 #include <cmath>
 #include <fstream>
 #include <iostream>
@@ -45,6 +45,38 @@ static void save_yaml_file(const std::string& filepath,
 void Normalizer::set_openness_ref(const std::string& side, const std::string& ref_type, double value) {
     save_yaml_file(extreme_file_path_, extremes_, side, ref_type, value);
     std::cerr << "[Normalizer] Saved " << side << "_" << ref_type << " = " << value << std::endl;
+}
+
+void Normalizer::clear_openness_ref(const std::string& side) {
+    try {
+        YAML::Node config;
+        try {
+            config = YAML::LoadFile(extreme_file_path_);
+        } catch (...) {
+            config = YAML::Node(YAML::NodeType::Map);
+        }
+
+        // Remove {side}_open and {side}_close keys from YAML node
+        std::vector<std::string> keys_to_remove;
+        for (const auto& entry : config) {
+            std::string k = entry.first.as<std::string>();
+            if (k == side + "_open" || k == side + "_close") {
+                keys_to_remove.push_back(k);
+            }
+        }
+        for (const auto& k : keys_to_remove) {
+            config.remove(k);
+        }
+
+        std::ofstream fout(extreme_file_path_);
+        if (fout.is_open()) {
+            fout << config;
+            fout.close();
+        }
+        std::cerr << "[Normalizer] Cleared openness refs for " << side << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "[Normalizer] Error clearing openness refs: " << e.what() << std::endl;
+    }
 }
 
 std::optional<double> Normalizer::get_openness_ref(const std::string& side, const std::string& ref_type) const {
@@ -135,9 +167,17 @@ void Normalizer::set_extreme(const std::string& side, const std::string& directi
 }
 
 void Normalizer::clear_extremes(const std::string& side) {
-    // Remove keys matching side_*
+    // Only remove the four extreme vector keys (inner, outer, up, down) — NOT openness refs (open, close)
+    std::vector<std::string> extreme_directions = {"inner", "outer", "up", "down"};
     for (auto it = extremes_.begin(); it != extremes_.end(); ) {
-        if (it->first.rfind(side + "_", 0) == 0) {
+        bool is_extreme = false;
+        for (const auto& dir : extreme_directions) {
+            if (it->first == side + "_" + dir) {
+                is_extreme = true;
+                break;
+            }
+        }
+        if (is_extreme) {
             it = extremes_.erase(it);
         } else {
             ++it;
@@ -152,12 +192,15 @@ void Normalizer::clear_extremes(const std::string& side) {
             config = YAML::Node(YAML::NodeType::Map);
         }
 
-        // Remove keys from YAML node
+        // Remove extreme vector keys from YAML node (only inner/outer/up/down, not open/close)
         std::vector<std::string> keys_to_remove;
         for (const auto& entry : config) {
             std::string k = entry.first.as<std::string>();
-            if (k.rfind(side + "_", 0) == 0) {
-                keys_to_remove.push_back(k);
+            for (const auto& dir : extreme_directions) {
+                if (k == side + "_" + dir) {
+                    keys_to_remove.push_back(k);
+                    break;
+                }
             }
         }
         for (const auto& k : keys_to_remove) {

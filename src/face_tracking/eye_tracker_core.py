@@ -90,6 +90,17 @@ class Normalizer:
         """
         return self._impl.get_openness_ref(side, ref_type)
 
+    def clear_openness_ref(self, side: str) -> None:
+        """清除指定眼睛的开闭参考距离（{side}_open / {side}_close）并持久化。
+
+        Parameters
+        ----------
+        side : str
+            "left" 或 "right"
+        """
+        self._impl.clear_openness_ref(side)
+        logger.info(f"已清除 {side} 眼开闭参考距离")
+
 
 # ============================================================
 # GazeVectorTracker — C++ 封装
@@ -120,6 +131,10 @@ class GazeVectorTracker:
         fourcc_str: str = "",
         brightness: float = 0.0,
         contrast: float = 1.0,
+        openness_threshold_low: int = 0,
+        openness_threshold_high: int = 80,
+        pupil_threshold_low: int = 5,
+        pupil_threshold_high: int = 25,
     ):
         if crop is None:
             crop = [0, 0, frame_width, frame_height]
@@ -129,6 +144,8 @@ class GazeVectorTracker:
             extreme_file,
             use_recommended_resolution, dark_search_roi_scale,
             fourcc_str, brightness, contrast,
+            openness_threshold_low, openness_threshold_high,
+            pupil_threshold_low, pupil_threshold_high,
         )
 
     def start_tracking(

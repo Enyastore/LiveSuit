@@ -19,7 +19,9 @@ GazeVectorTracker::GazeVectorTracker(
     std::string side, int frame_width, int frame_height,
     int frame_rate, std::string extreme_file,
     bool use_recommended_resolution, double dark_search_roi_scale,
-    std::string fourcc_str, double brightness, double contrast)
+    std::string fourcc_str, double brightness, double contrast,
+    int openness_threshold_low, int openness_threshold_high,
+    int pupil_threshold_low, int pupil_threshold_high)
     : cam_index_(cam_index), flip_(flip), crop_(std::move(crop)),
       side_(std::move(side)), frame_width_(frame_width),
       frame_height_(frame_height), frame_rate_(frame_rate),
@@ -28,7 +30,11 @@ GazeVectorTracker::GazeVectorTracker(
       dark_search_roi_scale_(std::max(0.1, std::min(1.0, dark_search_roi_scale))),
       brightness_(brightness), contrast_(contrast),
       normalizer_(std::move(extreme_file)),
-      prev_model_center_avg_(frame_width / 2, frame_height / 2) {}
+      prev_model_center_avg_(frame_width / 2, frame_height / 2),
+      eye_openness_threshold_low_(std::max(0, std::min(255, openness_threshold_low))),
+      eye_openness_threshold_high_(std::max(0, std::min(255, openness_threshold_high))),
+      pupil_threshold_low_(pupil_threshold_low),
+      pupil_threshold_high_(std::max(pupil_threshold_low + 1, pupil_threshold_high)) {}
 
 // ================================================================
 // Lock / Unlock
@@ -213,17 +219,8 @@ void GazeVectorTracker::process_commands(pybind11::object py_cmd_queue) {
                 else if (cmd_str == "headless_off") switch_headless_off();
                 else if (cmd_str == "reload_extremes") normalizer_.reload();
                 else if (cmd_str == "clear_extremes") normalizer_.clear_extremes(side_);
-                else if (cmd_str == "set_openness_threshold") {
-                    // Will be handled by next iteration if set via tuple
-                }
-                else if (cmd_str == "set_openness_blur") {
-                    // Will be handled by next iteration if set via tuple
-                }
-                else if (cmd_str == "set_openness_aggregation") {
-                    // Will be handled by next iteration if set via tuple
-                }
             }
-            // Check if it's a tuple command (like ("save_extreme", direction, vector))
+            // Check if it's a tuple command
             else if (py::isinstance<py::tuple>(cmd)) {
                 py::tuple tup = cmd.cast<py::tuple>();
                 if (tup.size() == 0) continue;
@@ -250,12 +247,14 @@ void GazeVectorTracker::process_commands(pybind11::object py_cmd_queue) {
                     brightness_ = tup[1].cast<double>();
                     contrast_ = tup[2].cast<double>();
                 }
+                // --- 旧版单阈值命令（向后兼容） ---
                 else if (cmd_type == "set_openness_threshold" && tup.size() >= 2) {
-                    eye_openness_threshold_ = std::max(0, std::min(255, tup[1].cast<int>()));
+                    int v = std::max(0, std::min(255, tup[1].cast<int>()));
+                    // 旧版单阈值映射为 high 阈值，low 保持不变
+                    eye_openness_threshold_high_ = v;
                 }
                 else if (cmd_type == "set_openness_blur" && tup.size() >= 2) {
                     int v = tup[1].cast<int>();
-                    // Force odd number >= 1
                     if (v < 1) v = 1;
                     if (v % 2 == 0) v += 1;
                     eye_openness_blur_ = v;
@@ -269,6 +268,28 @@ void GazeVectorTracker::process_commands(pybind11::object py_cmd_queue) {
                 else if (cmd_type == "set_openness_skip_threshold" && tup.size() >= 2) {
                     eye_openness_skip_threshold_ = std::max(0.0, tup[1].cast<double>());
                     std::cerr << "[" << side_ << "] 低开度跳过阈值: " << eye_openness_skip_threshold_ << std::endl;
+                }
+                // --- 新增双阈值命令 ---
+                else if (cmd_type == "set_openness_threshold_low" && tup.size() >= 2) {
+                    eye_openness_threshold_low_ = std::max(0, std::min(255, tup[1].cast<int>()));
+                    std::cerr << "[" << side_ << "] 开闭检测下界阈值: " << eye_openness_threshold_low_ << std::endl;
+                }
+                else if (cmd_type == "set_openness_threshold_high" && tup.size() >= 2) {
+                    eye_openness_threshold_high_ = std::max(0, std::min(255, tup[1].cast<int>()));
+                    std::cerr << "[" << side_ << "] 开闭检测上界阈值: " << eye_openness_threshold_high_ << std::endl;
+                }
+                else if (cmd_type == "set_pupil_threshold_low" && tup.size() >= 2) {
+                    int v = tup[1].cast<int>();
+                    pupil_threshold_low_ = v;
+                    if (pupil_threshold_high_ < pupil_threshold_low_ + 1) {
+                        pupil_threshold_high_ = pupil_threshold_low_ + 1;
+                    }
+                    std::cerr << "[" << side_ << "] 瞳孔检测下界偏移: " << pupil_threshold_low_ << std::endl;
+                }
+                else if (cmd_type == "set_pupil_threshold_high" && tup.size() >= 2) {
+                    int v = tup[1].cast<int>();
+                    pupil_threshold_high_ = std::max(v, pupil_threshold_low_ + 1);
+                    std::cerr << "[" << side_ << "] 瞳孔检测上界偏移: " << pupil_threshold_high_ << std::endl;
                 }
             }
         }
@@ -431,20 +452,25 @@ void GazeVectorTracker::process_frame(const cv::Mat& frame) {
 
     int darkest_pixel_value = gray_frame.at<uchar>(darkest_point->y, darkest_point->x);
 
-    cv::Mat thresholded_strict = apply_binary_threshold(gray_frame, darkest_pixel_value, 5);
-    thresholded_strict = mask_outside_square(thresholded_strict, *darkest_point, 250);
+    // ===== 双阈值瞳孔二值化（替代旧版三重二值化） =====
+    // 使用 inRange 捕获 [darkest + low, darkest + high] 区间的像素
+    int low_val = std::max(0, std::min(255, darkest_pixel_value + pupil_threshold_low_));
+    int high_val = std::max(0, std::min(255, darkest_pixel_value + pupil_threshold_high_));
 
-    cv::Mat thresholded_medium = apply_binary_threshold(gray_frame, darkest_pixel_value, 15);
-    thresholded_medium = mask_outside_square(thresholded_medium, *darkest_point, 250);
+    cv::Mat pupil_binary;
+    cv::inRange(gray_frame, low_val, high_val, pupil_binary);
+    // inRange 标记区间内为 255（白色），区间外为 0
+    // 不需要再取反，因为 pupil_binary 已经将暗区标为白色前景
 
-    cv::Mat thresholded_relaxed = apply_binary_threshold(gray_frame, darkest_pixel_value, 25);
-    thresholded_relaxed = mask_outside_square(thresholded_relaxed, *darkest_point, 250);
+    // 方形掩膜：只保留最暗点附近区域
+    pupil_binary = mask_outside_square(pupil_binary, *darkest_point, 250);
 
-    process_frames(thresholded_strict, thresholded_medium, thresholded_relaxed, processed_frame);
+    // 将同一个二值图传入 process_frames（保持原有接口不变）
+    process_frames(pupil_binary, pupil_binary, pupil_binary, processed_frame);
 }
 
 // ================================================================
-// Multi-threshold fusion & ellipse fitting
+// 单通道二值化处理 & 椭圆拟合（适配双阈值单输入）
 // ================================================================
 
 void GazeVectorTracker::process_frames(
@@ -548,7 +574,7 @@ void GazeVectorTracker::process_frames(
     last_tracking_result_.sphere_radius = max_observed_distance_;
     last_tracking_result_.raw_eye_openness = raw_eye_openness_;
 
-    // Compute gaze vector (uses member py_result_queue_ to send result back)
+    // Compute gaze vector
     auto [center_3d, gaze_rotated, norm_result] = compute_gaze_vector(
         center_x, center_y, model_center_average.x, model_center_average.y,
         best_ratio_under_ellipse);
@@ -927,7 +953,6 @@ std::optional<cv::Point> GazeVectorTracker::find_line_intersection(
     double By = e2.center.y - e1.center.y;
 
     double t1 = (Bx * A[1][1] - By * A[0][1]) / det;
-    // double t2 = (By * A[0][0] - Bx * A[1][0]) / det; // not used
 
     int ix = (int)(e1.center.x + t1 * dx1);
     int iy = (int)(e1.center.y + t1 * dy1);
@@ -976,7 +1001,7 @@ cv::Point GazeVectorTracker::compute_average_intersection(
         for (size_t i = 0; i < intersections.size() && accept; ++i) {
             for (size_t j = i + 1; j < intersections.size() && accept; ++j) {
                 double d = std::hypot(intersections[i].x - intersections[j].x,
-                                      intersections[i].y - intersections[j].y);
+                                      intersections[j].y - intersections[j].y);
                 if (d > pixel_limit) {
                     accept = false;
                     break;
@@ -1332,11 +1357,22 @@ void GazeVectorTracker::draw_debug_overlay(
     cv::putText(frame, ratio_text, cv::Point(10, 30),
                 cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
 
+    // 显示开闭检测双阈值信息
+    char openness_info[128];
+    std::snprintf(openness_info, sizeof(openness_info),
+                  "Openness: [%d, %d] lo=%d hi=%d",
+                  eye_openness_threshold_low_, eye_openness_threshold_high_,
+                  pupil_threshold_low_, pupil_threshold_high_);
+    cv::putText(frame, openness_info, cv::Point(12, 52),
+                cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 0), 3);
+    cv::putText(frame, openness_info, cv::Point(10, 50),
+                cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(200, 255, 200), 1);
+
     cv::imshow(win_name_, frame);
 }
 
 // ================================================================
-// 眼睛开度检测 — 二值化 + 竖直扫描 + 中位数/平均值聚合
+// 眼睛开度检测 — 双阈值 inRange + 竖直扫描 + 聚合
 // ================================================================
 
 double GazeVectorTracker::compute_eye_openness(const cv::Mat& gray_frame) {
@@ -1356,9 +1392,18 @@ double GazeVectorTracker::compute_eye_openness(const cv::Mat& gray_frame) {
                          cv::Size(eye_openness_blur_, eye_openness_blur_), 0);
     }
 
-    // 2. 二值化（THRESH_BINARY_INV：黑色→白色前景）
+    // 2. 双阈值二值化（inRange）：只保留 [low, high] 区间的像素
     cv::Mat binary;
-    cv::threshold(blurred, binary, eye_openness_threshold_, 255, cv::THRESH_BINARY_INV);
+    int low_val = std::max(0, std::min(255, eye_openness_threshold_low_));
+    int high_val = std::max(0, std::min(255, eye_openness_threshold_high_));
+    if (low_val >= high_val) {
+        // 非法区间，直接返回 0
+        eye_openness_top_agg_ = 0.0;
+        eye_openness_bottom_agg_ = 0.0;
+        return 0.0;
+    }
+    cv::inRange(blurred, low_val, high_val, binary);
+    // inRange：区间内像素标为 255（白色前景），区间外为 0
 
     // 3. 椭圆掩膜：只保留 dark_search_ellipse 内的像素
     cv::Mat mask = cv::Mat::zeros(h, w, CV_8U);
@@ -1405,6 +1450,8 @@ double GazeVectorTracker::compute_eye_openness(const cv::Mat& gray_frame) {
     }
 
     if (top_points.empty() || bottom_points.empty()) {
+        eye_openness_top_agg_ = 0.0;
+        eye_openness_bottom_agg_ = 0.0;
         return 0.0;
     }
 

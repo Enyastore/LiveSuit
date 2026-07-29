@@ -31,7 +31,11 @@ public:
         double dark_search_roi_scale = 0.70,
         std::string fourcc_str = "",
         double brightness = 0.0,
-        double contrast = 1.0
+        double contrast = 1.0,
+        int openness_threshold_low = 0,
+        int openness_threshold_high = 80,
+        int pupil_threshold_low = 5,
+        int pupil_threshold_high = 25
     );
 
     // Main tracking loop - blocking. Accepts Python queue objects via pybind11.
@@ -99,14 +103,19 @@ private:
     std::string win_name_;
     std::optional<cv::RotatedRect> last_search_ellipse_;
 
-    // ========== 眼睛开度检测参数 ==========
-    int eye_openness_threshold_ = 80;     // 二值化阈值 (0-255)
-    int eye_openness_blur_ = 3;           // 高斯模糊核 (奇数, 1=不模糊)
+    // ========== 眼睛开度检测参数（双阈值） ==========
+    int eye_openness_threshold_low_ = 0;      // 开闭检测下界阈值 (0-255)
+    int eye_openness_threshold_high_ = 80;    // 开闭检测上界阈值 (0-255)
+    int eye_openness_blur_ = 3;               // 高斯模糊核 (奇数, 1=不模糊)
     std::string eye_openness_aggregation_ = "median";  // "median" 或 "average"
-    double raw_eye_openness_ = 0.0;       // 每帧计算的开度 raw 值（在瞳孔检测之前）
+    double raw_eye_openness_ = 0.0;           // 每帧计算的开度 raw 值（在瞳孔检测之前）
     double eye_openness_skip_threshold_ = 0.0;  // 低于此值跳过眼追（0=不跳过）
-    double eye_openness_top_agg_ = 0.0;   // 每帧聚合后最高点 y 坐标
-    double eye_openness_bottom_agg_ = 0.0; // 每帧聚合后最低点 y 坐标
+    double eye_openness_top_agg_ = 0.0;       // 每帧聚合后最高点 y 坐标
+    double eye_openness_bottom_agg_ = 0.0;    // 每帧聚合后最低点 y 坐标
+
+    // ========== 瞳孔检测参数（双阈值） ==========
+    int pupil_threshold_low_ = 5;    // 瞳孔二值化下界偏移（相对于最暗像素）
+    int pupil_threshold_high_ = 25;  // 瞳孔二值化上界偏移（相对于最暗像素）
 
     // ========== Internal Methods ==========
 

@@ -24,7 +24,9 @@ PYBIND11_MODULE(eye_tracker_core_cpp, m) {
         .def("set_openness_ref", &Normalizer::set_openness_ref,
              py::arg("side"), py::arg("ref_type"), py::arg("value"))
         .def("get_openness_ref", &Normalizer::get_openness_ref,
-             py::arg("side"), py::arg("ref_type"));
+             py::arg("side"), py::arg("ref_type"))
+        .def("clear_openness_ref", &Normalizer::clear_openness_ref,
+             py::arg("side"));
 
     // ---- NormalizeResult ----
     py::class_<NormalizeResult>(m, "NormalizeResult")
@@ -50,7 +52,8 @@ PYBIND11_MODULE(eye_tracker_core_cpp, m) {
                 int, bool, std::vector<int>, std::string,
                 int, int, int, std::string,
                 bool, double, std::string,
-                double, double>(),
+                double, double,
+                int, int, int, int>(),
              py::arg("cam_index") = 0,
              py::arg("flip") = false,
              py::arg("crop") = std::vector<int>{0, 0, 640, 480},
@@ -63,7 +66,11 @@ PYBIND11_MODULE(eye_tracker_core_cpp, m) {
              py::arg("dark_search_roi_scale") = 0.70,
              py::arg("fourcc_str") = "",
              py::arg("brightness") = 0.0,
-             py::arg("contrast") = 1.0)
+             py::arg("contrast") = 1.0,
+             py::arg("openness_threshold_low") = 0,
+             py::arg("openness_threshold_high") = 80,
+             py::arg("pupil_threshold_low") = 5,
+             py::arg("pupil_threshold_high") = 25)
         .def("start_tracking", &GazeVectorTracker::start_tracking,
              py::arg("command_queue") = py::none(),
              py::arg("result_queue") = py::none(),
