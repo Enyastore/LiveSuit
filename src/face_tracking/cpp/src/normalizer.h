@@ -21,8 +21,7 @@ public:
 
     NormalizeResult normalize(const std::string& side,
                               const std::vector<double>& gaze_rotated) const;
-
-    // 眼睛开度标定
+                              
     void set_openness_ref(const std::string& side, const std::string& ref_type, double value);
     std::optional<double> get_openness_ref(const std::string& side, const std::string& ref_type) const;
     void clear_openness_ref(const std::string& side);

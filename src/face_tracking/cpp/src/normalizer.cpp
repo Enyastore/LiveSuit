@@ -11,7 +11,7 @@ Normalizer::Normalizer(const std::string& extreme_file) {
     load_extremes();
 }
 
-// Helper: save current extremes_ + openness refs to YAML file
+//帮助函数：保存参考值到YAML文件
 static void save_yaml_file(const std::string& filepath,
                            const std::unordered_map<std::string, std::vector<double>>& extremes,
                            const std::string& side, const std::string& ref_type, double ref_value) {
@@ -23,12 +23,12 @@ static void save_yaml_file(const std::string& filepath,
             config = YAML::Node(YAML::NodeType::Map);
         }
 
-        // Write existing extremes back
+        // 写入现有的注视极值向量
         for (const auto& [key, vec] : extremes) {
             config[key] = YAML::Node(vec);
         }
 
-        // Write or update openness ref
+        //更新开闭度参考值
         std::string ref_key = side + "_" + ref_type;
         config[ref_key] = ref_value;
 
@@ -38,13 +38,13 @@ static void save_yaml_file(const std::string& filepath,
             fout.close();
         }
     } catch (const std::exception& e) {
-        std::cerr << "[Normalizer] Error saving YAML: " << e.what() << std::endl;
+        std::cerr << "[归一化器] 保存YAML时出错: " << e.what() << std::endl;
     }
 }
 
 void Normalizer::set_openness_ref(const std::string& side, const std::string& ref_type, double value) {
     save_yaml_file(extreme_file_path_, extremes_, side, ref_type, value);
-    std::cerr << "[Normalizer] Saved " << side << "_" << ref_type << " = " << value << std::endl;
+    std::cerr << "[归一化器] 保存了 " << side << "_" << ref_type << " = " << value << std::endl;
 }
 
 void Normalizer::clear_openness_ref(const std::string& side) {
@@ -56,7 +56,7 @@ void Normalizer::clear_openness_ref(const std::string& side) {
             config = YAML::Node(YAML::NodeType::Map);
         }
 
-        // Remove {side}_open and {side}_close keys from YAML node
+        //清除 {side}_open 和 {side}_close
         std::vector<std::string> keys_to_remove;
         for (const auto& entry : config) {
             std::string k = entry.first.as<std::string>();
@@ -73,9 +73,9 @@ void Normalizer::clear_openness_ref(const std::string& side) {
             fout << config;
             fout.close();
         }
-        std::cerr << "[Normalizer] Cleared openness refs for " << side << std::endl;
+        std::cerr << "[归一化器] 清除了 " << side << " 的开闭参考值" << std::endl;
     } catch (const std::exception& e) {
-        std::cerr << "[Normalizer] Error clearing openness refs: " << e.what() << std::endl;
+        std::cerr << "[归一化器] 清除开闭参考值时出错: " << e.what() << std::endl;
     }
 }
 
@@ -87,25 +87,22 @@ std::optional<double> Normalizer::get_openness_ref(const std::string& side, cons
             return config[ref_key].as<double>();
         }
     } catch (...) {
-        // file not found or parse error
+        std::cerr << "[归一化器] 文件未找到" << std::endl;
     }
     return std::nullopt;
 }
 
+//处理路径绝对路径与相对路径
 std::string Normalizer::resolve_path(const std::string& filename) const {
-    // Try the current working directory first (for absolute paths or direct files)
+    //如果用户给的是相对路径，并且当前目录下能找到文件，就把相对路径变成绝对路径，方便后续使用；
+    //如果找不到，就信任调用者传入的路径本身。
     if (filename.empty() || filename[0] == '/') {
         return filename;
     }
 
-    // Check if the file exists in the current directory
     if (std::filesystem::exists(filename)) {
         return std::filesystem::absolute(filename).string();
     }
-
-    // Use __FILE__ based directory resolution at runtime - this is for when
-    // the .so is loaded from the eye_tracker package directory
-    // The Python bindings will set the path correctly at runtime
     return filename;
 }
 
@@ -115,7 +112,7 @@ void Normalizer::load_extremes() {
     try {
         YAML::Node config = YAML::LoadFile(extreme_file_path_);
         if (!config) {
-            std::cerr << "[Normalizer] Extreme file empty or not found" << std::endl;
+            std::cerr << "[归一化器] 参考值文件为空或未找到" << std::endl;
             return;
         }
         for (const auto& entry : config) {
@@ -129,11 +126,11 @@ void Normalizer::load_extremes() {
                 };
             }
         }
-        std::cerr << "[Normalizer] Loaded " << extremes_.size() << " extreme vectors" << std::endl;
+        std::cerr << "[归一化器] 加载了 " << extremes_.size() << " 个注视极值向量" << std::endl;
     } catch (const YAML::BadFile&) {
-        std::cerr << "[Normalizer] Extreme file not found: " << extreme_file_path_ << std::endl;
+        std::cerr << "[归一化器] 参考文件未找到：" << extreme_file_path_ << std::endl;
     } catch (const std::exception& e) {
-        std::cerr << "[Normalizer] Error loading extremes: " << e.what() << std::endl;
+        std::cerr << "[归一化器] 加载参考值时出错：" << e.what() << std::endl;
     }
 }
 
@@ -148,7 +145,7 @@ void Normalizer::set_extreme(const std::string& side, const std::string& directi
 
     try {
         YAML::Node config;
-        // Load existing file if present
+        // 加载当前文件（如果存在）
         try {
             config = YAML::LoadFile(extreme_file_path_);
         } catch (...) {
@@ -162,12 +159,12 @@ void Normalizer::set_extreme(const std::string& side, const std::string& directi
             fout.close();
         }
     } catch (const std::exception& e) {
-        std::cerr << "[Normalizer] Error saving extreme: " << e.what() << std::endl;
+        std::cerr << "[归一化器] 保存注视极值向量时出错： " << e.what() << std::endl;
     }
 }
 
 void Normalizer::clear_extremes(const std::string& side) {
-    // Only remove the four extreme vector keys (inner, outer, up, down) — NOT openness refs (open, close)
+    // 移除四个注视极值向量
     std::vector<std::string> extreme_directions = {"inner", "outer", "up", "down"};
     for (auto it = extremes_.begin(); it != extremes_.end(); ) {
         bool is_extreme = false;
@@ -192,7 +189,7 @@ void Normalizer::clear_extremes(const std::string& side) {
             config = YAML::Node(YAML::NodeType::Map);
         }
 
-        // Remove extreme vector keys from YAML node (only inner/outer/up/down, not open/close)
+        //移除四个注视极值向量对应的键
         std::vector<std::string> keys_to_remove;
         for (const auto& entry : config) {
             std::string k = entry.first.as<std::string>();
@@ -212,8 +209,8 @@ void Normalizer::clear_extremes(const std::string& side) {
             fout << config;
             fout.close();
         }
-        std::cerr << "[Normalizer] Cleared " << keys_to_remove.size()
-                  << " extreme vectors for " << side << std::endl;
+        std::cerr << "清除了" << keys_to_remove.size()
+                  << side << "眼的注视极值向量" << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "[Normalizer] Error clearing extremes: " << e.what() << std::endl;
     }
@@ -232,11 +229,11 @@ NormalizeResult Normalizer::normalize(const std::string& side,
     std::string up_key = side + "_up";
     std::string down_key = side + "_down";
 
-    // Check for missing extremes
+    // 检查缺失的注视极值向量
     std::vector<std::string> expected = {inner_key, outer_key, up_key, down_key};
     for (const auto& k : expected) {
         if (extremes_.find(k) == extremes_.end()) {
-            // Extract direction part after "side_"
+            // 提取 "side_" 后面的方向部分
             auto pos = k.find('_');
             if (pos != std::string::npos) {
                 result.missing.push_back(k.substr(pos + 1));
@@ -263,13 +260,19 @@ NormalizeResult Normalizer::normalize(const std::string& side,
     return result;
 }
 
+
+//========================
+//由于眼睛的运动，up与down向量的差向量并不正交于left于right向量的差向量。
+//算法的目的是基于准确的横轴（left-right）放置纵轴，并用up于down在其上的投影标定最高点/最低点。
+//便于归一化输出eye_x、eye_y参数。
+//========================
 std::tuple<std::optional<double>, std::optional<double>>
 Normalizer::orthogonal_project(const std::vector<double>& current,
                                 const std::vector<double>& inner,
                                 const std::vector<double>& outer,
                                 const std::vector<double>& up,
                                 const std::vector<double>& down) {
-    // Compute centroid of the four extreme points
+    // 计算四个注视极值向量的质心
     double cx = inner[0] + outer[0] + up[0] + down[0];
     double cy = inner[1] + outer[1] + up[1] + down[1];
     double cz = inner[2] + outer[2] + up[2] + down[2];
@@ -279,7 +282,7 @@ Normalizer::orthogonal_project(const std::vector<double>& current,
     }
     cx /= c_len; cy /= c_len; cz /= c_len;
 
-    // Compute ex axis (inner - outer, orthogonalized to centroid)
+    // 计算横轴
     double raw_ex_x = inner[0] - outer[0];
     double raw_ex_y = inner[1] - outer[1];
     double raw_ex_z = inner[2] - outer[2];
@@ -293,7 +296,7 @@ Normalizer::orthogonal_project(const std::vector<double>& current,
     }
     ex_x /= ex_len; ex_y /= ex_len; ex_z /= ex_len;
 
-    // Compute ey = centroid × ex (cross product)
+    // 计算纵轴 = 质心 × 横轴 (叉积)
     double ey_x = cy * ex_z - cz * ex_y;
     double ey_y = cz * ex_x - cx * ex_z;
     double ey_z = cx * ex_y - cy * ex_x;
@@ -303,7 +306,7 @@ Normalizer::orthogonal_project(const std::vector<double>& current,
     }
     ey_x /= ey_len; ey_y /= ey_len; ey_z /= ey_len;
 
-    // Dot product helper
+    // 点乘工具函数（注视向量模长已化为1，避免反复计算模长）
     auto dot = [](const std::vector<double>& a, double bx, double by, double bz) -> double {
         return a[0] * bx + a[1] * by + a[2] * bz;
     };
@@ -315,7 +318,7 @@ Normalizer::orthogonal_project(const std::vector<double>& current,
     double cur_x = dot(current, ex_x, ex_y, ex_z);
     double cur_y = dot(current, ey_x, ey_y, ey_z);
 
-    // Clamp-map function
+    // 钳制映射（将映射值限制在 [-1, 1] 范围内）
     auto clamp_map = [](double val, double lo, double hi) -> std::optional<double> {
         if (hi - lo < 1e-12) {
             return 0.0;

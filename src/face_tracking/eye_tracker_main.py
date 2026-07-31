@@ -745,99 +745,6 @@ class CropDebugWindow:
             (0, 220, 0), 2,
         )
 
-    def _compute_binary_debug(self, frame, crop_rect=None):
-        """对一帧执行与 C++ compute_eye_openness 相同的流程，返回二值图+参考线。
-
-        椭圆中心与 _draw_search_ellipse_on_frame 一致（跟随 crop_rect）。
-
-        Parameters
-        ----------
-        frame : np.ndarray (BGR)
-        crop_rect : None 或 [x1, y1, x2, y2]，用于定位椭圆中心
-
-        Returns
-        -------
-        binary_bgr : np.ndarray
-            带参考线的彩色二值图，用于显示
-        top_agg, bottom_agg : float
-            聚合后的高点/低点 y 坐标（原始帧坐标系）
-        raw_distance : float
-        """
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        h, w = frame.shape[:2]
-        scale = self._cam_config.dark_search_roi_scale
-
-        # 椭圆中心与半径必须与 _draw_search_ellipse_on_frame 完全一致
-        if crop_rect is not None:
-            x1, y1, x2, y2 = crop_rect
-            cx_roi = (x1 + x2) // 2
-            cy_roi = (y1 + y2) // 2
-            cw = x2 - x1
-            ch = y2 - y1
-            rx = int((cw / 2.0) * scale)
-            ry = int((ch / 2.0) * scale)
-        else:
-            cx_roi, cy_roi = w // 2, h // 2
-            rx = int((w / 2.0) * scale)
-            ry = int((h / 2.0) * scale)
-
-        # 模糊
-        blur = self._open_blur_var.get()
-        if blur % 2 == 0:
-            blur += 1
-        blurred = gray
-        if blur > 1:
-            blurred = cv2.GaussianBlur(gray, (blur, blur), 0)
-
-        # 二值化
-        threshold = self._open_threshold_var.get()
-        _, binary = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY_INV)
-
-        # 椭圆掩膜
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.ellipse(mask, (cx_roi, cy_roi), (max(rx, 1), max(ry, 1)), 0, 0, 360, 255, -1)
-        masked = cv2.bitwise_and(binary, mask)
-
-        # 逐列扫描
-        min_x = max(0, cx_roi - rx)
-        max_x = min(w, cx_roi + rx)
-        min_y = max(0, cy_roi - ry)
-        max_y = min(h, cy_roi + ry)
-
-        top_pts, bottom_pts = [], []
-        for col in range(min_x, max_x):
-            col_slice = masked[min_y:max_y, col]
-            fg = np.where(col_slice > 0)[0]
-            if len(fg) >= 2:
-                top_pts.append(float(min_y + fg[0]))
-                bottom_pts.append(float(min_y + fg[-1]))
-
-        top_agg, bottom_agg = 0.0, 0.0
-        raw_distance = 0.0
-        if top_pts and bottom_pts:
-            agg = self._open_agg_var.get()
-            if agg == "平均值":
-                top_agg = np.mean(top_pts)
-                bottom_agg = np.mean(bottom_pts)
-            else:  # 中位数
-                top_agg = float(np.median(top_pts))
-                bottom_agg = float(np.median(bottom_pts))
-            raw_distance = max(0.0, bottom_agg - top_agg)
-
-        # 构建彩色二值图
-        binary_bgr = cv2.cvtColor(masked, cv2.COLOR_GRAY2BGR)
-        # 画椭圆边框
-        cv2.ellipse(binary_bgr, (cx_roi, cy_roi), (max(rx, 1), max(ry, 1)), 0, 0, 360, (0, 200, 0), 1)
-        # 画聚合水平线
-        if top_agg > 0 and bottom_agg > 0:
-            cv2.line(binary_bgr, (min_x, int(top_agg)), (max_x, int(top_agg)), (0, 255, 0), 2)  # 绿-高点
-            cv2.line(binary_bgr, (min_x, int(bottom_agg)), (max_x, int(bottom_agg)), (0, 0, 255), 2)  # 红-低点
-            # 两点连线
-            mid_x = (min_x + max_x) // 2
-            cv2.line(binary_bgr, (mid_x, int(top_agg)), (mid_x, int(bottom_agg)), (255, 255, 0), 1)
-
-        return binary_bgr, top_agg, bottom_agg, raw_distance
-
     def _compute_openness_binary_debug(self, frame, crop_rect=None):
         """模拟 C++ compute_eye_openness 的双阈值 inRange 流程。"""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -1185,115 +1092,40 @@ class ControlPanel:
             "left_radius": False, "left_center": False,
             "right_radius": False, "right_center": False,
         }
+        # 每列输出标签引用
+        self._output_labels: Dict[str, tk.Label] = {"left": None, "right": None}
         self._window: Optional[tk.Toplevel] = None
         self._open()
 
     def _open(self) -> None:
         self._window = tk.Toplevel(self._master)
-        self._window.title("控制面板")
+        self._window.title("眼追控制面板")
         self._window.resizable(False, False)
 
-        tk.Label(self._window, text="眼球追踪控制面板", font=("", 12, "bold")).pack(
-            pady=(10, 5)
-        )
+        # 标题（跨两列）
+        title = tk.Label(self._window, text="眼追控制面板", font=("", 12, "bold"))
+        title.grid(row=0, column=0, columnspan=2, pady=(10, 5))
 
-        tk.Label(self._window, text="左眼").pack(anchor="w", padx=20, pady=(5, 0))
-        self._make_button(self._cmd_queue_left, "左眼半径", "left_radius").pack(pady=2)
-        self._make_button(self._cmd_queue_left, "左眼中心", "left_center").pack(pady=2)
+        # 左/右列标题
+        left_header = tk.Label(self._window, text="左眼", font=("", 10, "bold"))
+        left_header.grid(row=1, column=0, padx=(15, 5), pady=(0, 3))
+        right_header = tk.Label(self._window, text="右眼", font=("", 10, "bold"))
+        right_header.grid(row=1, column=1, padx=(5, 15), pady=(0, 3))
 
-        tk.Label(self._window, text="右眼").pack(anchor="w", padx=20, pady=(10, 0))
-        self._make_button(self._cmd_queue_right, "右眼半径", "right_radius").pack(pady=2)
-        self._make_button(self._cmd_queue_right, "右眼中心", "right_center").pack(pady=2)
+        # 列容器
+        left_col = tk.Frame(self._window, padx=8, pady=2, highlightthickness=1,
+                           highlightcolor="#ccc", highlightbackground="#ccc")
+        left_col.grid(row=2, column=0, sticky="n", padx=(10, 4))
+        right_col = tk.Frame(self._window, padx=8, pady=2, highlightthickness=1,
+                             highlightcolor="#ccc", highlightbackground="#ccc")
+        right_col.grid(row=2, column=1, sticky="n", padx=(4, 10))
 
-        tk.Label(self._window, text="极限注视向量", font=("", 10, "bold")).pack(pady=(10, 5))
-        directions = [("仰视", "up"), ("俯视", "down"), ("内眼角", "inner"), ("外眼角", "outer")]
-        for eye_side in ("left", "right"):
-            eye_label = "左眼" if eye_side == "left" else "右眼"
-            row = tk.Frame(self._window)
-            row.pack(pady=(2, 0))
-            tk.Label(row, text=eye_label, width=4).pack(side=tk.LEFT)
-            for label, dir_key in directions:
-                tk.Button(
-                    row,
-                    text=label,
-                    command=lambda s=eye_side, d=dir_key: self._save_extreme_vector(s, d),
-                    width=10,
-                ).pack(side=tk.LEFT, padx=2)
+        self._build_eye_column(left_col, "left", self._cmd_queue_left)
+        self._build_eye_column(right_col, "right", self._cmd_queue_right)
 
-        # 清除极值向量按钮
-        tk.Label(self._window, text="清除极值向量", font=("", 10, "bold")).pack(pady=(10, 5))
-        btn_clear_left = tk.Button(
-            self._window,
-            text="清除左眼极值向量",
-            command=lambda: self._clear_extremes("left"),
-            width=22,
-        )
-        btn_clear_left.pack(pady=1)
-        btn_clear_right = tk.Button(
-            self._window,
-            text="清除右眼极值向量",
-            command=lambda: self._clear_extremes("right"),
-            width=22,
-        )
-        btn_clear_right.pack(pady=1)
+        self._window.columnconfigure(0, weight=1)
+        self._window.columnconfigure(1, weight=1)
 
-        # ---- 眼睛开度跳过阈值 ----
-        tk.Label(self._window, text="开度距离阈值", font=("", 10, "bold")).pack(pady=(10, 5))
-        tk.Label(self._window, text="当开度距离低于该阈值时，暂停追踪", font=("", 8)).pack()
-
-        skip_frame = tk.Frame(self._window)
-        skip_frame.pack(pady=(5, 0))
-
-        tk.Label(skip_frame, text="左眼").pack(side=tk.LEFT, padx=(10, 2))
-        self._skip_left_var = tk.DoubleVar(value=0.0)
-        tk.Scale(
-            skip_frame, from_=0, to=200, resolution=1,
-            orient=tk.HORIZONTAL, variable=self._skip_left_var,
-            length=200, showvalue=True,
-            command=self._on_skip_left_changed,
-        ).pack(side=tk.LEFT, padx=(0, 15))
-
-        tk.Label(skip_frame, text="右眼").pack(side=tk.LEFT, padx=(10, 2))
-        self._skip_right_var = tk.DoubleVar(value=0.0)
-        tk.Scale(
-            skip_frame, from_=0, to=200, resolution=1,
-            orient=tk.HORIZONTAL, variable=self._skip_right_var,
-            length=200, showvalue=True,
-            command=self._on_skip_right_changed,
-        ).pack(side=tk.LEFT, padx=(0, 10))
-
-        # ---- 保存开度参考值 ----
-        tk.Label(self._window, text="眼睑开度距离", font=("", 10, "bold")).pack(pady=(10, 5))
-
-        # 当前 raw 值显示
-        self._raw_label = tk.Label(self._window, text="", font=("", 8))
-        self._raw_label.pack()
-
-        for eye_side in ("left", "right"):
-            eye_label = "左眼" if eye_side == "left" else "右眼"
-            tk.Label(self._window, text=eye_label).pack(anchor="w", padx=20, pady=(3, 0))
-            btn_frame = tk.Frame(self._window)
-            btn_frame.pack(pady=(0, 2))
-            tk.Button(
-                btn_frame,
-                text="  保存全睁距离  ",
-                command=lambda s=eye_side: self._save_openness_ref(s, "open"),
-            ).pack(side=tk.LEFT, padx=5)
-            tk.Button(
-                btn_frame,
-                text="  保存全闭距离  ",
-                command=lambda s=eye_side: self._save_openness_ref(s, "close"),
-            ).pack(side=tk.LEFT, padx=5)
-            tk.Button(
-                btn_frame,
-                text="  清除开闭距离  ",
-                command=lambda s=eye_side: self._clear_openness_refs(s),
-            ).pack(side=tk.LEFT, padx=5)
-
-        # ---- 最终输出值（eye_x, eye_y, eye_o）----
-        tk.Label(self._window, text="最终输出", font=("", 10, "bold")).pack(pady=(10, 5))
-        self._final_output_label = tk.Label(self._window, text="", font=("", 9), justify=tk.LEFT)
-        self._final_output_label.pack()
         self._update_raw_display()
 
         def _on_close():
@@ -1301,7 +1133,120 @@ class ControlPanel:
             self._window = None
         self._window.protocol("WM_DELETE_WINDOW", _on_close)
 
-    def _make_button(self, queue, label_prefix, lock_key):
+    def _build_eye_column(self, parent: tk.Frame, side: str, cmd_queue):
+        """在父 Frame 中构建单眼的所有控件列。"""
+        queue = cmd_queue
+        lock_r_key = f"{side}_radius"
+        lock_c_key = f"{side}_center"
+
+        # ---- 第 0 行：锁定眼球半径 ----
+        self._make_button(parent, queue, "眼球半径", lock_r_key).pack(pady=1, fill=tk.X)
+        # ---- 第 1 行：锁定眼球中心 ----
+        self._make_button(parent, queue, "眼球中心", lock_c_key).pack(pady=1, fill=tk.X)
+
+        # ---- 分隔线 ----
+        ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+
+        # ---- 注视方向：十字排列 ----
+        dir_frame = tk.Frame(parent)
+        dir_frame.pack(pady=(0, 2))
+
+        # 左右眼「内」「外」方向顺序
+        if side == "left":
+            outer_label, outer_key = "外眼角", "outer"
+            inner_label, inner_key = "内眼角", "inner"
+        else:
+            outer_label, outer_key = "内眼角", "inner"
+            inner_label, inner_key = "外眼角", "outer"
+
+        # 第一行：居中的【仰视】
+        top_frame = tk.Frame(dir_frame)
+        top_frame.pack()
+        tk.Button(top_frame, text="仰视", width=8,
+                  command=lambda d="up": self._save_extreme_vector(side, d)).pack()
+
+        # 第二行：【外眼角】 保存参考值 【内眼角】
+        mid_frame = tk.Frame(dir_frame)
+        mid_frame.pack()
+        btn_outer = tk.Button(mid_frame, text=outer_label, width=8,
+                              command=lambda d=outer_key: self._save_extreme_vector(side, d))
+        btn_outer.pack(side=tk.LEFT, padx=(0, 4))
+
+        tk.Label(mid_frame, text="保存参考值", font=("", 8)).pack(side=tk.LEFT, padx=2)
+
+        btn_inner = tk.Button(mid_frame, text=inner_label, width=8,
+                              command=lambda d=inner_key: self._save_extreme_vector(side, d))
+        btn_inner.pack(side=tk.LEFT, padx=(4, 0))
+
+        # 第三行：居中的【俯视】
+        bottom_frame = tk.Frame(dir_frame)
+        bottom_frame.pack()
+        tk.Button(bottom_frame, text="俯视", width=8,
+                  command=lambda d="down": self._save_extreme_vector(side, d)).pack()
+
+        # ---- 分隔线 ----
+        ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+
+        # ---- 完全睁眼 / 完全闭眼 ----
+        open_frame = tk.Frame(parent)
+        open_frame.pack(pady=(0, 2))
+        tk.Button(
+            open_frame, text="完全睁眼", width=12,
+            command=lambda: self._save_openness_ref(side, "open"),
+        ).pack(side=tk.LEFT, padx=3)
+        tk.Button(
+            open_frame, text="完全闭眼", width=12,
+            command=lambda: self._save_openness_ref(side, "close"),
+        ).pack(side=tk.LEFT, padx=3)
+
+        # ---- 分隔线 ----
+        ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+
+        # ---- 清除按钮 ----
+        clear_frame = tk.Frame(parent)
+        clear_frame.pack(pady=(0, 2))
+        tk.Button(
+            clear_frame, text="清除注视参考", width=12,
+            command=lambda: self._clear_extremes(side),
+        ).pack(side=tk.LEFT, padx=3)
+        tk.Button(
+            clear_frame, text="清除开闭参考", width=12,
+            command=lambda: self._clear_openness_refs(side),
+        ).pack(side=tk.LEFT, padx=3)
+
+        # ---- 分隔线 ----
+        ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+
+        # ---- 最低开度滑块 ----
+        min_open_frame = tk.Frame(parent)
+        min_open_frame.pack(fill=tk.X, pady=(0, 2))
+        tk.Label(min_open_frame, text="最低开度", font=("", 8)).pack(anchor="w")
+        if side == "left":
+            self._skip_left_var = tk.DoubleVar(value=0.0)
+            tk.Scale(
+                min_open_frame, from_=0, to=200, resolution=1,
+                orient=tk.HORIZONTAL, variable=self._skip_left_var,
+                length=200, showvalue=True,
+                command=self._on_skip_left_changed,
+            ).pack(fill=tk.X)
+        else:
+            self._skip_right_var = tk.DoubleVar(value=0.0)
+            tk.Scale(
+                min_open_frame, from_=0, to=200, resolution=1,
+                orient=tk.HORIZONTAL, variable=self._skip_right_var,
+                length=200, showvalue=True,
+                command=self._on_skip_right_changed,
+            ).pack(fill=tk.X)
+
+        # ---- 分隔线 ----
+        ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+
+        # ---- 输出 ----
+        output_label = tk.Label(parent, text="", font=("", 8), justify=tk.LEFT, anchor="w")
+        output_label.pack(fill=tk.X, pady=(2, 4))
+        self._output_labels[side] = output_label
+
+    def _make_button(self, parent, queue, label_prefix, lock_key):
         btn_text = tk.StringVar()
 
         def update_text(*args):
@@ -1320,7 +1265,7 @@ class ControlPanel:
             update_text()
 
         update_text()
-        btn = tk.Button(self._window, textvariable=btn_text, command=toggle, width=18)
+        btn = tk.Button(parent, textvariable=btn_text, command=toggle, width=18)
         if queue is None:
             btn.config(state=tk.DISABLED)
         return btn
@@ -1376,32 +1321,32 @@ class ControlPanel:
                 logger.error(f"发送右眼跳过阈值失败: {e}")
 
     def _update_raw_display(self) -> None:
-        """定时更新当前开度距离显示，以及最终输出 eye_x/eye_y/eye_o。"""
+        """定时更新每列的输出显示。"""
         if self._window is None or not self._window.winfo_exists():
             return
         if self._module is not None:
             state = self._module.get_normalized_eye_state()
+            for side_key in ("left", "right"):
+                lbl = self._output_labels.get(side_key)
+                if lbl is None:
+                    continue
+                s = state[side_key]
+                raw = s.get("raw_eye_openness", None)
+                eye_o = s.get("eye_o", None)
+                eye_x = s.get("eye_x", None)
+                eye_y = s.get("eye_y", None)
 
-            # --- raw 显示（仅开度，2 位小数） ---
-            left_raw = state["left"].get("raw_eye_openness", "N/A")
-            right_raw = state["right"].get("raw_eye_openness", "N/A")
-            text = f"左: {left_raw:.2f}" if isinstance(left_raw, (int, float)) else f"左: {left_raw}"
-            text += f"  右: {right_raw:.2f}" if isinstance(right_raw, (int, float)) else f"  右: {right_raw}"
-            self._raw_label.config(text=text)
+                raw_str = f"{raw:.1f}" if isinstance(raw, (int, float)) else "N/A"
+                eye_o_str = f"{eye_o:.2f}" if isinstance(eye_o, (int, float)) else "N/A"
+                eye_x_str = f"{eye_x:+.2f}" if isinstance(eye_x, (int, float)) else "N/A"
+                eye_y_str = f"{eye_y:+.2f}" if isinstance(eye_y, (int, float)) else "N/A"
 
-            # --- 最终输出显示（eye_x, eye_y, eye_o，各 2 位小数） ---
-            if hasattr(self, '_final_output_label'):
-                final_lines = []
-                for side_key, label in [("left", "左眼"), ("right", "右眼")]:
-                    x = state[side_key].get("eye_x", None)
-                    y = state[side_key].get("eye_y", None)
-                    o = state[side_key].get("eye_o", None)
-                    parts = []
-                    parts.append(f"x={x:+.2f}" if isinstance(x, (int, float)) else "x=N/A")
-                    parts.append(f"y={y:+.2f}" if isinstance(y, (int, float)) else "y=N/A")
-                    parts.append(f"o={o:.2f}" if isinstance(o, (int, float)) else "o=N/A")
-                    final_lines.append(f"{label}: {'  '.join(parts)}")
-                self._final_output_label.config(text="\n".join(final_lines))
+                text = (
+                    f"输出：\n"
+                    f"raw={raw_str}   eye_o={eye_o_str}\n"
+                    f"eye_x={eye_x_str}   eye_y={eye_y_str}"
+                )
+                lbl.config(text=text)
 
         self._window.after(500, self._update_raw_display)
 

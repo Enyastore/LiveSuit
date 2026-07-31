@@ -11,7 +11,7 @@ using namespace eye_tracker;
 PYBIND11_MODULE(eye_tracker_core_cpp, m) {
     m.doc() = "C++ implementation of eye tracking core algorithms";
 
-    // ---- Normalizer ----
+    // ---- 归一化器 ----
     py::class_<Normalizer>(m, "Normalizer")
         .def(py::init<const std::string&>(), py::arg("extreme_file") = "extreme_vectors.yaml")
         .def("reload", &Normalizer::reload)
@@ -28,25 +28,25 @@ PYBIND11_MODULE(eye_tracker_core_cpp, m) {
         .def("clear_openness_ref", &Normalizer::clear_openness_ref,
              py::arg("side"));
 
-    // ---- NormalizeResult ----
+    // ---- 归一化结果  ----
     py::class_<NormalizeResult>(m, "NormalizeResult")
         .def_readonly("eye_x", &NormalizeResult::eye_x)
         .def_readonly("eye_y", &NormalizeResult::eye_y)
         .def_readonly("missing", &NormalizeResult::missing);
 
-    // ---- PupilEllipse ----
+    // ---- 瞳孔椭圆 ----
     py::class_<PupilEllipse>(m, "PupilEllipse")
         .def_readonly("center", &PupilEllipse::center)
         .def_readonly("axes", &PupilEllipse::axes)
         .def_readonly("angle_degrees", &PupilEllipse::angle_degrees);
 
-    // ---- TrackingResult ----
+    // ---- 追踪结果 ----
     py::class_<TrackingResult>(m, "TrackingResult")
         .def_readonly("pupil_ellipse", &TrackingResult::pupil_ellipse)
         .def_readonly("eye_center", &TrackingResult::eye_center)
         .def_readonly("sphere_radius", &TrackingResult::sphere_radius);
 
-    // ---- GazeVectorTracker ----
+    // ---- 注视向量追踪器 ----
     py::class_<GazeVectorTracker>(m, "GazeVectorTracker")
         .def(py::init<
                 int, bool, std::vector<int>, std::string,
@@ -84,7 +84,7 @@ PYBIND11_MODULE(eye_tracker_core_cpp, m) {
         .def("is_running", &GazeVectorTracker::is_running)
         .def("is_headless", &GazeVectorTracker::is_headless);
 
-    // ---- cv::Point helpers for Python ----
+    // ---- cv::点坐标工具类--
     py::class_<cv::Point>(m, "CvPoint")
         .def_readonly("x", &cv::Point::x)
         .def_readonly("y", &cv::Point::y)

@@ -11,7 +11,7 @@ namespace eye_tracker {
 namespace py = pybind11;
 
 // ================================================================
-// Constructor
+// 构造函数
 // ================================================================
 
 GazeVectorTracker::GazeVectorTracker(
@@ -37,7 +37,7 @@ GazeVectorTracker::GazeVectorTracker(
       pupil_threshold_high_(std::max(pupil_threshold_low + 1, pupil_threshold_high)) {}
 
 // ================================================================
-// Lock / Unlock
+// 锁定/解锁眼球半径/中心
 // ================================================================
 
 void GazeVectorTracker::lock_sphere_radius() {
@@ -77,7 +77,7 @@ void GazeVectorTracker::stop() {
 }
 
 // ================================================================
-// State management
+// 状态机
 // ================================================================
 
 void GazeVectorTracker::reset_tracking_state() {
@@ -90,6 +90,8 @@ void GazeVectorTracker::reset_tracking_state() {
     last_tracking_result_ = TrackingResult{};
 }
 
+
+//开关无头模式（不显示OpenCV窗口）
 void GazeVectorTracker::cleanup() {
     running_ = false;
     if (cap_.isOpened()) {
@@ -111,13 +113,13 @@ void GazeVectorTracker::switch_headless_on() {
         }
     } catch (...) {}
     headless_ = true;
-    std::cerr << "[" << side_ << "] 已切换到 headless 模式" << std::endl;
+    std::cerr << "[" << side_ << "] 已切换到无头模式" << std::endl;
 }
 
 void GazeVectorTracker::switch_headless_off() {
     if (!headless_) return;
     headless_ = false;
-    std::cerr << "[" << side_ << "] 已退出 headless 模式" << std::endl;
+    std::cerr << "[" << side_ << "] 已退出无头模式" << std::endl;
     try {
         if (!win_name_.empty()) {
             cv::namedWindow(win_name_, cv::WINDOW_NORMAL);
@@ -130,7 +132,7 @@ void GazeVectorTracker::switch_headless_off() {
 }
 
 // ================================================================
-// Camera restart
+// 调整分辨率/帧率后重启相机
 // ================================================================
 
 void GazeVectorTracker::restart_camera(int w, int h, int fps, const std::string& fourcc_str) {
@@ -164,7 +166,7 @@ void GazeVectorTracker::restart_camera(int w, int h, int fps, const std::string&
         cap_.set(cv::CAP_PROP_FOURCC, it->second);
     }
 
-    // Verify actual size
+    // 验证实际画幅
     int actual_w = (int)cap_.get(cv::CAP_PROP_FRAME_WIDTH);
     int actual_h = (int)cap_.get(cv::CAP_PROP_FRAME_HEIGHT);
     if (actual_w != w || actual_h != h) {
@@ -172,7 +174,7 @@ void GazeVectorTracker::restart_camera(int w, int h, int fps, const std::string&
                   << "，实际 " << actual_w << "x" << actual_h << std::endl;
     }
 
-    // Scale crop based on old resolution
+    // 重新缩放画面
     if (frame_width_ > 0 && frame_height_ > 0) {
         crop_[0] = crop_[0] * w / frame_width_;
         crop_[1] = crop_[1] * h / frame_height_;
@@ -190,7 +192,7 @@ void GazeVectorTracker::restart_camera(int w, int h, int fps, const std::string&
 }
 
 // ================================================================
-// Command processing
+// 命令处理
 // ================================================================
 
 void GazeVectorTracker::process_commands() {
@@ -202,6 +204,9 @@ void GazeVectorTracker::process_commands(pybind11::object py_cmd_queue) {
 
     try {
         while (true) {
+            // 先检查队列是否为空，避免依赖异常控制流
+            if (py_cmd_queue.attr("empty")().cast<bool>()) break;
+
             // Call get_nowait() on the Python queue
             py::object cmd = py_cmd_queue.attr("get_nowait")();
             
@@ -247,12 +252,6 @@ void GazeVectorTracker::process_commands(pybind11::object py_cmd_queue) {
                     brightness_ = tup[1].cast<double>();
                     contrast_ = tup[2].cast<double>();
                 }
-                // --- 旧版单阈值命令（向后兼容） ---
-                else if (cmd_type == "set_openness_threshold" && tup.size() >= 2) {
-                    int v = std::max(0, std::min(255, tup[1].cast<int>()));
-                    // 旧版单阈值映射为 high 阈值，low 保持不变
-                    eye_openness_threshold_high_ = v;
-                }
                 else if (cmd_type == "set_openness_blur" && tup.size() >= 2) {
                     int v = tup[1].cast<int>();
                     if (v < 1) v = 1;
@@ -269,14 +268,14 @@ void GazeVectorTracker::process_commands(pybind11::object py_cmd_queue) {
                     eye_openness_skip_threshold_ = std::max(0.0, tup[1].cast<double>());
                     std::cerr << "[" << side_ << "] 低开度跳过阈值: " << eye_openness_skip_threshold_ << std::endl;
                 }
-                // --- 新增双阈值命令 ---
+                
                 else if (cmd_type == "set_openness_threshold_low" && tup.size() >= 2) {
                     eye_openness_threshold_low_ = std::max(0, std::min(255, tup[1].cast<int>()));
-                    std::cerr << "[" << side_ << "] 开闭检测下界阈值: " << eye_openness_threshold_low_ << std::endl;
+                    std::cerr << "[" << side_ << "] 开闭检测二值化下界: " << eye_openness_threshold_low_ << std::endl;
                 }
                 else if (cmd_type == "set_openness_threshold_high" && tup.size() >= 2) {
                     eye_openness_threshold_high_ = std::max(0, std::min(255, tup[1].cast<int>()));
-                    std::cerr << "[" << side_ << "] 开闭检测上界阈值: " << eye_openness_threshold_high_ << std::endl;
+                    std::cerr << "[" << side_ << "] 开闭检测二值化上界: " << eye_openness_threshold_high_ << std::endl;
                 }
                 else if (cmd_type == "set_pupil_threshold_low" && tup.size() >= 2) {
                     int v = tup[1].cast<int>();
@@ -284,23 +283,27 @@ void GazeVectorTracker::process_commands(pybind11::object py_cmd_queue) {
                     if (pupil_threshold_high_ < pupil_threshold_low_ + 1) {
                         pupil_threshold_high_ = pupil_threshold_low_ + 1;
                     }
-                    std::cerr << "[" << side_ << "] 瞳孔检测下界偏移: " << pupil_threshold_low_ << std::endl;
+                    std::cerr << "[" << side_ << "] 瞳孔检测二值化下界偏移（相对最暗像素）: " << pupil_threshold_low_ << std::endl;
                 }
                 else if (cmd_type == "set_pupil_threshold_high" && tup.size() >= 2) {
                     int v = tup[1].cast<int>();
                     pupil_threshold_high_ = std::max(v, pupil_threshold_low_ + 1);
-                    std::cerr << "[" << side_ << "] 瞳孔检测上界偏移: " << pupil_threshold_high_ << std::endl;
+                    std::cerr << "[" << side_ << "] 瞳孔检测二值化上界偏移（相对最暗像素）: " << pupil_threshold_high_ << std::endl;
                 }
             }
         }
     } catch (const py::error_already_set& e) {
-        // queue.Empty is expected when no commands; ignore
-        if (!e.matches(PyExc_Exception)) throw;
+        // 仅忽略 queue.Empty（空队列的预期信号），其余异常重新抛出，避免静默吞掉错误
+        py::object exc_type = e.type();
+        std::string type_name = py::str(exc_type).cast<std::string>();
+        if (type_name.find("Empty") == std::string::npos) {
+            throw;
+        }
     }
 }
 
 // ================================================================
-// Main tracking loop
+// 主循环
 // ================================================================
 
 void GazeVectorTracker::start_tracking(
@@ -329,7 +332,7 @@ void GazeVectorTracker::start_tracking(
         cap_.set(cv::CAP_PROP_FOURCC, it->second);
     }
 
-    // Store queues as member objects
+    //将命令队列存储为成员变量，以便在主循环中使用
     py_cmd_queue_ = py_cmd_queue;
     py_result_queue_ = py_result_queue;
 
@@ -347,7 +350,7 @@ void GazeVectorTracker::start_tracking(
     const int max_fail = 10;
 
     while (running_) {
-        // Process commands
+        // 处理命令
         process_commands();
 
         cv::Mat frame;
@@ -373,7 +376,7 @@ void GazeVectorTracker::start_tracking(
 
         int x1 = crop_[0], y1 = crop_[1], x2 = crop_[2], y2 = crop_[3];
         if (y2 > frame.rows || x2 > frame.cols) {
-            std::cerr << "警告：crop [" << x1 << "," << y1 << "," << x2 << "," << y2
+            std::cerr << "警告：画面裁剪 [" << x1 << "," << y1 << "," << x2 << "," << y2
                       << "] 超出帧尺寸 (" << frame.cols << "x" << frame.rows << ")" << std::endl;
             continue;
         }
@@ -403,7 +406,7 @@ void GazeVectorTracker::start_tracking(
 }
 
 // ================================================================
-// Frame processing
+// 单帧处理
 // ================================================================
 
 void GazeVectorTracker::process_frame(const cv::Mat& frame) {
@@ -426,7 +429,7 @@ void GazeVectorTracker::process_frame(const cv::Mat& frame) {
         frame_height_ = new_h;
     }
 
-    // Brightness/contrast adjustment
+    // 应用亮度和对比度调整
     if (contrast_ != 1.0 || brightness_ != 0.0) {
         processed_frame.convertTo(processed_frame, -1, contrast_, brightness_);
     }
@@ -434,10 +437,10 @@ void GazeVectorTracker::process_frame(const cv::Mat& frame) {
     cv::Mat gray_frame;
     cv::cvtColor(processed_frame, gray_frame, cv::COLOR_BGR2GRAY);
 
-    // 眼睛开度检测 — 在瞳孔追踪之前执行（轻量级）
+    // 眼睛开度检测 — 在瞳孔追踪之前执行
     raw_eye_openness_ = compute_eye_openness(gray_frame);
 
-    // 开度低于阈值 → 跳过整个眼追流水线，节省 CPU
+    // 开度低于阈值 → 跳过整个眼追流水线
     if (eye_openness_skip_threshold_ > 0.0 && raw_eye_openness_ < eye_openness_skip_threshold_) {
         last_tracking_result_ = TrackingResult{};
         last_tracking_result_.raw_eye_openness = raw_eye_openness_;
@@ -452,7 +455,7 @@ void GazeVectorTracker::process_frame(const cv::Mat& frame) {
 
     int darkest_pixel_value = gray_frame.at<uchar>(darkest_point->y, darkest_point->x);
 
-    // ===== 双阈值瞳孔二值化（替代旧版三重二值化） =====
+    // ===== 瞳孔二值化 =====
     // 使用 inRange 捕获 [darkest + low, darkest + high] 区间的像素
     int low_val = std::max(0, std::min(255, darkest_pixel_value + pupil_threshold_low_));
     int high_val = std::max(0, std::min(255, darkest_pixel_value + pupil_threshold_high_));
@@ -460,17 +463,15 @@ void GazeVectorTracker::process_frame(const cv::Mat& frame) {
     cv::Mat pupil_binary;
     cv::inRange(gray_frame, low_val, high_val, pupil_binary);
     // inRange 标记区间内为 255（白色），区间外为 0
-    // 不需要再取反，因为 pupil_binary 已经将暗区标为白色前景
-
     // 方形掩膜：只保留最暗点附近区域
     pupil_binary = mask_outside_square(pupil_binary, *darkest_point, 250);
 
-    // 将同一个二值图传入 process_frames（保持原有接口不变）
+    // 将同一个二值图传入 process_frames
     process_frames(pupil_binary, pupil_binary, pupil_binary, processed_frame);
 }
 
 // ================================================================
-// 单通道二值化处理 & 椭圆拟合（适配双阈值单输入）
+// 单通道二值化处理 & 椭圆拟合
 // ================================================================
 
 void GazeVectorTracker::process_frames(
@@ -515,7 +516,8 @@ void GazeVectorTracker::process_frames(
         }
     }
 
-    // Optimize contours by angle
+    // 根据角度优化轮廓点
+    // 遍历轮廓点，取其相邻两点，若角度朝外则舍弃（该点源于光线造成的瞳孔内亮点轮廓）
     if (!final_contours.empty()) {
         final_contours = {optimize_contours_by_angle(final_contours)};
     }
@@ -561,7 +563,7 @@ void GazeVectorTracker::process_frames(
 
     update_eye_sphere_radius(model_center_average, final_rotated_rect, best_ratio_under_ellipse);
 
-    // Build TrackingResult
+    // 构建最终结果
     last_tracking_result_ = TrackingResult{};
     if (final_rotated_rect.has_value()) {
         PupilEllipse pe;
@@ -574,7 +576,7 @@ void GazeVectorTracker::process_frames(
     last_tracking_result_.sphere_radius = max_observed_distance_;
     last_tracking_result_.raw_eye_openness = raw_eye_openness_;
 
-    // Compute gaze vector
+    // 计算注视向量
     auto [center_3d, gaze_rotated, norm_result] = compute_gaze_vector(
         center_x, center_y, model_center_average.x, model_center_average.y,
         best_ratio_under_ellipse);
@@ -587,7 +589,7 @@ void GazeVectorTracker::process_frames(
 }
 
 // ================================================================
-// Threshold & mask
+// 阈值和遮罩
 // ================================================================
 
 cv::Mat GazeVectorTracker::apply_binary_threshold(
@@ -615,7 +617,7 @@ cv::Mat GazeVectorTracker::mask_outside_square(
 }
 
 // ================================================================
-// Darkest area search (vectorized)
+// 最暗区域搜索 (vectorized)
 // ================================================================
 
 std::optional<cv::Point> GazeVectorTracker::get_darkest_area(
@@ -641,20 +643,19 @@ std::optional<cv::Point> GazeVectorTracker::get_darkest_area(
     int min_sum = INT_MAX;
     std::optional<cv::Point> best_point;
 
-    // C++ vectorized scan - iterate over grid points
     for (int gy = ignore_bounds; gy < h - ignore_bounds; gy += image_skip_size) {
         for (int gx = ignore_bounds; gx < w - ignore_bounds; gx += image_skip_size) {
             int sy = gy + search_area / 2;
             int sx = gx + search_area / 2;
 
-            // Check if within ellipse
+            // 检查是否在搜索椭圆内
             if (rx > 0 && ry > 0) {
                 double dx = (double)(sx - cx_roi) / rx;
                 double dy = (double)(sy - cy_roi) / ry;
                 if (dx * dx + dy * dy > 1.0) continue;
             }
 
-            // Sum up a grid of (internal_skip_size × internal_skip_size) pixels
+            // 计算搜索区域内的像素总和
             int sum = 0;
             int count = 0;
             for (int dy = 0; dy < search_area; dy += internal_skip_size) {
@@ -677,7 +678,7 @@ std::optional<cv::Point> GazeVectorTracker::get_darkest_area(
 }
 
 // ================================================================
-// Contour processing
+//轮廓处理
 // ================================================================
 
 std::vector<cv::Point> GazeVectorTracker::filter_contours_by_area_and_return_largest(
@@ -711,7 +712,7 @@ std::vector<cv::Point> GazeVectorTracker::optimize_contours_by_angle(
 
     int spacing = std::max(1, n / 25);
 
-    // Compute centroid
+    // 计算质心
     cv::Point2f centroid(0, 0);
     for (const auto& pt : contour) {
         centroid.x += pt.x;
@@ -752,7 +753,7 @@ std::vector<cv::Point> GazeVectorTracker::optimize_contours_by_angle(
 }
 
 // ================================================================
-// Ellipse goodness
+// 计算椭圆优度
 // ================================================================
 
 std::vector<double> GazeVectorTracker::check_ellipse_goodness(
@@ -854,7 +855,7 @@ std::vector<double> GazeVectorTracker::check_contour_pixels(
 }
 
 // ================================================================
-// Eye sphere radius
+// 估算2D眼球半径
 // ================================================================
 
 std::optional<double> GazeVectorTracker::distance_to_pupil_outer_edge(
@@ -921,7 +922,7 @@ void GazeVectorTracker::update_eye_sphere_radius(
 }
 
 // ================================================================
-// Ray intersections & eye center estimation
+// 计算瞳孔椭圆射线交点以估计3D眼球中心
 // ================================================================
 
 double GazeVectorTracker::angle_diff(double a, double b) {
@@ -1001,7 +1002,7 @@ cv::Point GazeVectorTracker::compute_average_intersection(
         for (size_t i = 0; i < intersections.size() && accept; ++i) {
             for (size_t j = i + 1; j < intersections.size() && accept; ++j) {
                 double d = std::hypot(intersections[i].x - intersections[j].x,
-                                      intersections[j].y - intersections[j].y);
+                                      intersections[i].y - intersections[j].y);
                 if (d > pixel_limit) {
                     accept = false;
                     break;
@@ -1065,7 +1066,7 @@ cv::Point GazeVectorTracker::update_and_average_point(
 }
 
 // ================================================================
-// Gaze vector computation
+// 计算注视向量
 // ================================================================
 
 std::tuple<std::optional<cv::Point3f>, std::optional<cv::Point3f>, NormalizeResult>
@@ -1110,7 +1111,7 @@ GazeVectorTracker::compute_gaze_vector(
     double sphere_offset_y = 1.0 - ((double)center_y / viewport_h) * 2.0;
     cv::Point3f sphere_center(sphere_offset_x * 1.5f, sphere_offset_y * 1.5f, 0.0f);
 
-    // Ray-sphere intersection
+    // 计算射线与球体的交点
     cv::Point3f origin = ray_origin;
     cv::Point3f direction = -ray_direction; // reverse direction
     cv::Point3f L = origin - sphere_center;
@@ -1168,7 +1169,7 @@ GazeVectorTracker::compute_gaze_vector(
                                circle_local_center.z * circle_local_center.z);
     if (clc_len > 0) circle_local_center /= clc_len;
 
-    // Rodrigues rotation
+    // 计算罗德里格斯旋转轴和旋转角度
     cv::Point3f rotation_axis = circle_local_center.cross(target_direction);
     double rot_axis_norm = std::sqrt(rotation_axis.x * rotation_axis.x +
                                       rotation_axis.y * rotation_axis.y +
@@ -1186,13 +1187,13 @@ GazeVectorTracker::compute_gaze_vector(
         dot = std::max(-1.0, std::min(1.0, dot));
         double angle_rad = std::acos(dot);
 
-        // Rodrigues rotation matrix
+        // 罗德里格斯旋转矩阵
         double c = std::cos(angle_rad);
         double s = std::sin(angle_rad);
         double t = 1 - c;
         double x_a = rotation_axis.x, y_a = rotation_axis.y, z_a = rotation_axis.z;
 
-        // Apply rotation matrix to circle_local_center
+        // 应用旋转矩阵
         double rot[3][3] = {
             {t * x_a * x_a + c, t * x_a * y_a - s * z_a, t * x_a * z_a + s * y_a},
             {t * x_a * y_a + s * z_a, t * y_a * y_a + c, t * y_a * z_a - s * x_a},
@@ -1215,11 +1216,11 @@ GazeVectorTracker::compute_gaze_vector(
         if (gaze_len > 0) gaze_rotated /= gaze_len;
     }
 
-    // Normalize
+    // 归一化
     std::vector<double> gaze_list = {gaze_rotated.x, gaze_rotated.y, gaze_rotated.z};
     NormalizeResult norm_result = normalizer_.normalize(side_, gaze_list);
 
-    // Send result to Python queue
+    // 将结果发送至python队列
     if (!py_result_queue_.is_none()) {
         try {
             py::dict result;
@@ -1241,7 +1242,7 @@ GazeVectorTracker::compute_gaze_vector(
 }
 
 // ================================================================
-// Debug overlay
+// 绘制调试层
 // ================================================================
 
 void GazeVectorTracker::draw_debug_overlay(
@@ -1253,11 +1254,11 @@ void GazeVectorTracker::draw_debug_overlay(
     double best_ratio_under_ellipse,
     const NormalizeResult& norm_result)
 {
-    // Draw search ellipse
+    // 绘制搜索椭圆
     if (last_search_ellipse_.has_value()) {
         cv::ellipse(frame, *last_search_ellipse_, cv::Scalar(0, 200, 0), 2);
 
-        // 在椭圆区域内绘制开度参考线
+        // 在搜索椭圆区域内绘制开度参考线
         cv::RotatedRect ellipse = *last_search_ellipse_;
         int cx = (int)ellipse.center.x;
         int cy = (int)ellipse.center.y;
@@ -1284,7 +1285,7 @@ void GazeVectorTracker::draw_debug_overlay(
         }
     }
 
-    // Draw eye sphere
+    // 绘制2D眼球
     cv::circle(frame, model_center_average, (int)max_observed_distance_,
                cv::Scalar(255, 50, 50), 2);
     cv::circle(frame, model_center_average, 8, cv::Scalar(255, 255, 0), -1);
@@ -1327,7 +1328,7 @@ void GazeVectorTracker::draw_debug_overlay(
                     cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
     }
 
-    // Normalization status HUD
+    // 归一化输出HUD
     if (!norm_result.missing.empty()) {
         std::string msg = "Insufficient extreme vectors! (";
         for (size_t i = 0; i < norm_result.missing.size(); ++i) {
@@ -1373,6 +1374,10 @@ void GazeVectorTracker::draw_debug_overlay(
 
 // ================================================================
 // 眼睛开度检测 — 双阈值 inRange + 竖直扫描 + 聚合
+// 每列扫描找到最高点和最低点
+// 所有最高点的平均值或中位数作为最终最高点
+// 所有最低点的平均值或中位数作为最终最低点
+// 二者之间的距离为raw开度
 // ================================================================
 
 double GazeVectorTracker::compute_eye_openness(const cv::Mat& gray_frame) {

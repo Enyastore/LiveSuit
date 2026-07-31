@@ -38,27 +38,27 @@ public:
         int pupil_threshold_high = 25
     );
 
-    // Main tracking loop - blocking. Accepts Python queue objects via pybind11.
+    // 主循环（阻塞式，接受pybind11信息流）
     void start_tracking(
         pybind11::object py_cmd_queue,
         pybind11::object py_result_queue,
         bool headless = false
     );
 
-    // Commands
+    // 命令
     void lock_sphere_radius();
     void unlock_sphere_radius();
     void lock_eye_center();
     void unlock_eye_center();
     void stop();
 
-    // Accessors (for Python bindings)
+    // get函数
     TrackingResult get_last_tracking_result() const { return last_tracking_result_; }
     bool is_running() const { return running_; }
     bool is_headless() const { return headless_; }
 
 private:
-    // ========== Configuration ==========
+    // ========== 配置 ==========
     int cam_index_;
     bool flip_;
     std::vector<int> crop_;
@@ -72,10 +72,10 @@ private:
     double brightness_;
     double contrast_;
 
-    // ========== Normalizer ==========
+    // ========== 归一化器 ==========
     Normalizer normalizer_;
 
-    // ========== Tracking State ==========
+    // ========== 追踪状态 ==========
     std::vector<cv::RotatedRect> ray_lines_;
     std::vector<cv::Point> model_centers_;
     int min_model_centers_ = 30;
@@ -90,24 +90,24 @@ private:
     TrackingResult last_tracking_result_;
     std::vector<cv::Point> stored_intersections_;
 
-    // ========== Lock State ==========
+    // ========== 眼球锁定状态 ==========
     bool sphere_radius_locked_ = false;
     double locked_sphere_radius_ = 0;
     bool eye_center_locked_ = false;
     cv::Point locked_eye_center_;
 
-    // ========== Run State ==========
+    // ========== 运行状态 ==========
     cv::VideoCapture cap_;
     std::atomic<bool> running_{false};
     bool headless_ = false;
     std::string win_name_;
     std::optional<cv::RotatedRect> last_search_ellipse_;
 
-    // ========== 眼睛开度检测参数（双阈值） ==========
-    int eye_openness_threshold_low_ = 0;      // 开闭检测下界阈值 (0-255)
-    int eye_openness_threshold_high_ = 80;    // 开闭检测上界阈值 (0-255)
+    // ========== 眼睛开度检测参数 ==========
+    int eye_openness_threshold_low_ = 0;      // 开闭检测二值化下界 (0-255)
+    int eye_openness_threshold_high_ = 80;    // 开闭检测二值化上界 (0-255)
     int eye_openness_blur_ = 3;               // 高斯模糊核 (奇数, 1=不模糊)
-    std::string eye_openness_aggregation_ = "median";  // "median" 或 "average"
+    std::string eye_openness_aggregation_ = "median";  // "median"（中位数） 或 "average"（平均值）
     double raw_eye_openness_ = 0.0;           // 每帧计算的开度 raw 值（在瞳孔检测之前）
     double eye_openness_skip_threshold_ = 0.0;  // 低于此值跳过眼追（0=不跳过）
     double eye_openness_top_agg_ = 0.0;       // 每帧聚合后最高点 y 坐标
@@ -117,33 +117,33 @@ private:
     int pupil_threshold_low_ = 5;    // 瞳孔二值化下界偏移（相对于最暗像素）
     int pupil_threshold_high_ = 25;  // 瞳孔二值化上界偏移（相对于最暗像素）
 
-    // ========== Internal Methods ==========
+    // ========== 内部方法 ==========
 
     void reset_tracking_state();
     void cleanup();
     void switch_headless_on();
     void switch_headless_off();
 
-    // Frame processing
+    // 帧处理
     void process_frame(const cv::Mat& frame);
     void process_frames(const cv::Mat& thresholded_strict,
                          const cv::Mat& thresholded_medium,
                          const cv::Mat& thresholded_relaxed,
                          cv::Mat& frame);
 
-    // Threshold & mask
+    // 阈值和遮罩
     static cv::Mat apply_binary_threshold(const cv::Mat& image, int darkest_pixel_value, int added_threshold);
     static cv::Mat mask_outside_square(const cv::Mat& image, cv::Point center, int size);
 
-    // Darkest area search
+    // 搜索最暗区域
     std::optional<cv::Point> get_darkest_area(const cv::Mat& image, const cv::Mat& gray_frame);
 
-    // Contour processing
+    // 瞳孔轮廓处理
     static std::vector<cv::Point> filter_contours_by_area_and_return_largest(
         const std::vector<std::vector<cv::Point>>& contours, int pixel_thresh, int ratio_thresh);
     static std::vector<cv::Point> optimize_contours_by_angle(const std::vector<cv::Point>& contour);
 
-    // Ellipse goodness
+    // 椭圆优度
     static std::vector<double> check_ellipse_goodness(const cv::Mat& binary_image,
                                                        const std::vector<cv::Point>& contour,
                                                        const std::optional<cv::RotatedRect>& ellipse_opt);
@@ -151,14 +151,14 @@ private:
                                                       cv::Size image_shape,
                                                       const std::optional<cv::RotatedRect>& ellipse_opt);
 
-    // Eye sphere
+    // 眼球球半径和眼睛中心更新
     static std::optional<double> distance_to_pupil_outer_edge(cv::Point eye_center,
                                                                const cv::RotatedRect& pupil_ellipse);
     void update_eye_sphere_radius(cv::Point eye_center,
                                    const std::optional<cv::RotatedRect>& current_pupil_ellipse,
                                    double current_pupil_confidence);
 
-    // Ray intersections
+    // 射线交点
     static double angle_diff(double a, double b);
     static std::optional<cv::Point> find_line_intersection(const cv::RotatedRect& e1,
                                                              const cv::RotatedRect& e2);
@@ -171,11 +171,11 @@ private:
     static cv::Point update_and_average_point(std::vector<cv::Point>& point_list,
                                                 cv::Point new_point, int N);
 
-    // Gaze vector computation
+    // 计算注视向量
     std::tuple<std::optional<cv::Point3f>, std::optional<cv::Point3f>, NormalizeResult>
     compute_gaze_vector(int x, int y, int center_x, int center_y, double confidence_ratio);
 
-    // Debug overlay
+    // 绘制调试层
     void draw_debug_overlay(cv::Mat& frame, cv::Point model_center_average,
                              const std::optional<cv::RotatedRect>& final_rotated_rect,
                              int center_x, int center_y,
@@ -187,15 +187,15 @@ private:
     // ========== 眼睛开度检测 ==========
     double compute_eye_openness(const cv::Mat& gray_frame);
 
-    // Command/result queue (stored as member to access from process_frames)
+    // ========== 命令/结果队列 ==========
     pybind11::object py_cmd_queue_;
     pybind11::object py_result_queue_;
 
-    // Command processing
+    // ========== 命令处理 ==========
     void process_commands();
     void process_commands(pybind11::object py_cmd_queue);
 
-    // Camera restart
+    // ========== 摄像头重启 ==========
     void restart_camera(int w, int h, int fps, const std::string& fourcc_str);
 };
 

@@ -8,6 +8,7 @@
 """
 
 import logging
+import os
 from eye_tracker_core_cpp import (
     Normalizer as _CppNormalizer,
     GazeVectorTracker as _CppGazeVectorTracker,
@@ -16,6 +17,22 @@ from eye_tracker_core_cpp import (
 )
 
 logger = logging.getLogger(__name__)
+
+# 本模块所在目录（用于解析 extreme_vectors.yaml 的相对路径，避免依赖当前工作目录）
+_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _resolve_extreme_file(extreme_file: str) -> str:
+    """将相对路径的 extreme_file 解析为模块目录下的绝对路径。
+
+    若传入的是绝对路径，或模块目录下不存在该文件，则原样返回。
+    """
+    if os.path.isabs(extreme_file):
+        return extreme_file
+    resolved = os.path.join(_MODULE_DIR, extreme_file)
+    if os.path.exists(resolved):
+        return resolved
+    return extreme_file  # 回退原值
 
 # V4L2 四字符码整数值（直接设置 CAP_PROP_FOURCC 使用）
 # 保留在此以便 eye_tracker_main 等模块引用
@@ -46,7 +63,7 @@ class Normalizer:
     """
 
     def __init__(self, extreme_file: str = "extreme_vectors.yaml"):
-        self._impl = _CppNormalizer(extreme_file)
+        self._impl = _CppNormalizer(_resolve_extreme_file(extreme_file))
 
     def reload(self) -> None:
         self._impl.reload()
@@ -141,7 +158,7 @@ class GazeVectorTracker:
         self._impl = _CppGazeVectorTracker(
             cam_index, flip, list(crop), side,
             frame_width, frame_height, frame_rate,
-            extreme_file,
+            _resolve_extreme_file(extreme_file),
             use_recommended_resolution, dark_search_roi_scale,
             fourcc_str, brightness, contrast,
             openness_threshold_low, openness_threshold_high,

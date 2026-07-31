@@ -5,15 +5,18 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# ---- Find OpenCV (manual paths since cmake config/pkg-config not available) ----
-set(OPENCV_INCLUDE_DIRS "/usr/include/opencv4")
-set(OPENCV_LIBS
-    opencv_core
-    opencv_imgproc
-    opencv_highgui
-    opencv_videoio
-    opencv_imgcodecs
-)
+# ---- Find OpenCV (prefer cmake config, fallback to manual paths) ----
+find_package(OpenCV QUIET)
+if(NOT OpenCV_FOUND)
+    set(OpenCV_INCLUDE_DIRS "/usr/include/opencv4")
+    set(OpenCV_LIBS
+        opencv_core
+        opencv_imgproc
+        opencv_highgui
+        opencv_videoio
+        opencv_imgcodecs
+    )
+endif()
 
 # ---- Find yaml-cpp ----
 find_package(yaml-cpp REQUIRED)
@@ -33,14 +36,14 @@ pybind11_add_module(eye_tracker_core_cpp ${SOURCES})
 
 target_include_directories(eye_tracker_core_cpp
     PRIVATE
-        ${OPENCV_INCLUDE_DIRS}
+        ${OpenCV_INCLUDE_DIRS}
         ${YAML_CPP_INCLUDE_DIR}
         src/
 )
 
 target_link_libraries(eye_tracker_core_cpp
     PRIVATE
-        ${OPENCV_LIBS}
+        ${OpenCV_LIBS}
         yaml-cpp
 )
 
