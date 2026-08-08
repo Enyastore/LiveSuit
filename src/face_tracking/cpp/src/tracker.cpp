@@ -17,7 +17,7 @@ namespace py = pybind11;
 GazeVectorTracker::GazeVectorTracker(
     int cam_index, bool flip, std::vector<int> crop,
     std::string side, int frame_width, int frame_height,
-    int frame_rate, std::string extreme_file,
+    int frame_rate, std::string refs_file,
     bool use_recommended_resolution, double dark_search_roi_scale,
     std::string fourcc_str, double brightness, double contrast,
     int openness_threshold_low, int openness_threshold_high,
@@ -29,7 +29,7 @@ GazeVectorTracker::GazeVectorTracker(
       use_recommended_resolution_(use_recommended_resolution),
       dark_search_roi_scale_(std::max(0.1, std::min(1.0, dark_search_roi_scale))),
       brightness_(brightness), contrast_(contrast),
-      normalizer_(std::move(extreme_file)),
+      normalizer_(std::move(refs_file)),
       prev_model_center_avg_(frame_width / 2, frame_height / 2),
       eye_openness_threshold_low_(std::max(0, std::min(255, openness_threshold_low))),
       eye_openness_threshold_high_(std::max(0, std::min(255, openness_threshold_high))),
@@ -222,24 +222,24 @@ void GazeVectorTracker::process_commands(pybind11::object py_cmd_queue) {
                 else if (cmd_str == "unlock_center") unlock_eye_center();
                 else if (cmd_str == "headless_on") switch_headless_on();
                 else if (cmd_str == "headless_off") switch_headless_off();
-                else if (cmd_str == "reload_extremes") normalizer_.reload();
-                else if (cmd_str == "clear_extremes") normalizer_.clear_extremes(side_);
+                else if (cmd_str == "reload_refs") normalizer_.reload();
+                else if (cmd_str == "clear_extreme_vectors") normalizer_.clear_extreme_vectors(side_);
             }
-            // Check if it's a tuple command
+            //检查是否为元组命令
             else if (py::isinstance<py::tuple>(cmd)) {
                 py::tuple tup = cmd.cast<py::tuple>();
                 if (tup.size() == 0) continue;
 
                 std::string cmd_type = tup[0].cast<std::string>();
 
-                if (cmd_type == "save_extreme" && tup.size() >= 3) {
+                if (cmd_type == "save_extreme_vectors" && tup.size() >= 3) {
                     std::string direction = tup[1].cast<std::string>();
                     py::list vec_list = tup[2].cast<py::list>();
                     std::vector<double> vec;
                     for (auto item : vec_list) {
                         vec.push_back(item.cast<double>());
                     }
-                    normalizer_.set_extreme(side_, direction, vec);
+                    normalizer_.set_extreme_vectors(side_, direction, vec);
                 }
                 else if (cmd_type == "set_search_roi_scale" && tup.size() >= 2) {
                     dark_search_roi_scale_ = std::max(0.1, std::min(1.0, tup[1].cast<double>()));

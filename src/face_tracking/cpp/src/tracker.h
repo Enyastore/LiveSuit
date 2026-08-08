@@ -26,7 +26,7 @@ public:
         int frame_width = 640,
         int frame_height = 480,
         int frame_rate = 30,
-        std::string extreme_file = "extreme_vectors.yaml",
+        std::string refs_file = "references.yaml",
         bool use_recommended_resolution = true,
         double dark_search_roi_scale = 0.70,
         std::string fourcc_str = "",

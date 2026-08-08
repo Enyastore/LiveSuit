@@ -13,11 +13,11 @@ PYBIND11_MODULE(eye_tracker_core_cpp, m) {
 
     // ---- 归一化器 ----
     py::class_<Normalizer>(m, "Normalizer")
-        .def(py::init<const std::string&>(), py::arg("extreme_file") = "extreme_vectors.yaml")
+        .def(py::init<const std::string&>(), py::arg("refs_file") = "references.yaml")
         .def("reload", &Normalizer::reload)
-        .def("set_extreme", &Normalizer::set_extreme,
+        .def("set_extreme_vectors", &Normalizer::set_extreme_vectors,
              py::arg("side"), py::arg("direction"), py::arg("vector"))
-        .def("clear_extremes", &Normalizer::clear_extremes, py::arg("side"))
+        .def("clear_extreme_vectors", &Normalizer::clear_extreme_vectors, py::arg("side"))
         .def("normalize", &Normalizer::normalize,
              py::arg("side"), py::arg("gaze_rotated"))
         // 眼睛开度标定
@@ -61,7 +61,7 @@ PYBIND11_MODULE(eye_tracker_core_cpp, m) {
              py::arg("frame_width") = 640,
              py::arg("frame_height") = 480,
              py::arg("frame_rate") = 30,
-             py::arg("extreme_file") = "extreme_vectors.yaml",
+             py::arg("refs_file") = "references.yaml",
              py::arg("use_recommended_resolution") = true,
              py::arg("dark_search_roi_scale") = 0.70,
              py::arg("fourcc_str") = "",

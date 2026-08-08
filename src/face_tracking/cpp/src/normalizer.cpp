@@ -6,14 +6,14 @@
 
 namespace eye_tracker {
 
-Normalizer::Normalizer(const std::string& extreme_file) {
-    extreme_file_path_ = resolve_path(extreme_file);
-    load_extremes();
+Normalizer::Normalizer(const std::string& refs_file) {
+    refs_file_path_ = resolve_path(refs_file);
+    load_refs();
 }
 
 //帮助函数：保存参考值到YAML文件
 static void save_yaml_file(const std::string& filepath,
-                           const std::unordered_map<std::string, std::vector<double>>& extremes,
+                           const std::unordered_map<std::string, std::vector<double>>& extreme_vectors,
                            const std::string& side, const std::string& ref_type, double ref_value) {
     try {
         YAML::Node config;
@@ -23,8 +23,8 @@ static void save_yaml_file(const std::string& filepath,
             config = YAML::Node(YAML::NodeType::Map);
         }
 
-        // 写入现有的注视极值向量
-        for (const auto& [key, vec] : extremes) {
+        // 写入现有的极值向量
+        for (const auto& [key, vec] : extreme_vectors) {
             config[key] = YAML::Node(vec);
         }
 
@@ -43,15 +43,26 @@ static void save_yaml_file(const std::string& filepath,
 }
 
 void Normalizer::set_openness_ref(const std::string& side, const std::string& ref_type, double value) {
-    save_yaml_file(extreme_file_path_, extremes_, side, ref_type, value);
+    // 先更新内存缓存（与 set_extreme_vectors 更新 extreme_vectors_ 的行为一致）
+    if (ref_type == "open") {
+        cached_open_ref_[side] = value;
+    } else if (ref_type == "close") {
+        cached_close_ref_[side] = value;
+    }
+
+    save_yaml_file(refs_file_path_, extreme_vectors_, side, ref_type, value);
     std::cerr << "[归一化器] 保存了 " << side << "_" << ref_type << " = " << value << std::endl;
 }
 
 void Normalizer::clear_openness_ref(const std::string& side) {
+    // 先清除内存缓存
+    cached_open_ref_.erase(side);
+    cached_close_ref_.erase(side);
+
     try {
         YAML::Node config;
         try {
-            config = YAML::LoadFile(extreme_file_path_);
+            config = YAML::LoadFile(refs_file_path_);
         } catch (...) {
             config = YAML::Node(YAML::NodeType::Map);
         }
@@ -68,7 +79,7 @@ void Normalizer::clear_openness_ref(const std::string& side) {
             config.remove(k);
         }
 
-        std::ofstream fout(extreme_file_path_);
+        std::ofstream fout(refs_file_path_);
         if (fout.is_open()) {
             fout << config;
             fout.close();
@@ -80,14 +91,16 @@ void Normalizer::clear_openness_ref(const std::string& side) {
 }
 
 std::optional<double> Normalizer::get_openness_ref(const std::string& side, const std::string& ref_type) const {
-    try {
-        YAML::Node config = YAML::LoadFile(extreme_file_path_);
-        std::string ref_key = side + "_" + ref_type;
-        if (config[ref_key]) {
-            return config[ref_key].as<double>();
+    if (ref_type == "open") {
+        auto it = cached_open_ref_.find(side);
+        if (it != cached_open_ref_.end()) {
+            return it->second;
         }
-    } catch (...) {
-        std::cerr << "[归一化器] 文件未找到" << std::endl;
+    } else if (ref_type == "close") {
+        auto it = cached_close_ref_.find(side);
+        if (it != cached_close_ref_.end()) {
+            return it->second;
+        }
     }
     return std::nullopt;
 }
@@ -106,11 +119,13 @@ std::string Normalizer::resolve_path(const std::string& filename) const {
     return filename;
 }
 
-void Normalizer::load_extremes() {
-    extremes_.clear();
+void Normalizer::load_refs() {
+    extreme_vectors_.clear();
+    cached_open_ref_.clear();
+    cached_close_ref_.clear();
 
     try {
-        YAML::Node config = YAML::LoadFile(extreme_file_path_);
+        YAML::Node config = YAML::LoadFile(refs_file_path_);
         if (!config) {
             std::cerr << "[归一化器] 参考值文件为空或未找到" << std::endl;
             return;
@@ -119,41 +134,58 @@ void Normalizer::load_extremes() {
             std::string key = entry.first.as<std::string>();
             auto vec = entry.second;
             if (vec.IsSequence() && vec.size() >= 3) {
-                extremes_[key] = {
+                extreme_vectors_[key] = {
                     vec[0].as<double>(),
                     vec[1].as<double>(),
                     vec[2].as<double>()
                 };
+                continue;
+            }
+
+            // 解析开度参考值标量键：{side}_open / {side}_close
+            if (!vec.IsScalar()) continue;
+            static const std::string open_suffix = "_open";
+            static const std::string close_suffix = "_close";
+            if (key.size() > open_suffix.size() &&
+                key.compare(key.size() - open_suffix.size(), open_suffix.size(), open_suffix) == 0) {
+                std::string side = key.substr(0, key.size() - open_suffix.size());
+                if (!side.empty()) cached_open_ref_[side] = vec.as<double>();
+            } else if (key.size() > close_suffix.size() &&
+                       key.compare(key.size() - close_suffix.size(), close_suffix.size(), close_suffix) == 0) {
+                std::string side = key.substr(0, key.size() - close_suffix.size());
+                if (!side.empty()) cached_close_ref_[side] = vec.as<double>();
             }
         }
-        std::cerr << "[归一化器] 加载了 " << extremes_.size() << " 个注视极值向量" << std::endl;
+        std::cerr << "[归一化器] 加载了 " << extreme_vectors_.size() << " 个注视极值向量，"
+                  << cached_open_ref_.size() << " 个开参考，"
+                  << cached_close_ref_.size() << " 个闭参考" << std::endl;
     } catch (const YAML::BadFile&) {
-        std::cerr << "[归一化器] 参考文件未找到：" << extreme_file_path_ << std::endl;
+        std::cerr << "[归一化器] 参考文件未找到：" << refs_file_path_ << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "[归一化器] 加载参考值时出错：" << e.what() << std::endl;
     }
 }
 
 void Normalizer::reload() {
-    load_extremes();
+    load_refs();
 }
 
-void Normalizer::set_extreme(const std::string& side, const std::string& direction,
-                             const std::vector<double>& vector) {
+void Normalizer::set_extreme_vectors(const std::string& side, const std::string& direction,
+                                     const std::vector<double>& vector) {
     std::string key = side + "_" + direction;
-    extremes_[key] = vector;
+    extreme_vectors_[key] = vector;
 
     try {
         YAML::Node config;
         // 加载当前文件（如果存在）
         try {
-            config = YAML::LoadFile(extreme_file_path_);
+            config = YAML::LoadFile(refs_file_path_);
         } catch (...) {
             config = YAML::Node(YAML::NodeType::Map);
         }
 
         config[key] = YAML::Node(vector);
-        std::ofstream fout(extreme_file_path_);
+        std::ofstream fout(refs_file_path_);
         if (fout.is_open()) {
             fout << config;
             fout.close();
@@ -163,19 +195,19 @@ void Normalizer::set_extreme(const std::string& side, const std::string& directi
     }
 }
 
-void Normalizer::clear_extremes(const std::string& side) {
+void Normalizer::clear_extreme_vectors(const std::string& side) {
     // 移除四个注视极值向量
-    std::vector<std::string> extreme_directions = {"inner", "outer", "up", "down"};
-    for (auto it = extremes_.begin(); it != extremes_.end(); ) {
-        bool is_extreme = false;
-        for (const auto& dir : extreme_directions) {
+    std::vector<std::string> extreme_vector_directions = {"inner", "outer", "up", "down"};
+    for (auto it = extreme_vectors_.begin(); it != extreme_vectors_.end(); ) {
+        bool is_extreme_vector = false;
+        for (const auto& dir : extreme_vector_directions) {
             if (it->first == side + "_" + dir) {
-                is_extreme = true;
+                is_extreme_vector = true;
                 break;
             }
         }
-        if (is_extreme) {
-            it = extremes_.erase(it);
+        if (is_extreme_vector) {
+            it = extreme_vectors_.erase(it);
         } else {
             ++it;
         }
@@ -184,7 +216,7 @@ void Normalizer::clear_extremes(const std::string& side) {
     try {
         YAML::Node config;
         try {
-            config = YAML::LoadFile(extreme_file_path_);
+            config = YAML::LoadFile(refs_file_path_);
         } catch (...) {
             config = YAML::Node(YAML::NodeType::Map);
         }
@@ -193,7 +225,7 @@ void Normalizer::clear_extremes(const std::string& side) {
         std::vector<std::string> keys_to_remove;
         for (const auto& entry : config) {
             std::string k = entry.first.as<std::string>();
-            for (const auto& dir : extreme_directions) {
+            for (const auto& dir : extreme_vector_directions) {
                 if (k == side + "_" + dir) {
                     keys_to_remove.push_back(k);
                     break;
@@ -204,7 +236,7 @@ void Normalizer::clear_extremes(const std::string& side) {
             config.remove(k);
         }
 
-        std::ofstream fout(extreme_file_path_);
+        std::ofstream fout(refs_file_path_);
         if (fout.is_open()) {
             fout << config;
             fout.close();
@@ -212,7 +244,7 @@ void Normalizer::clear_extremes(const std::string& side) {
         std::cerr << "清除了" << keys_to_remove.size()
                   << side << "眼的注视极值向量" << std::endl;
     } catch (const std::exception& e) {
-        std::cerr << "[Normalizer] Error clearing extremes: " << e.what() << std::endl;
+        std::cerr << "[Normalizer] Error clearing extreme vectors: " << e.what() << std::endl;
     }
 }
 
@@ -232,7 +264,7 @@ NormalizeResult Normalizer::normalize(const std::string& side,
     // 检查缺失的注视极值向量
     std::vector<std::string> expected = {inner_key, outer_key, up_key, down_key};
     for (const auto& k : expected) {
-        if (extremes_.find(k) == extremes_.end()) {
+        if (extreme_vectors_.find(k) == extreme_vectors_.end()) {
             // 提取 "side_" 后面的方向部分
             auto pos = k.find('_');
             if (pos != std::string::npos) {
@@ -249,10 +281,10 @@ NormalizeResult Normalizer::normalize(const std::string& side,
 
     auto [eye_x, eye_y] = orthogonal_project(
         gaze_rotated,
-        extremes_.at(inner_key),
-        extremes_.at(outer_key),
-        extremes_.at(up_key),
-        extremes_.at(down_key)
+        extreme_vectors_.at(inner_key),
+        extreme_vectors_.at(outer_key),
+        extreme_vectors_.at(up_key),
+        extreme_vectors_.at(down_key)
     );
 
     result.eye_x = eye_x;
@@ -272,7 +304,7 @@ Normalizer::orthogonal_project(const std::vector<double>& current,
                                 const std::vector<double>& outer,
                                 const std::vector<double>& up,
                                 const std::vector<double>& down) {
-    // 计算四个注视极值向量的质心
+    // 计算四个极值向量的质心
     double cx = inner[0] + outer[0] + up[0] + down[0];
     double cy = inner[1] + outer[1] + up[1] + down[1];
     double cz = inner[2] + outer[2] + up[2] + down[2];

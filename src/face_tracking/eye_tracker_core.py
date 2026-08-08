@@ -18,21 +18,21 @@ from eye_tracker_core_cpp import (
 
 logger = logging.getLogger(__name__)
 
-# 本模块所在目录（用于解析 extreme_vectors.yaml 的相对路径，避免依赖当前工作目录）
+# 本模块所在目录（用于解析 references.yaml 的相对路径，避免依赖当前工作目录）
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def _resolve_extreme_file(extreme_file: str) -> str:
-    """将相对路径的 extreme_file 解析为模块目录下的绝对路径。
+def _resolve_refs_file(refs_file: str) -> str:
+    """将相对路径的 refs_file 解析为模块目录下的绝对路径。
 
     若传入的是绝对路径，或模块目录下不存在该文件，则原样返回。
     """
-    if os.path.isabs(extreme_file):
-        return extreme_file
-    resolved = os.path.join(_MODULE_DIR, extreme_file)
+    if os.path.isabs(refs_file):
+        return refs_file
+    resolved = os.path.join(_MODULE_DIR, refs_file)
     if os.path.exists(resolved):
         return resolved
-    return extreme_file  # 回退原值
+    return refs_file  # 回退原值
 
 # V4L2 四字符码整数值（直接设置 CAP_PROP_FOURCC 使用）
 # 保留在此以便 eye_tracker_main 等模块引用
@@ -53,26 +53,26 @@ _V4L2_FOURCC_MAP = {
 class Normalizer:
     """将 3D 注视向量（gaze_rotated）映射为屏幕坐标 [-1, 1]² 的归一化器。
 
-    标定文件（extreme_vectors.yaml）需包含四个极值点：
+    标定文件（references.yaml）需包含四个极值点：
       {side}_inner, {side}_outer, {side}_up, {side}_down
 
     无此文件时 normalize() 返回 eye_x / eye_y 均为 None，
     下游调用者须自行降级处理。
 
-    此外支持眼睛开度标定参考值的存取（{side}_open_ref / {side}_close_ref）。
+    此外支持眼睛开度标定参考值的存取（{side}_open / {side}_close）。
     """
 
-    def __init__(self, extreme_file: str = "extreme_vectors.yaml"):
-        self._impl = _CppNormalizer(_resolve_extreme_file(extreme_file))
+    def __init__(self, refs_file: str = "references.yaml"):
+        self._impl = _CppNormalizer(_resolve_refs_file(refs_file))
 
     def reload(self) -> None:
         self._impl.reload()
 
-    def set_extreme(self, side: str, direction: str, vector) -> None:
-        self._impl.set_extreme(side, direction, list(vector))
+    def set_extreme_vectors(self, side: str, direction: str, vector) -> None:
+        self._impl.set_extreme_vectors(side, direction, list(vector))
 
-    def clear_extremes(self, side: str) -> None:
-        self._impl.clear_extremes(side)
+    def clear_extreme_vectors(self, side: str) -> None:
+        self._impl.clear_extreme_vectors(side)
 
     def normalize(self, side: str, gaze_rotated) -> dict:
         result = self._impl.normalize(side, list(gaze_rotated))
@@ -142,7 +142,7 @@ class GazeVectorTracker:
         frame_width: int = 640,
         frame_height: int = 480,
         frame_rate: int = 30,
-        extreme_file: str = "extreme_vectors.yaml",
+        refs_file: str = "references.yaml",
         use_recommended_resolution: bool = True,
         dark_search_roi_scale: float = 0.70,
         fourcc_str: str = "",
@@ -158,7 +158,7 @@ class GazeVectorTracker:
         self._impl = _CppGazeVectorTracker(
             cam_index, flip, list(crop), side,
             frame_width, frame_height, frame_rate,
-            _resolve_extreme_file(extreme_file),
+            _resolve_refs_file(refs_file),
             use_recommended_resolution, dark_search_roi_scale,
             fourcc_str, brightness, contrast,
             openness_threshold_low, openness_threshold_high,

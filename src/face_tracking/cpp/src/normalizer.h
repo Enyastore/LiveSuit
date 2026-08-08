@@ -12,12 +12,12 @@ namespace eye_tracker {
 
 class Normalizer {
 public:
-    explicit Normalizer(const std::string& extreme_file = "extreme_vectors.yaml");
+    explicit Normalizer(const std::string& refs_file = "references.yaml");
 
     void reload();
-    void set_extreme(const std::string& side, const std::string& direction,
-                     const std::vector<double>& vector);
-    void clear_extremes(const std::string& side);
+    void set_extreme_vectors(const std::string& side, const std::string& direction,
+                             const std::vector<double>& vector);
+    void clear_extreme_vectors(const std::string& side);
 
     NormalizeResult normalize(const std::string& side,
                               const std::vector<double>& gaze_rotated) const;
@@ -27,10 +27,15 @@ public:
     void clear_openness_ref(const std::string& side);
 
 private:
-    std::string extreme_file_path_;
-    std::unordered_map<std::string, std::vector<double>> extremes_;
+    std::string refs_file_path_;
+    std::unordered_map<std::string, std::vector<double>> extreme_vectors_;
 
-    void load_extremes();
+    // 眼睛开度参考值内存缓存（避免每帧读盘，行为与注视极值向量一致）
+    // key 为 side（"left"/"right"）
+    std::unordered_map<std::string, double> cached_open_ref_;
+    std::unordered_map<std::string, double> cached_close_ref_;
+
+    void load_refs();
 
     static std::tuple<std::optional<double>, std::optional<double>>
     orthogonal_project(const std::vector<double>& current,
@@ -39,7 +44,7 @@ private:
                        const std::vector<double>& up,
                        const std::vector<double>& down);
 
-    // Resolve extreme file path relative to the Python module directory
+    // Resolve refs file path relative to the Python module directory
     std::string resolve_path(const std::string& filename) const;
 };
 

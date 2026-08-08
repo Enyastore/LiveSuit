@@ -1207,7 +1207,7 @@ class ControlPanel:
         clear_frame.pack(pady=(0, 2))
         tk.Button(
             clear_frame, text="清除注视参考", width=12,
-            command=lambda: self._clear_extremes(side),
+            command=lambda: self._clear_extreme_vectors(side),
         ).pack(side=tk.LEFT, padx=3)
         tk.Button(
             clear_frame, text="清除开闭参考", width=12,
@@ -1279,19 +1279,19 @@ class ControlPanel:
         q = self._cmd_queue_left if side == "left" else self._cmd_queue_right
         if q is not None:
             try:
-                q.put_nowait(("save_extreme", direction, vector))
+                q.put_nowait(("save_extreme_vectors", direction, vector))
                 logger.info(f"已发送 {side}_{direction} 到子进程保存")
             except Exception as e:
                 logger.error(f"发送极值向量到子进程失败: {e}")
         else:
             logger.warning(f"[{side}] 追踪尚未启动，无法保存")
 
-    def _clear_extremes(self, side: str) -> None:
+    def _clear_extreme_vectors(self, side: str) -> None:
         """清除指定眼（left/right）的所有极值向量。"""
         q = self._cmd_queue_left if side == "left" else self._cmd_queue_right
         if q is not None:
             try:
-                q.put_nowait("clear_extremes")
+                q.put_nowait("clear_extreme_vectors")
                 logger.info(f"已发送清除 {side} 眼极值向量命令到子进程")
             except Exception as e:
                 logger.error(f"发送清除极值向量命令到子进程失败: {e}")
@@ -1409,8 +1409,8 @@ class EyeTrackingModule:
         tkinter 父窗口实例。headless=False 时若为 None 会自动创建一个隐藏窗口。
     config_path : str
         相机配置文件的路径。
-    extreme_file : str
-        极值向量文件的路径（文件名部分）。
+    refs_file : str
+        参考值文件的路径（文件名部分）。
     """
 
     def __init__(
@@ -1418,10 +1418,10 @@ class EyeTrackingModule:
         headless: bool = False,
         master: Optional[tk.Tk] = None,
         config_path: str = "config.yaml",
-        extreme_file: str = "extreme_vectors.yaml",
+        refs_file: str = "references.yaml",
     ):
         self._headless = headless
-        self._extreme_file = extreme_file
+        self._refs_file = refs_file
 
         if headless:
             self._master: Optional[tk.Tk] = None
@@ -1433,6 +1433,10 @@ class EyeTrackingModule:
 
         self._persistence = ConfigPersistence(config_path)
         self.config: AppConfig = self._persistence.load()
+
+        # 模块级共享 Normalizer：供结果收集线程读取开度参考缓存、
+        # 供控制面板写入/清除参考值（保证标定后 eye_o 立即生效）
+        self._openness_normalizer: Normalizer = Normalizer(self._refs_file)
 
         self._process_left: Optional[multiprocessing.Process] = None
         self._process_right: Optional[multiprocessing.Process] = None
@@ -1506,7 +1510,7 @@ class EyeTrackingModule:
                 "left", self._cmd_queue_left, self._result_queue, self._headless,
                 self.config.left.frame_width, self.config.left.frame_height,
                 self.config.left.frame_rate,
-                self._extreme_file, self.config.left.use_recommended_resolution,
+                self._refs_file, self.config.left.use_recommended_resolution,
                 self.config.left.dark_search_roi_scale,
                 self.config.left.fourcc,
                 self.config.left.brightness,
@@ -1527,7 +1531,7 @@ class EyeTrackingModule:
                 "right", self._cmd_queue_right, self._result_queue, self._headless,
                 self.config.right.frame_width, self.config.right.frame_height,
                 self.config.right.frame_rate,
-                self._extreme_file, self.config.right.use_recommended_resolution,
+                self._refs_file, self.config.right.use_recommended_resolution,
                 self.config.right.dark_search_roi_scale,
                 self.config.right.fourcc,
                 self.config.right.brightness,
@@ -1568,12 +1572,17 @@ class EyeTrackingModule:
         self._result_thread.start()
 
     def _collect_results(self) -> None:
-        # 创建 Normalizer 实例用于读取开度参考值
-        openness_normalizer = Normalizer(self._extreme_file)
+        # 使用模块级共享 Normalizer（与用户标定写入的是同一实例，
+        # 标定后 eye_o 计算立即使用最新 open/close 参考缓存）
+        openness_normalizer = self._openness_normalizer
+        # 本地缓存队列引用，避免 stop() 置 None 后访问 self._result_queue
+        result_queue = self._result_queue
+        if result_queue is None:
+            return
 
         while not self._result_stop.is_set():
             try:
-                data = self._result_queue.get(timeout=0.01)
+                data = result_queue.get(timeout=0.01)
             except queue.Empty:
                 continue
             except Exception:
@@ -1595,14 +1604,17 @@ class EyeTrackingModule:
                     eye_o = (raw_openness - close_ref) / (open_ref - close_ref)
                     eye_o = max(0.0, min(1.0, eye_o))
 
-            self._latest_state[side] = {
+            # 快照式整体替换：读者拿到的始终是同一次更新的一致快照
+            new_state = dict(self._latest_state)
+            new_state[side] = {
                 "eye_x": data.get("eye_x"),
                 "eye_y": data.get("eye_y"),
                 "confidence": data.get("confidence"),
                 "raw_eye_openness": raw_openness,
                 "eye_o": eye_o,
             }
-            self._latest_state["timestamp"] = time.time()
+            new_state["timestamp"] = time.time()
+            self._latest_state = new_state
 
     def _stop_internal(self) -> None:
         if self._control_panel is not None:
@@ -1635,7 +1647,8 @@ class EyeTrackingModule:
         logger.info("眼球追踪已停止")
 
     def get_normalized_eye_state(self) -> dict:
-        return dict(self._latest_state)
+        # 直接返回不可变快照引用（写入方整体替换，读者拿到一致快照）
+        return self._latest_state
 
     def get_raw_gaze_vector(self, side: str) -> Optional[List[float]]:
         return self._raw_gaze.get(side)
@@ -1696,11 +1709,12 @@ class EyeTrackingModule:
             return
         if self._control_panel is not None and self._control_panel.is_open():
             self._control_panel.destroy()
-        openness_normalizer = Normalizer(self._extreme_file)
         self._control_panel = ControlPanel(
             self._master, self._cmd_queue_left, self._cmd_queue_right,
             self.get_raw_gaze_vector,
-            openness_normalizer=openness_normalizer,
+            # 传入模块级共享 Normalizer：控制面板写入的开度参考
+            # 与结果收集线程读取的是同一实例，标定后立即生效
+            openness_normalizer=self._openness_normalizer,
             module=self,
         )
 
@@ -1730,7 +1744,7 @@ def _run_tracker_in_process(
     command_queue: multiprocessing.Queue,
     result_queue: multiprocessing.Queue, headless: bool,
     frame_width: int, frame_height: int, frame_rate: int,
-    extreme_file: str,
+    refs_file: str,
     use_recommended_resolution: bool = True,
     dark_search_roi_scale: float = 0.70,
     fourcc_str: str = "",
@@ -1744,7 +1758,7 @@ def _run_tracker_in_process(
     tracker = GazeVectorTracker(
         cam_index=cam_index, flip=flip, crop=crop, side=side,
         frame_width=frame_width, frame_height=frame_height,
-        frame_rate=frame_rate, extreme_file=extreme_file,
+        frame_rate=frame_rate, refs_file=refs_file,
         use_recommended_resolution=use_recommended_resolution,
         dark_search_roi_scale=dark_search_roi_scale,
         fourcc_str=fourcc_str,
