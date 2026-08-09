@@ -33,8 +33,8 @@ GazeVectorTracker::GazeVectorTracker(
       prev_model_center_avg_(frame_width / 2, frame_height / 2),
       eye_openness_threshold_low_(std::max(0, std::min(255, openness_threshold_low))),
       eye_openness_threshold_high_(std::max(0, std::min(255, openness_threshold_high))),
-      pupil_threshold_low_(pupil_threshold_low),
-      pupil_threshold_high_(std::max(pupil_threshold_low + 1, pupil_threshold_high)) {}
+      pupil_threshold_low_(std::max(0, std::min(255, pupil_threshold_low))),
+      pupil_threshold_high_(std::max(pupil_threshold_low_ + 1, std::min(255, pupil_threshold_high))) {}
 
 // ================================================================
 // 锁定/解锁眼球半径/中心
@@ -278,17 +278,16 @@ void GazeVectorTracker::process_commands(pybind11::object py_cmd_queue) {
                     std::cerr << "[" << side_ << "] 开闭检测二值化上界: " << eye_openness_threshold_high_ << std::endl;
                 }
                 else if (cmd_type == "set_pupil_threshold_low" && tup.size() >= 2) {
-                    int v = tup[1].cast<int>();
-                    pupil_threshold_low_ = v;
+                    pupil_threshold_low_ = std::max(0, std::min(255, tup[1].cast<int>()));
                     if (pupil_threshold_high_ < pupil_threshold_low_ + 1) {
                         pupil_threshold_high_ = pupil_threshold_low_ + 1;
                     }
-                    std::cerr << "[" << side_ << "] 瞳孔检测二值化下界偏移（相对最暗像素）: " << pupil_threshold_low_ << std::endl;
+                    std::cerr << "[" << side_ << "] 瞳孔检测二值化下界: " << pupil_threshold_low_ << std::endl;
                 }
                 else if (cmd_type == "set_pupil_threshold_high" && tup.size() >= 2) {
-                    int v = tup[1].cast<int>();
-                    pupil_threshold_high_ = std::max(v, pupil_threshold_low_ + 1);
-                    std::cerr << "[" << side_ << "] 瞳孔检测二值化上界偏移（相对最暗像素）: " << pupil_threshold_high_ << std::endl;
+                    pupil_threshold_high_ = std::max(
+                        pupil_threshold_low_ + 1, std::min(255, tup[1].cast<int>()));
+                    std::cerr << "[" << side_ << "] 瞳孔检测二值化上界: " << pupil_threshold_high_ << std::endl;
                 }
             }
         }
@@ -447,88 +446,37 @@ void GazeVectorTracker::process_frame(const cv::Mat& frame) {
         return;
     }
 
-    auto darkest_point = get_darkest_area(processed_frame, gray_frame);
-    if (!darkest_point.has_value()) {
-        last_tracking_result_ = TrackingResult{};
-        return;
+    // ===== 瞳孔检测（共用核心算法，与调试面板一致）=====
+    PupilDebugResult dbg = detect_pupil(
+        gray_frame, dark_search_roi_scale_, {},
+        pupil_threshold_low_, pupil_threshold_high_, 200, 4);
+
+    // 同步搜索椭圆（供 draw_debug_overlay 使用）
+    if (dbg.roi_rx > 0 && dbg.roi_ry > 0) {
+        last_search_ellipse_ = cv::RotatedRect(
+            cv::Point2f(dbg.roi_cx, dbg.roi_cy),
+            cv::Size2f(dbg.roi_rx * 2, dbg.roi_ry * 2), 0);
+    } else {
+        last_search_ellipse_.reset();
     }
-
-    int darkest_pixel_value = gray_frame.at<uchar>(darkest_point->y, darkest_point->x);
-
-    // ===== 瞳孔二值化 =====
-    // 使用 inRange 捕获 [darkest + low, darkest + high] 区间的像素
-    int low_val = std::max(0, std::min(255, darkest_pixel_value + pupil_threshold_low_));
-    int high_val = std::max(0, std::min(255, darkest_pixel_value + pupil_threshold_high_));
-
-    cv::Mat pupil_binary;
-    cv::inRange(gray_frame, low_val, high_val, pupil_binary);
-    // inRange 标记区间内为 255（白色），区间外为 0
-    // 方形掩膜：只保留最暗点附近区域
-    pupil_binary = mask_outside_square(pupil_binary, *darkest_point, 250);
-
-    // 将同一个二值图传入 process_frames
-    process_frames(pupil_binary, pupil_binary, pupil_binary, processed_frame);
-}
-
-// ================================================================
-// 单通道二值化处理 & 椭圆拟合
-// ================================================================
-
-void GazeVectorTracker::process_frames(
-    const cv::Mat& thresholded_strict, const cv::Mat& thresholded_medium,
-    const cv::Mat& thresholded_relaxed, cv::Mat& frame)
-{
-    cv::Mat kernel = cv::Mat::ones(5, 5, CV_8U);
-    std::vector<cv::Mat> image_array = {thresholded_relaxed, thresholded_medium, thresholded_strict};
 
     std::optional<cv::RotatedRect> final_rotated_rect;
-    std::vector<cv::Point> final_contours;
-    double goodness = 0;
-    double best_ratio_under_ellipse = 0;
+    double best_ratio_under_ellipse = dbg.ratio_under_ellipse;
     int best_center_x = -1, best_center_y = -1;
+    if (dbg.ellipse_found) {
+        final_rotated_rect = cv::RotatedRect(
+            cv::Point2f(dbg.ellipse_center.x, dbg.ellipse_center.y),
+            cv::Size2f(dbg.ellipse_axes.x, dbg.ellipse_axes.y),
+            dbg.ellipse_angle);
+        best_center_x = (int)dbg.ellipse_center.x;
+        best_center_y = (int)dbg.ellipse_center.y;
 
-    for (int i = 0; i < 3; ++i) {
-        cv::Mat dilated;
-        cv::dilate(image_array[i], dilated, kernel, cv::Point(-1, -1), 2);
-
-        std::vector<std::vector<cv::Point>> contours;
-        cv::findContours(dilated, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-
-        auto reduced = filter_contours_by_area_and_return_largest(contours, 1000, 3);
-
-        if (reduced.size() > 5) {
-            cv::RotatedRect ellipse = cv::fitEllipse(reduced);
-            int cx = (int)ellipse.center.x;
-            int cy = (int)ellipse.center.y;
-
-            auto current_goodness = check_ellipse_goodness(dilated, reduced, ellipse);
-            auto total_pixels = check_contour_pixels(reduced, dilated.size(), ellipse);
-
-            double final_goodness = current_goodness[0] * total_pixels[0] * total_pixels[0] * total_pixels[1];
-
-            if (final_goodness > 0 && final_goodness > goodness) {
-                goodness = final_goodness;
-                best_ratio_under_ellipse = total_pixels[1];
-                final_contours = reduced;
-                best_center_x = cx;
-                best_center_y = cy;
-            }
-        }
-    }
-
-    // 根据角度优化轮廓点
-    // 遍历轮廓点，取其相邻两点，若角度朝外则舍弃（该点源于光线造成的瞳孔内亮点轮廓）
-    if (!final_contours.empty()) {
-        final_contours = {optimize_contours_by_angle(final_contours)};
-    }
-
-    if (final_contours.size() > 5) {
-        final_rotated_rect = cv::fitEllipse(final_contours);
-
+        // 置信度足够则加入射线历史
         if (best_ratio_under_ellipse >= pupil_confidence_threshold_) {
             ray_lines_.push_back(*final_rotated_rect);
             if ((int)ray_lines_.size() > max_rays_) {
-                ray_lines_.erase(ray_lines_.begin(), ray_lines_.begin() + (ray_lines_.size() - max_rays_));
+                ray_lines_.erase(ray_lines_.begin(),
+                                 ray_lines_.begin() + (ray_lines_.size() - max_rays_));
             }
         }
     }
@@ -542,7 +490,8 @@ void GazeVectorTracker::process_frames(
     } else {
         model_center_average = cv::Point(frame_width_ / 2, frame_height_ / 2);
         cv::Point model_center = compute_average_intersection(
-            frame, ray_lines_, intersection_ray_count_, 1500, minimum_intersection_angle_degrees_);
+            processed_frame, ray_lines_, intersection_ray_count_, 1500,
+            minimum_intersection_angle_degrees_);
 
         if (model_center.x != 0 || model_center.y != 0) {
             model_center_average = update_and_average_point(model_centers_, model_center, 200);
@@ -582,58 +531,48 @@ void GazeVectorTracker::process_frames(
         best_ratio_under_ellipse);
 
     if (!headless_) {
-        draw_debug_overlay(frame, model_center_average, final_rotated_rect,
+        draw_debug_overlay(processed_frame, model_center_average, final_rotated_rect,
                            center_x, center_y, center_3d, gaze_rotated,
                            best_ratio_under_ellipse, norm_result);
     }
 }
 
 // ================================================================
-// 阈值和遮罩
+// 搜索椭圆 / 最暗区域搜索（正式算法与调试接口共用）
 // ================================================================
 
-cv::Mat GazeVectorTracker::apply_binary_threshold(
-    const cv::Mat& image, int darkest_pixel_value, int added_threshold)
+// 计算搜索椭圆（支持 crop 指定 ROI；无 crop 时以整帧中心/尺寸计算）
+std::optional<cv::RotatedRect> GazeVectorTracker::compute_search_ellipse(
+    int frame_w, int frame_h, const std::vector<int>& crop, double dark_search_roi_scale)
 {
-    int threshold = darkest_pixel_value + added_threshold;
-    cv::Mat thresholded;
-    cv::threshold(image, thresholded, threshold, 255, cv::THRESH_BINARY_INV);
-    return thresholded;
-}
-
-cv::Mat GazeVectorTracker::mask_outside_square(
-    const cv::Mat& image, cv::Point center, int size)
-{
-    cv::Mat mask = cv::Mat::zeros(image.size(), CV_8U);
-    int half = size / 2;
-    int x1 = std::max(0, center.x - half);
-    int y1 = std::max(0, center.y - half);
-    int x2 = std::min(image.cols, center.x + half);
-    int y2 = std::min(image.rows, center.y + half);
-    mask(cv::Rect(x1, y1, x2 - x1, y2 - y1)).setTo(255);
-    cv::Mat result;
-    cv::bitwise_and(image, mask, result);
-    return result;
-}
-
-// ================================================================
-// 最暗区域搜索 (vectorized)
-// ================================================================
-
-std::optional<cv::Point> GazeVectorTracker::get_darkest_area(
-    const cv::Mat& image, const cv::Mat& gray_frame)
-{
-    int h = image.rows, w = image.cols;
-    int cx_roi = w / 2, cy_roi = h / 2;
-    int rx = (int)((w / 2.0) * dark_search_roi_scale_);
-    int ry = (int)((h / 2.0) * dark_search_roi_scale_);
-
-    if (rx > 0 && ry > 0) {
-        last_search_ellipse_ = cv::RotatedRect(cv::Point2f(cx_roi, cy_roi),
-                                                cv::Size2f(rx * 2, ry * 2), 0);
+    int cw, ch, cx, cy;
+    if (crop.size() == 4 && crop[2] > crop[0] && crop[3] > crop[1]) {
+        cw = crop[2] - crop[0];
+        ch = crop[3] - crop[1];
+        cx = crop[0] + cw / 2;
+        cy = crop[1] + ch / 2;
     } else {
-        last_search_ellipse_.reset();
+        cw = frame_w;
+        ch = frame_h;
+        cx = frame_w / 2;
+        cy = frame_h / 2;
     }
+    int rx = (int)((cw / 2.0) * dark_search_roi_scale);
+    int ry = (int)((ch / 2.0) * dark_search_roi_scale);
+    if (rx <= 0 || ry <= 0) return std::nullopt;
+    return cv::RotatedRect(cv::Point2f((float)cx, (float)cy),
+                           cv::Size2f((float)(rx * 2), (float)(ry * 2)), 0);
+}
+
+// 在搜索椭圆内查找最暗区域（区域像素总和搜索）
+std::optional<cv::Point> GazeVectorTracker::find_darkest_area_in_ellipse(
+    const cv::Mat& gray_frame, const cv::RotatedRect& search_ellipse)
+{
+    int h = gray_frame.rows, w = gray_frame.cols;
+    int cx_roi = (int)search_ellipse.center.x;
+    int cy_roi = (int)search_ellipse.center.y;
+    int rx = std::max(1, (int)(search_ellipse.size.width / 2));
+    int ry = std::max(1, (int)(search_ellipse.size.height / 2));
 
     const int ignore_bounds = 20;
     const int image_skip_size = 10;
@@ -649,19 +588,17 @@ std::optional<cv::Point> GazeVectorTracker::get_darkest_area(
             int sx = gx + search_area / 2;
 
             // 检查是否在搜索椭圆内
-            if (rx > 0 && ry > 0) {
-                double dx = (double)(sx - cx_roi) / rx;
-                double dy = (double)(sy - cy_roi) / ry;
-                if (dx * dx + dy * dy > 1.0) continue;
-            }
+            double dx = (double)(sx - cx_roi) / rx;
+            double dy = (double)(sy - cy_roi) / ry;
+            if (dx * dx + dy * dy > 1.0) continue;
 
             // 计算搜索区域内的像素总和
             int sum = 0;
             int count = 0;
-            for (int dy = 0; dy < search_area; dy += internal_skip_size) {
-                for (int dx = 0; dx < search_area; dx += internal_skip_size) {
-                    int py = std::min(std::max(sy + dy, 0), h - 1);
-                    int px = std::min(std::max(sx + dx, 0), w - 1);
+            for (int dy2 = 0; dy2 < search_area; dy2 += internal_skip_size) {
+                for (int dx2 = 0; dx2 < search_area; dx2 += internal_skip_size) {
+                    int py = std::min(std::max(sy + dy2, 0), h - 1);
+                    int px = std::min(std::max(sx + dx2, 0), w - 1);
                     sum += gray_frame.at<uchar>(py, px);
                     count++;
                 }
@@ -1381,88 +1318,216 @@ void GazeVectorTracker::draw_debug_overlay(
 // ================================================================
 
 double GazeVectorTracker::compute_eye_openness(const cv::Mat& gray_frame) {
+    // 共用核心算法（与调试接口一致）
+    OpennessDebugResult r = detect_openness(
+        gray_frame, dark_search_roi_scale_, {},
+        eye_openness_threshold_low_, eye_openness_threshold_high_,
+        eye_openness_blur_, eye_openness_aggregation_);
+
+    // 存储聚合结果供 draw_debug_overlay 使用
+    eye_openness_top_agg_ = r.top_agg;
+    eye_openness_bottom_agg_ = r.bottom_agg;
+    return r.raw_distance;
+}
+
+// ================================================================
+// 核心算法 — 瞳孔检测（正式 process_frame 与调试接口共用，唯一实现）
+// ================================================================
+
+PupilDebugResult GazeVectorTracker::detect_pupil(
+    const cv::Mat& gray_frame, double dark_search_roi_scale,
+    const std::vector<int>& crop,
+    int pupil_threshold_low, int pupil_threshold_high,
+    int area_thresh, int ratio_thresh)
+{
+    PupilDebugResult result;
+    if (gray_frame.empty()) return result;
+    result.valid = true;
+
     int h = gray_frame.rows, w = gray_frame.cols;
 
-    // 获取 dark_search_ellipse 参数（与 get_darkest_area 一致）
-    int cx_roi = w / 2, cy_roi = h / 2;
-    int rx = (int)((w / 2.0) * dark_search_roi_scale_);
-    int ry = (int)((h / 2.0) * dark_search_roi_scale_);
+    // 搜索椭圆（支持 crop 指定 ROI，与调试面板行为一致）
+    auto search_ellipse_opt = compute_search_ellipse(w, h, crop, dark_search_roi_scale);
+    cv::RotatedRect search_ellipse;
+    if (search_ellipse_opt.has_value()) {
+        search_ellipse = *search_ellipse_opt;
+    } else {
+        search_ellipse = cv::RotatedRect(cv::Point2f(w / 2.0f, h / 2.0f),
+                                         cv::Size2f(std::max(1, w), std::max(1, h)), 0);
+    }
+    result.roi_cx = search_ellipse.center.x;
+    result.roi_cy = search_ellipse.center.y;
+    result.roi_rx = search_ellipse.size.width / 2.0f;
+    result.roi_ry = search_ellipse.size.height / 2.0f;
 
-    if (rx <= 0 || ry <= 0) return 0.0;
+    // 最暗点（区域总和 + 椭圆内限定）
+    auto darkest_point = find_darkest_area_in_ellipse(gray_frame, search_ellipse);
+    if (darkest_point.has_value()) {
+        result.darkest_point = cv::Point2f((float)darkest_point->x, (float)darkest_point->y);
+        result.darkest_pixel_value = gray_frame.at<uchar>(darkest_point->y, darkest_point->x);
+    } else {
+        result.darkest_point = cv::Point2f(w / 2.0f, h / 2.0f);
+        result.darkest_pixel_value = 0;
+    }
+
+    // 双阈值二值化（绝对灰度阈值，与眼睛开度检测一致）
+    int low_val = std::max(0, std::min(255, pupil_threshold_low));
+    int high_val = std::max(0, std::min(255, pupil_threshold_high));
+    if (low_val >= high_val) {
+        result.binary = cv::Mat::zeros(h, w, CV_8U);
+        return result;
+    }
+
+    cv::Mat pupil_binary;
+    cv::inRange(gray_frame, low_val, high_val, pupil_binary);
+
+    // 椭圆 ROI 掩膜
+    cv::Mat mask = cv::Mat::zeros(gray_frame.size(), CV_8U);
+    cv::ellipse(mask, search_ellipse, cv::Scalar(255), -1);
+    cv::bitwise_and(pupil_binary, mask, pupil_binary);
+
+    // 膨胀
+    cv::Mat kernel = cv::Mat::ones(5, 5, CV_8U);
+    cv::Mat dilated;
+    cv::dilate(pupil_binary, dilated, kernel, cv::Point(-1, -1), 2);
+
+    result.binary = pupil_binary;
+    result.dilated = dilated;
+
+    // 轮廓 → 过滤 → 拟合
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(dilated, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    std::vector<cv::Point> final_contours =
+        filter_contours_by_area_and_return_largest(contours, area_thresh, ratio_thresh);
+
+    if (final_contours.size() > 5) {
+        cv::RotatedRect ellipse = cv::fitEllipse(final_contours);
+        auto current_goodness = check_ellipse_goodness(dilated, final_contours, ellipse);
+        auto total_pixels = check_contour_pixels(final_contours, dilated.size(), ellipse);
+        result.goodness_cover = current_goodness[0];
+        result.goodness_aspect = current_goodness[2];
+        result.goodness_total = current_goodness[0] * current_goodness[2] * 100.0;
+        result.ratio_under_ellipse = total_pixels[1];
+
+        if (result.goodness_total > 0) {
+            result.ellipse_center = cv::Point2f(ellipse.center.x, ellipse.center.y);
+            result.ellipse_axes = cv::Point2f(ellipse.size.width, ellipse.size.height);
+            result.ellipse_angle = ellipse.angle;
+
+            // 角度优化 + 重拟合
+            std::vector<cv::Point> optimized = optimize_contours_by_angle(final_contours);
+            if (optimized.size() > 5) {
+                cv::RotatedRect fitted = cv::fitEllipse(optimized);
+                result.ellipse_center = cv::Point2f(fitted.center.x, fitted.center.y);
+                result.ellipse_axes = cv::Point2f(fitted.size.width, fitted.size.height);
+                result.ellipse_angle = fitted.angle;
+            }
+            result.ellipse_found = true;
+        }
+    }
+
+    return result;
+}
+
+// ================================================================
+// 调试接口 — 瞳孔检测（薄封装，供 Python 调试面板调用）
+// ================================================================
+
+PupilDebugResult GazeVectorTracker::debug_pupil_detect(
+    const cv::Mat& frame, int pupil_threshold_low, int pupil_threshold_high,
+    double dark_search_roi_scale, const std::vector<int>& crop,
+    int area_thresh, int ratio_thresh)
+{
+    PupilDebugResult result;
+    if (frame.empty()) return result;
+    cv::Mat gray_frame;
+    cv::cvtColor(frame, gray_frame, cv::COLOR_BGR2GRAY);
+    return detect_pupil(gray_frame, dark_search_roi_scale, crop,
+                        pupil_threshold_low, pupil_threshold_high,
+                        area_thresh, ratio_thresh);
+}
+
+// ================================================================
+// 核心算法 — 眼睛开度检测（正式 compute_eye_openness 与调试接口共用，唯一实现）
+// ================================================================
+
+OpennessDebugResult GazeVectorTracker::detect_openness(
+    const cv::Mat& gray_frame, double dark_search_roi_scale,
+    const std::vector<int>& crop,
+    int openness_threshold_low, int openness_threshold_high,
+    int blur_kernel, const std::string& aggregation)
+{
+    OpennessDebugResult result;
+    if (gray_frame.empty()) return result;
+    result.valid = true;
+
+    int h = gray_frame.rows, w = gray_frame.cols;
+
+    auto search_ellipse_opt = compute_search_ellipse(w, h, crop, dark_search_roi_scale);
+    if (!search_ellipse_opt.has_value()) return result;
+    cv::RotatedRect search_ellipse = *search_ellipse_opt;
+    int cx_roi = (int)search_ellipse.center.x;
+    int cy_roi = (int)search_ellipse.center.y;
+    int rx = (int)(search_ellipse.size.width / 2);
+    int ry = (int)(search_ellipse.size.height / 2);
+
+    result.roi_cx = (float)cx_roi;
+    result.roi_cy = (float)cy_roi;
+    result.roi_rx = (float)rx;
+    result.roi_ry = (float)ry;
+
+    if (rx <= 0 || ry <= 0) return result;
 
     // 1. 高斯模糊
     cv::Mat blurred = gray_frame;
-    if (eye_openness_blur_ > 1) {
-        cv::GaussianBlur(gray_frame, blurred,
-                         cv::Size(eye_openness_blur_, eye_openness_blur_), 0);
+    if (blur_kernel > 1) {
+        if (blur_kernel % 2 == 0) blur_kernel += 1;  // 强制奇数
+        cv::GaussianBlur(gray_frame, blurred, cv::Size(blur_kernel, blur_kernel), 0);
     }
 
-    // 2. 双阈值二值化（inRange）：只保留 [low, high] 区间的像素
+    // 2. 双阈值 inRange
+    int low_val = std::max(0, std::min(255, openness_threshold_low));
+    int high_val = std::max(0, std::min(255, openness_threshold_high));
+    if (low_val >= high_val) return result;
+
     cv::Mat binary;
-    int low_val = std::max(0, std::min(255, eye_openness_threshold_low_));
-    int high_val = std::max(0, std::min(255, eye_openness_threshold_high_));
-    if (low_val >= high_val) {
-        // 非法区间，直接返回 0
-        eye_openness_top_agg_ = 0.0;
-        eye_openness_bottom_agg_ = 0.0;
-        return 0.0;
-    }
     cv::inRange(blurred, low_val, high_val, binary);
-    // inRange：区间内像素标为 255（白色前景），区间外为 0
 
-    // 3. 椭圆掩膜：只保留 dark_search_ellipse 内的像素
+    // 3. 椭圆掩膜
     cv::Mat mask = cv::Mat::zeros(h, w, CV_8U);
-    cv::ellipse(mask, cv::RotatedRect(cv::Point2f(cx_roi, cy_roi),
-                                       cv::Size2f(rx * 2, ry * 2), 0),
-                cv::Scalar(255), -1);
+    cv::ellipse(mask, search_ellipse, cv::Scalar(255), -1);
     cv::Mat masked;
     cv::bitwise_and(binary, mask, masked);
 
+    result.binary = binary;
+    result.masked = masked;
+
     // 4. 逐列扫描
-    //    限定在椭圆边界框内扫描，提高效率
     int min_x = std::max(0, cx_roi - rx);
     int max_x = std::min(w, cx_roi + rx);
     int min_y = std::max(0, cy_roi - ry);
     int max_y = std::min(h, cy_roi + ry);
 
     std::vector<double> top_points, bottom_points;
-
     for (int x = min_x; x < max_x; ++x) {
-        int top_y = -1;
-        int bottom_y = -1;
-
-        // 从上往下找第一个白色像素
+        int top_y = -1, bottom_y = -1;
         for (int y = min_y; y < max_y; ++y) {
-            if (masked.at<uchar>(y, x) > 0) {
-                top_y = y;
-                break;
-            }
+            if (masked.at<uchar>(y, x) > 0) { top_y = y; break; }
         }
-
-        // 从下往上找第一个白色像素
         for (int y = max_y - 1; y >= min_y; --y) {
-            if (masked.at<uchar>(y, x) > 0) {
-                bottom_y = y;
-                break;
-            }
+            if (masked.at<uchar>(y, x) > 0) { bottom_y = y; break; }
         }
-
-        // 该列必须既有最高点又有最低点，且 top != bottom（高度至少 1）
         if (top_y >= 0 && bottom_y >= 0 && bottom_y > top_y) {
             top_points.push_back((double)top_y);
             bottom_points.push_back((double)bottom_y);
         }
     }
 
-    if (top_points.empty() || bottom_points.empty()) {
-        eye_openness_top_agg_ = 0.0;
-        eye_openness_bottom_agg_ = 0.0;
-        return 0.0;
-    }
+    if (top_points.empty()) return result;
 
-    // 5. 聚合
+    // 5. 聚合（median / average）
     double top_agg, bottom_agg;
-    if (eye_openness_aggregation_ == "average") {
+    if (aggregation == "average") {
         double sum_top = 0, sum_bottom = 0;
         for (size_t i = 0; i < top_points.size(); ++i) {
             sum_top += top_points[i];
@@ -1471,31 +1536,41 @@ double GazeVectorTracker::compute_eye_openness(const cv::Mat& gray_frame) {
         top_agg = sum_top / top_points.size();
         bottom_agg = sum_bottom / bottom_points.size();
     } else {
-        // 中位数
+        std::sort(top_points.begin(), top_points.end());
+        std::sort(bottom_points.begin(), bottom_points.end());
         size_t n = top_points.size();
-        size_t mid = n / 2;
-        std::nth_element(top_points.begin(), top_points.begin() + mid, top_points.end());
-        std::nth_element(bottom_points.begin(), bottom_points.begin() + mid, bottom_points.end());
         if (n % 2 == 0) {
-            // 偶数个，取中间两数的均值
-            auto mid2 = mid - 1;
-            std::nth_element(top_points.begin(), top_points.begin() + mid2, top_points.end());
-            std::nth_element(bottom_points.begin(), bottom_points.begin() + mid2, bottom_points.end());
-            top_agg = (top_points[mid] + top_points[mid2]) * 0.5;
-            bottom_agg = (bottom_points[mid] + bottom_points[mid2]) * 0.5;
+            top_agg = (top_points[n / 2 - 1] + top_points[n / 2]) * 0.5;
+            bottom_agg = (bottom_points[n / 2 - 1] + bottom_points[n / 2]) * 0.5;
         } else {
-            top_agg = top_points[mid];
-            bottom_agg = bottom_points[mid];
+            top_agg = top_points[n / 2];
+            bottom_agg = bottom_points[n / 2];
         }
     }
 
-    double raw_distance = bottom_agg - top_agg;
+    result.top_agg = top_agg;
+    result.bottom_agg = bottom_agg;
+    result.raw_distance = std::max(0.0, bottom_agg - top_agg);
 
-    // 存储聚合结果供 draw_debug_overlay 使用
-    eye_openness_top_agg_ = top_agg;
-    eye_openness_bottom_agg_ = bottom_agg;
+    return result;
+}
 
-    return std::max(0.0, raw_distance);
+// ================================================================
+// 调试接口 — 眼睛开度检测（薄封装，供 Python 调试面板调用）
+// ================================================================
+
+OpennessDebugResult GazeVectorTracker::debug_openness_detect(
+    const cv::Mat& frame, int openness_threshold_low, int openness_threshold_high,
+    int blur_kernel, const std::string& aggregation, double dark_search_roi_scale,
+    const std::vector<int>& crop)
+{
+    OpennessDebugResult result;
+    if (frame.empty()) return result;
+    cv::Mat gray_frame;
+    cv::cvtColor(frame, gray_frame, cv::COLOR_BGR2GRAY);
+    return detect_openness(gray_frame, dark_search_roi_scale, crop,
+                           openness_threshold_low, openness_threshold_high,
+                           blur_kernel, aggregation);
 }
 
 } // namespace eye_tracker

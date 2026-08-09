@@ -34,8 +34,8 @@ public:
         double contrast = 1.0,
         int openness_threshold_low = 0,
         int openness_threshold_high = 80,
-        int pupil_threshold_low = 5,
-        int pupil_threshold_high = 25
+        int pupil_threshold_low = 0,
+        int pupil_threshold_high = 50
     );
 
     // 主循环（阻塞式，接受pybind11信息流）
@@ -57,7 +57,32 @@ public:
     bool is_running() const { return running_; }
     bool is_headless() const { return headless_; }
 
+    // ---- 调试接口（静态，供 Python 调试面板调用）----
+    // 瞳孔检测调试：薄封装，内部调用核心 detect_pupil
+    static PupilDebugResult debug_pupil_detect(
+        const cv::Mat& frame, int pupil_threshold_low, int pupil_threshold_high,
+        double dark_search_roi_scale, const std::vector<int>& crop = {},
+        int area_thresh = 200, int ratio_thresh = 4);
+    // 眼睛开度调试：薄封装，内部调用核心 detect_openness
+    static OpennessDebugResult debug_openness_detect(
+        const cv::Mat& frame, int openness_threshold_low, int openness_threshold_high,
+        int blur_kernel, const std::string& aggregation,
+        double dark_search_roi_scale, const std::vector<int>& crop = {});
+
 private:
+    // ---- 核心算法（正式流程与调试接口共用，唯一实现）----
+    // 瞳孔检测核心：gray → 最暗点 → 双阈值 → 椭圆掩膜 → 膨胀 → 轮廓 → 拟合 → 角度优化
+    static PupilDebugResult detect_pupil(
+        const cv::Mat& gray_frame, double dark_search_roi_scale,
+        const std::vector<int>& crop,
+        int pupil_threshold_low, int pupil_threshold_high,
+        int area_thresh, int ratio_thresh);
+    // 开度检测核心：gray → 模糊 → 双阈值 → 椭圆掩膜 → 列扫描 → 聚合
+    static OpennessDebugResult detect_openness(
+        const cv::Mat& gray_frame, double dark_search_roi_scale,
+        const std::vector<int>& crop,
+        int openness_threshold_low, int openness_threshold_high,
+        int blur_kernel, const std::string& aggregation);
     // ========== 配置 ==========
     int cam_index_;
     bool flip_;
@@ -114,8 +139,8 @@ private:
     double eye_openness_bottom_agg_ = 0.0;    // 每帧聚合后最低点 y 坐标
 
     // ========== 瞳孔检测参数（双阈值） ==========
-    int pupil_threshold_low_ = 5;    // 瞳孔二值化下界偏移（相对于最暗像素）
-    int pupil_threshold_high_ = 25;  // 瞳孔二值化上界偏移（相对于最暗像素）
+    int pupil_threshold_low_ = 0;    // 瞳孔二值化下界（0-255 绝对灰度阈值）
+    int pupil_threshold_high_ = 50;  // 瞳孔二值化上界（0-255 绝对灰度阈值）
 
     // ========== 内部方法 ==========
 
@@ -126,17 +151,12 @@ private:
 
     // 帧处理
     void process_frame(const cv::Mat& frame);
-    void process_frames(const cv::Mat& thresholded_strict,
-                         const cv::Mat& thresholded_medium,
-                         const cv::Mat& thresholded_relaxed,
-                         cv::Mat& frame);
 
-    // 阈值和遮罩
-    static cv::Mat apply_binary_threshold(const cv::Mat& image, int darkest_pixel_value, int added_threshold);
-    static cv::Mat mask_outside_square(const cv::Mat& image, cv::Point center, int size);
-
-    // 搜索最暗区域
-    std::optional<cv::Point> get_darkest_area(const cv::Mat& image, const cv::Mat& gray_frame);
+    // 搜索椭圆工具（调试接口与正式算法共用）
+    static std::optional<cv::RotatedRect> compute_search_ellipse(
+        int frame_w, int frame_h, const std::vector<int>& crop, double dark_search_roi_scale);
+    static std::optional<cv::Point> find_darkest_area_in_ellipse(
+        const cv::Mat& gray_frame, const cv::RotatedRect& search_ellipse);
 
     // 瞳孔轮廓处理
     static std::vector<cv::Point> filter_contours_by_area_and_return_largest(

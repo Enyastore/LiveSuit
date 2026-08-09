@@ -14,6 +14,8 @@ from eye_tracker_core_cpp import (
     GazeVectorTracker as _CppGazeVectorTracker,
     NormalizeResult,
     TrackingResult,
+    PupilDebugResult,
+    OpennessDebugResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -150,8 +152,8 @@ class GazeVectorTracker:
         contrast: float = 1.0,
         openness_threshold_low: int = 0,
         openness_threshold_high: int = 80,
-        pupil_threshold_low: int = 5,
-        pupil_threshold_high: int = 25,
+        pupil_threshold_low: int = 0,
+        pupil_threshold_high: int = 50,
     ):
         if crop is None:
             crop = [0, 0, frame_width, frame_height]
@@ -202,3 +204,30 @@ class GazeVectorTracker:
 
     def get_last_tracking_result(self):
         return self._impl.get_last_tracking_result()
+
+    # ---- 静态调试接口（与 C++ 正式算法共用实现）----
+
+    @staticmethod
+    def debug_pupil_detect(frame, pupil_threshold_low, pupil_threshold_high,
+                           dark_search_roi_scale, crop=None,
+                           area_thresh=200, ratio_thresh=4):
+        """瞳孔检测调试：返回 PupilDebugResult（二值图、最暗点、椭圆、优度）。
+
+        参数 frame 为预处理后的 BGR 帧（flip / 亮度 / 对比度已应用）。
+        crop 为可选 [x1, y1, x2, y2]，用于指定搜索椭圆位置；None 则用整帧中心。
+        """
+        return _CppGazeVectorTracker.debug_pupil_detect(
+            frame, pupil_threshold_low, pupil_threshold_high,
+            dark_search_roi_scale, list(crop or []), area_thresh, ratio_thresh)
+
+    @staticmethod
+    def debug_openness_detect(frame, openness_threshold_low, openness_threshold_high,
+                              blur_kernel, aggregation, dark_search_roi_scale,
+                              crop=None):
+        """眼睛开度检测调试：返回 OpennessDebugResult（二值图、上下聚合线、开度）。
+
+        aggregation 为 "median" 或 "average"。
+        """
+        return _CppGazeVectorTracker.debug_openness_detect(
+            frame, openness_threshold_low, openness_threshold_high,
+            blur_kernel, aggregation, dark_search_roi_scale, list(crop or []))

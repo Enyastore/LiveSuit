@@ -175,9 +175,9 @@ class CameraConfig:
     # 眼睛开闭检测双阈值（0-255）
     openness_threshold_low: int = 0
     openness_threshold_high: int = 80
-    # 瞳孔检测双阈值偏移（相对于最暗像素）
-    pupil_threshold_low: int = 5
-    pupil_threshold_high: int = 25
+    # 瞳孔检测双阈值（0-255 绝对灰度阈值）
+    pupil_threshold_low: int = 0
+    pupil_threshold_high: int = 50
 
 
 @dataclass
@@ -232,8 +232,8 @@ class ConfigPersistence:
                     contrast=left_data.get('contrast', 1.0),
                     openness_threshold_low=left_data.get('openness_threshold_low', 0),
                     openness_threshold_high=left_data.get('openness_threshold_high', 80),
-                    pupil_threshold_low=left_data.get('pupil_threshold_low', 5),
-                    pupil_threshold_high=left_data.get('pupil_threshold_high', 25),
+                    pupil_threshold_low=left_data.get('pupil_threshold_low', 0),
+                    pupil_threshold_high=left_data.get('pupil_threshold_high', 50),
                 ),
                 right=CameraConfig(
                     index=right_data.get('camera_index', 0),
@@ -249,8 +249,8 @@ class ConfigPersistence:
                     contrast=right_data.get('contrast', 1.0),
                     openness_threshold_low=right_data.get('openness_threshold_low', 0),
                     openness_threshold_high=right_data.get('openness_threshold_high', 80),
-                    pupil_threshold_low=right_data.get('pupil_threshold_low', 5),
-                    pupil_threshold_high=right_data.get('pupil_threshold_high', 25),
+                    pupil_threshold_low=right_data.get('pupil_threshold_low', 0),
+                    pupil_threshold_high=right_data.get('pupil_threshold_high', 50),
                 ),
             )
         except Exception as e:
@@ -371,7 +371,7 @@ class CropDebugWindow:
         self._openness_blur = 3
         self._openness_aggregation = "中位数"
 
-        # 瞳孔调试参数（双阈值偏移）
+        # 瞳孔调试参数（双阈值）
         self._pupil_low = cam_config.pupil_threshold_low
         self._pupil_high = cam_config.pupil_threshold_high
 
@@ -541,18 +541,18 @@ class CropDebugWindow:
         tk.Label(pupil_sliders, text="下界：", font=("", 7)).pack(side=tk.LEFT)
         self._pupil_low_var = tk.IntVar(value=self._pupil_low)
         tk.Scale(
-            pupil_sliders, from_=0, to=50, resolution=1,
+            pupil_sliders, from_=0, to=255, resolution=1,
             orient=tk.HORIZONTAL, variable=self._pupil_low_var,
-            length=120, showvalue=True,
+            length=140, showvalue=True,
             command=self._on_pupil_low_changed,
         ).pack(side=tk.LEFT)
 
         tk.Label(pupil_sliders, text="上界：", font=("", 7)).pack(side=tk.LEFT, padx=(8, 0))
         self._pupil_high_var = tk.IntVar(value=self._pupil_high)
         tk.Scale(
-            pupil_sliders, from_=1, to=100, resolution=1,
+            pupil_sliders, from_=1, to=255, resolution=1,
             orient=tk.HORIZONTAL, variable=self._pupil_high_var,
-            length=120, showvalue=True,
+            length=140, showvalue=True,
             command=self._on_pupil_high_changed,
         ).pack(side=tk.LEFT)
 
@@ -746,176 +746,85 @@ class CropDebugWindow:
         )
 
     def _compute_openness_binary_debug(self, frame, crop_rect=None):
-        """模拟 C++ compute_eye_openness 的双阈值 inRange 流程。"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        h, w = frame.shape[:2]
-        scale = self._cam_config.dark_search_roi_scale
-
-        if crop_rect is not None:
-            x1, y1, x2, y2 = crop_rect
-            cx_roi = (x1 + x2) // 2
-            cy_roi = (y1 + y2) // 2
-            cw = x2 - x1
-            ch = y2 - y1
-            rx = int((cw / 2.0) * scale)
-            ry = int((ch / 2.0) * scale)
-        else:
-            cx_roi, cy_roi = w // 2, h // 2
-            rx = int((w / 2.0) * scale)
-            ry = int((h / 2.0) * scale)
-
+        """从 C++ 获取开度二值化结果并渲染预览（算法在 C++，此处仅绘制叠加层）。"""
         blur = self._open_blur_var.get()
         if blur % 2 == 0:
             blur += 1
-        blurred = gray
-        if blur > 1:
-            blurred = cv2.GaussianBlur(gray, (blur, blur), 0)
+        agg = self._open_agg_var.get()
+        agg_map = {"平均值": "average", "中位数": "median"}
+        result = GazeVectorTracker.debug_openness_detect(
+            frame,
+            self._open_low_var.get(),
+            self._open_high_var.get(),
+            blur,
+            agg_map.get(agg, "median"),
+            self._cam_config.dark_search_roi_scale,
+            crop=list(crop_rect) if crop_rect else None,
+        )
+        if not result.valid:
+            h, w = frame.shape[:2]
+            blank = cv2.cvtColor(np.zeros((h, w), np.uint8), cv2.COLOR_GRAY2BGR)
+            return blank, 0.0, 0.0, 0.0
 
-        # 双阈值 inRange
-        low_val = self._open_low_var.get()
-        high_val = self._open_high_var.get()
-        if low_val >= high_val:
-            low_val, high_val = 0, 1
-        binary = cv2.inRange(blurred, low_val, high_val)
+        h, w = frame.shape[:2]
+        binary_bgr = cv2.cvtColor(result.masked, cv2.COLOR_GRAY2BGR)
 
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.ellipse(mask, (cx_roi, cy_roi), (max(rx, 1), max(ry, 1)), 0, 0, 360, 255, -1)
-        masked = cv2.bitwise_and(binary, mask)
+        cx, cy = int(result.roi_cx), int(result.roi_cy)
+        rx, ry = int(result.roi_rx), int(result.roi_ry)
+        cv2.ellipse(binary_bgr, (cx, cy), (max(rx, 1), max(ry, 1)), 0, 0, 360, (0, 200, 0), 1)
 
-        min_x = max(0, cx_roi - rx)
-        max_x = min(w, cx_roi + rx)
-        min_y = max(0, cy_roi - ry)
-        max_y = min(h, cy_roi + ry)
-
-        top_pts, bottom_pts = [], []
-        for col in range(min_x, max_x):
-            col_slice = masked[min_y:max_y, col]
-            fg = np.where(col_slice > 0)[0]
-            if len(fg) >= 2:
-                top_pts.append(float(min_y + fg[0]))
-                bottom_pts.append(float(min_y + fg[-1]))
-
-        top_agg, bottom_agg = 0.0, 0.0
-        raw_distance = 0.0
-        if top_pts and bottom_pts:
-            agg = self._open_agg_var.get()
-            if agg == "平均值":
-                top_agg = np.mean(top_pts)
-                bottom_agg = np.mean(bottom_pts)
-            else:
-                top_agg = float(np.median(top_pts))
-                bottom_agg = float(np.median(bottom_pts))
-            raw_distance = max(0.0, bottom_agg - top_agg)
-
-        binary_bgr = cv2.cvtColor(masked, cv2.COLOR_GRAY2BGR)
-        cv2.ellipse(binary_bgr, (cx_roi, cy_roi), (max(rx, 1), max(ry, 1)), 0, 0, 360, (0, 200, 0), 1)
+        top_agg, bottom_agg = result.top_agg, result.bottom_agg
         if top_agg > 0 and bottom_agg > 0:
+            min_x = max(0, cx - rx)
+            max_x = min(w, cx + rx)
             cv2.line(binary_bgr, (min_x, int(top_agg)), (max_x, int(top_agg)), (0, 255, 0), 2)
             cv2.line(binary_bgr, (min_x, int(bottom_agg)), (max_x, int(bottom_agg)), (0, 0, 255), 2)
             mid_x = (min_x + max_x) // 2
             cv2.line(binary_bgr, (mid_x, int(top_agg)), (mid_x, int(bottom_agg)), (255, 255, 0), 1)
-        return binary_bgr, top_agg, bottom_agg, raw_distance
+
+        return binary_bgr, top_agg, bottom_agg, result.raw_distance
 
     def _compute_pupil_binary_debug(self, frame, crop_rect=None):
-        """模拟 C++ 瞳孔双阈值二值化，并在二值图上拟合椭圆、计算 goodness。"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        h, w = frame.shape[:2]
-        scale = self._cam_config.dark_search_roi_scale
+        """从 C++ 获取瞳孔二值化/椭圆拟合结果并渲染预览（算法在 C++，此处仅绘制叠加层）。"""
+        result = GazeVectorTracker.debug_pupil_detect(
+            frame,
+            self._pupil_low_var.get(),
+            self._pupil_high_var.get(),
+            self._cam_config.dark_search_roi_scale,
+            crop=list(crop_rect) if crop_rect else None,
+            area_thresh=200,
+            ratio_thresh=4,
+        )
+        if not result.valid:
+            h, w = frame.shape[:2]
+            blank = cv2.cvtColor(np.zeros((h, w), np.uint8), cv2.COLOR_GRAY2BGR)
+            return blank, (0, 0), 0, None, 0.0, 0.0, 0.0
 
-        if crop_rect is not None:
-            x1, y1, x2, y2 = crop_rect
-            cx_roi = (x1 + x2) // 2
-            cy_roi = (y1 + y2) // 2
-            cw = x2 - x1
-            ch = y2 - y1
-            rx = int((cw / 2.0) * scale)
-            ry = int((ch / 2.0) * scale)
-        else:
-            cx_roi, cy_roi = w // 2, h // 2
-            rx = int((w / 2.0) * scale)
-            ry = int((h / 2.0) * scale)
-
-        # 找最暗点
-        blurred_gray = cv2.GaussianBlur(gray, (3, 3), 0)
-        min_val = 255
-        best_pt = (cx_roi, cy_roi)
-        for gy in range(10, h - 10, 5):
-            for gx in range(10, w - 10, 5):
-                v = int(blurred_gray[gy, gx])
-                if v < min_val:
-                    min_val = v
-                    best_pt = (gx, gy)
-
-        low_offset = self._pupil_low_var.get()
-        high_offset = self._pupil_high_var.get()
-        low_val = max(0, min(255, min_val + low_offset))
-        high_val = max(low_val + 1, min(255, min_val + high_offset))
-
-        pupil_binary = cv2.inRange(gray, low_val, high_val)
-
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.ellipse(mask, (cx_roi, cy_roi), (max(rx, 1), max(ry, 1)), 0, 0, 360, 255, -1)
-        masked = cv2.bitwise_and(pupil_binary, mask)
-
-        # ---- 椭圆拟合与 goodness 计算（参考原始 Python 算法） ----
-        ellipse_info = None  # ((cx, cy), (w, h), angle) or None
-        goodness_cover = 0.0  # 覆盖百分比
-        goodness_aspect = 0.0  # 椭圆长短轴比例接近圆程度
-        goodness_total = 0.0  # 综合分数
-
-        # 膨胀以连接轮廓
-        kernel = np.ones((5, 5), np.uint8)
-        dilated = cv2.dilate(masked, kernel, iterations=2)
-
-        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        # 筛选面积 >= 200、长宽比 <= 4 的最大轮廓
-        best_contour = None
-        best_area = 0
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area >= 200:
-                x, y, cw_c, ch_c = cv2.boundingRect(cnt)
-                ratio = max(cw_c, ch_c) / max(min(cw_c, ch_c), 1)
-                if ratio <= 4.0 and area > best_area:
-                    best_area = area
-                    best_contour = cnt
-
-        if best_contour is not None and len(best_contour) >= 5:
-            ellipse = cv2.fitEllipse(best_contour)
-            ellipse_info = ellipse
-            (el_cx, el_cy), (el_w, el_h), el_angle = ellipse
-
-            # ---- goodness 计算 ----
-            # 1) 椭圆内覆盖比例
-            el_mask = np.zeros_like(masked)
-            cv2.ellipse(el_mask, ellipse, 255, -1)
-            covered = np.sum((masked == 255) & (el_mask == 255))
-            el_area = np.sum(el_mask == 255)
-            goodness_cover = covered / max(el_area, 1)
-
-            # 2) 长短轴接近圆程度（0~1，1=正圆）
-            goodness_aspect = min(el_w, el_h) / max(el_w, el_h)
-
-            # 3) 综合（参考原始算法：cover * 面积因子近似）
-            goodness_total = goodness_cover * goodness_aspect * 100.0
-
-        # ---- 构建显示图像 ----
-        binary_bgr = cv2.cvtColor(masked, cv2.COLOR_GRAY2BGR)
+        binary_bgr = cv2.cvtColor(result.binary, cv2.COLOR_GRAY2BGR)
 
         # 画搜索区域椭圆（绿色）
-        cv2.ellipse(binary_bgr, (cx_roi, cy_roi), (max(rx, 1), max(ry, 1)), 0, 0, 360, (0, 200, 0), 1)
+        cx, cy = int(result.roi_cx), int(result.roi_cy)
+        rx, ry = int(result.roi_rx), int(result.roi_ry)
+        cv2.ellipse(binary_bgr, (cx, cy), (max(rx, 1), max(ry, 1)), 0, 0, 360, (0, 200, 0), 1)
 
         # 画最暗点（红色）
+        best_pt = (int(result.darkest_point.x), int(result.darkest_point.y))
         cv2.circle(binary_bgr, best_pt, 4, (0, 0, 255), -1)
 
         # 画拟合椭圆（青色），仅当拟合成功
-        if ellipse_info is not None:
+        ellipse_info = None
+        if result.ellipse_found:
+            ellipse_info = (
+                (float(result.ellipse_center.x), float(result.ellipse_center.y)),
+                (float(result.ellipse_axes.x), float(result.ellipse_axes.y)),
+                float(result.ellipse_angle),
+            )
             cv2.ellipse(binary_bgr, ellipse_info, (255, 255, 0), 2)  # 青色
-            # 标记椭圆中心
-            cv2.circle(binary_bgr, (int(ellipse_info[0][0]), int(ellipse_info[0][1])), 3, (255, 255, 0), -1)
+            cv2.circle(binary_bgr, (int(ellipse_info[0][0]), int(ellipse_info[0][1])),
+                       3, (255, 255, 0), -1)
 
-        return binary_bgr, best_pt, min_val, ellipse_info, goodness_cover, goodness_aspect, goodness_total
+        return (binary_bgr, best_pt, result.darkest_pixel_value, ellipse_info,
+                result.goodness_cover, result.goodness_aspect, result.goodness_total)
 
     def _resize_binary_view(self, binary_bgr):
         debug_h, debug_w = binary_bgr.shape[:2]
@@ -1752,8 +1661,8 @@ def _run_tracker_in_process(
     contrast: float = 1.0,
     openness_threshold_low: int = 0,
     openness_threshold_high: int = 80,
-    pupil_threshold_low: int = 5,
-    pupil_threshold_high: int = 25,
+    pupil_threshold_low: int = 0,
+    pupil_threshold_high: int = 50,
 ) -> None:
     tracker = GazeVectorTracker(
         cam_index=cam_index, flip=flip, crop=crop, side=side,
