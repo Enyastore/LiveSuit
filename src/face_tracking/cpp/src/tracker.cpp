@@ -88,6 +88,9 @@ void GazeVectorTracker::reset_tracking_state() {
     last_sphere_radius_ellipse_.reset();
     stored_intersections_.clear();
     last_tracking_result_ = TrackingResult{};
+    last_valid_eye_x_.reset();
+    last_valid_eye_y_.reset();
+    last_valid_gaze_rotated_.clear();
 }
 
 
@@ -439,10 +442,20 @@ void GazeVectorTracker::process_frame(const cv::Mat& frame) {
     // 眼睛开度检测 — 在瞳孔追踪之前执行
     raw_eye_openness_ = compute_eye_openness(gray_frame);
 
-    // 开度低于阈值 → 跳过整个眼追流水线
+    // 开度低于阈值 → 跳过瞳孔/注视流水线（保留开度推送与标定线绘制）
     if (eye_openness_skip_threshold_ > 0.0 && raw_eye_openness_ < eye_openness_skip_threshold_) {
         last_tracking_result_ = TrackingResult{};
         last_tracking_result_.raw_eye_openness = raw_eye_openness_;
+
+        // 仍向外部推送开度；eye_x/eye_y 保持上次有效值（不跳变、不丢失）
+        push_result(std::nullopt, std::nullopt, std::nullopt, 0.0);
+
+        // 画面始终播放；仅绘制搜索椭圆与开度标定线，不绘制瞳孔/眼球/注视
+        if (!headless_) {
+            draw_debug_overlay(processed_frame, cv::Point(0, 0), std::nullopt,
+                               -1, -1, std::nullopt, std::nullopt, 0.0,
+                               NormalizeResult{}, false);
+        }
         return;
     }
 
@@ -507,6 +520,17 @@ void GazeVectorTracker::process_frame(const cv::Mat& frame) {
 
     if (center_x == -1 || center_y == -1) {
         last_tracking_result_ = TrackingResult{};
+        last_tracking_result_.raw_eye_openness = raw_eye_openness_;
+
+        // 瞳孔未检出（半闭眼遮挡等）→ 仍推送开度；eye_x/eye_y 保持上次有效值
+        push_result(std::nullopt, std::nullopt, std::nullopt, 0.0);
+
+        // 画面始终播放；仅绘制搜索椭圆与开度标定线
+        if (!headless_) {
+            draw_debug_overlay(processed_frame, cv::Point(0, 0), std::nullopt,
+                               -1, -1, std::nullopt, std::nullopt, 0.0,
+                               NormalizeResult{}, false);
+        }
         return;
     }
 
@@ -1157,25 +1181,47 @@ GazeVectorTracker::compute_gaze_vector(
     std::vector<double> gaze_list = {gaze_rotated.x, gaze_rotated.y, gaze_rotated.z};
     NormalizeResult norm_result = normalizer_.normalize(side_, gaze_list);
 
-    // 将结果发送至python队列
-    if (!py_result_queue_.is_none()) {
-        try {
-            py::dict result;
-            result["side"] = side_;
-            py::list gaze_list_py;
-            for (double v : gaze_list) {
-                gaze_list_py.append(v);
-            }
-            result["gaze_rotated"] = gaze_list_py;
-            result["eye_x"] = norm_result.eye_x.has_value() ? py::cast(*norm_result.eye_x) : py::none();
-            result["eye_y"] = norm_result.eye_y.has_value() ? py::cast(*norm_result.eye_y) : py::none();
-            result["confidence"] = confidence_ratio;
-            result["raw_eye_openness"] = last_tracking_result_.raw_eye_openness;
-            py_result_queue_.attr("put_nowait")(result);
-        } catch (...) {}
-    }
+    // 将结果发送至python队列（唯一出口；eye_x/eye_y 无有效值时保持上次有效值）
+    push_result(gaze_list, norm_result.eye_x, norm_result.eye_y, confidence_ratio);
 
     return {sphere_center, gaze_rotated, norm_result};
+}
+
+// ================================================================
+// 推送结果到 Python 队列（唯一出口）
+// 低开度/瞳孔缺失时 eye_x/eye_y 无新值 → 保持上次有效值，
+// 保证外部模块时刻都能读到有效的归一化参数（不跳变、不丢失）。
+// ================================================================
+
+void GazeVectorTracker::push_result(
+    const std::optional<std::vector<double>>& gaze_rotated,
+    const std::optional<double>& eye_x,
+    const std::optional<double>& eye_y,
+    double confidence)
+{
+    // 有有效新值则更新缓存
+    if (gaze_rotated.has_value() && gaze_rotated->size() == 3) {
+        last_valid_gaze_rotated_ = *gaze_rotated;
+    }
+    if (eye_x.has_value()) last_valid_eye_x_ = *eye_x;
+    if (eye_y.has_value()) last_valid_eye_y_ = *eye_y;
+
+    if (py_result_queue_.is_none()) return;
+
+    try {
+        py::dict result;
+        result["side"] = side_;
+        py::list gaze_list_py;
+        for (double v : last_valid_gaze_rotated_) {
+            gaze_list_py.append(v);
+        }
+        result["gaze_rotated"] = gaze_list_py;
+        result["eye_x"] = last_valid_eye_x_.has_value() ? py::cast(*last_valid_eye_x_) : py::none();
+        result["eye_y"] = last_valid_eye_y_.has_value() ? py::cast(*last_valid_eye_y_) : py::none();
+        result["confidence"] = confidence;
+        result["raw_eye_openness"] = last_tracking_result_.raw_eye_openness;
+        py_result_queue_.attr("put_nowait")(result);
+    } catch (...) {}
 }
 
 // ================================================================
@@ -1189,9 +1235,10 @@ void GazeVectorTracker::draw_debug_overlay(
     const std::optional<cv::Point3f>& center_3d,
     const std::optional<cv::Point3f>& gaze_rotated,
     double best_ratio_under_ellipse,
-    const NormalizeResult& norm_result)
+    const NormalizeResult& norm_result,
+    bool draw_tracking_details)
 {
-    // 绘制搜索椭圆
+    // 绘制搜索椭圆（始终绘制，含开度标定红/绿/青线）
     if (last_search_ellipse_.has_value()) {
         cv::ellipse(frame, *last_search_ellipse_, cv::Scalar(0, 200, 0), 2);
 
@@ -1222,89 +1269,92 @@ void GazeVectorTracker::draw_debug_overlay(
         }
     }
 
-    // 绘制2D眼球
-    cv::circle(frame, model_center_average, (int)max_observed_distance_,
-               cv::Scalar(255, 50, 50), 2);
-    cv::circle(frame, model_center_average, 8, cv::Scalar(255, 255, 0), -1);
+    // 瞳孔/眼球/注视等追踪细节仅在正常流水线时绘制（低开度跳过时关闭）
+    if (draw_tracking_details) {
+        // 绘制2D眼球
+        cv::circle(frame, model_center_average, (int)max_observed_distance_,
+                   cv::Scalar(255, 50, 50), 2);
+        cv::circle(frame, model_center_average, 8, cv::Scalar(255, 255, 0), -1);
 
-    if (final_rotated_rect.has_value() && center_x >= 0 && center_y >= 0) {
-        cv::line(frame, model_center_average, cv::Point(center_x, center_y),
-                 cv::Scalar(255, 150, 50), 2);
-    }
-
-    if (final_rotated_rect.has_value()) {
-        cv::ellipse(frame, *final_rotated_rect, cv::Scalar(20, 255, 255), 2);
-    }
-
-    if (final_rotated_rect.has_value() && center_x >= 0 && center_y >= 0) {
-        int dx = center_x - model_center_average.x;
-        int dy = center_y - model_center_average.y;
-        int ext_x = model_center_average.x + 2 * dx;
-        int ext_y = model_center_average.y + 2 * dy;
-        cv::line(frame, cv::Point(center_x, center_y), cv::Point(ext_x, ext_y),
-                 cv::Scalar(200, 255, 0), 3);
-    }
-
-    if (center_3d.has_value() && gaze_rotated.has_value()) {
-        char origin_text[128];
-        std::snprintf(origin_text, sizeof(origin_text),
-                      "Origin: (%.2f, %.2f, %.2f)",
-                      center_3d->x, center_3d->y, center_3d->z);
-        char dir_text[128];
-        std::snprintf(dir_text, sizeof(dir_text),
-                      "Direction: (%.2f, %.2f, %.2f)",
-                      gaze_rotated->x, gaze_rotated->y, gaze_rotated->z);
-
-        cv::putText(frame, origin_text, cv::Point(12, frame.rows - 38),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 3);
-        cv::putText(frame, dir_text, cv::Point(12, frame.rows - 13),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 3);
-        cv::putText(frame, origin_text, cv::Point(10, frame.rows - 40),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
-        cv::putText(frame, dir_text, cv::Point(10, frame.rows - 15),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
-    }
-
-    // 归一化输出HUD
-    if (!norm_result.missing.empty()) {
-        std::string msg = "Insufficient extreme vectors! (";
-        for (size_t i = 0; i < norm_result.missing.size(); ++i) {
-            if (i > 0) msg += ", ";
-            msg += norm_result.missing[i];
+        if (final_rotated_rect.has_value() && center_x >= 0 && center_y >= 0) {
+            cv::line(frame, model_center_average, cv::Point(center_x, center_y),
+                     cv::Scalar(255, 150, 50), 2);
         }
-        msg += ") is missing.";
-        cv::putText(frame, msg, cv::Point(10, frame.rows - 65),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 3);
-        cv::putText(frame, msg, cv::Point(10, frame.rows - 65),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
-    } else if (norm_result.eye_x.has_value() && norm_result.eye_y.has_value()) {
-        char norm_text[128];
-        std::snprintf(norm_text, sizeof(norm_text),
-                      "Eye X: %+.3f   Eye Y: %+.3f",
-                      *norm_result.eye_x, *norm_result.eye_y);
-        cv::putText(frame, norm_text, cv::Point(10, frame.rows - 65),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 3);
-        cv::putText(frame, norm_text, cv::Point(10, frame.rows - 65),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
+
+        if (final_rotated_rect.has_value()) {
+            cv::ellipse(frame, *final_rotated_rect, cv::Scalar(20, 255, 255), 2);
+        }
+
+        if (final_rotated_rect.has_value() && center_x >= 0 && center_y >= 0) {
+            int dx = center_x - model_center_average.x;
+            int dy = center_y - model_center_average.y;
+            int ext_x = model_center_average.x + 2 * dx;
+            int ext_y = model_center_average.y + 2 * dy;
+            cv::line(frame, cv::Point(center_x, center_y), cv::Point(ext_x, ext_y),
+                     cv::Scalar(200, 255, 0), 3);
+        }
+
+        if (center_3d.has_value() && gaze_rotated.has_value()) {
+            char origin_text[128];
+            std::snprintf(origin_text, sizeof(origin_text),
+                          "Origin: (%.2f, %.2f, %.2f)",
+                          center_3d->x, center_3d->y, center_3d->z);
+            char dir_text[128];
+            std::snprintf(dir_text, sizeof(dir_text),
+                          "Direction: (%.2f, %.2f, %.2f)",
+                          gaze_rotated->x, gaze_rotated->y, gaze_rotated->z);
+
+            cv::putText(frame, origin_text, cv::Point(12, frame.rows - 38),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 3);
+            cv::putText(frame, dir_text, cv::Point(12, frame.rows - 13),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 3);
+            cv::putText(frame, origin_text, cv::Point(10, frame.rows - 40),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
+            cv::putText(frame, dir_text, cv::Point(10, frame.rows - 15),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
+        }
+
+        // 归一化输出HUD
+        if (!norm_result.missing.empty()) {
+            std::string msg = "Insufficient extreme vectors! (";
+            for (size_t i = 0; i < norm_result.missing.size(); ++i) {
+                if (i > 0) msg += ", ";
+                msg += norm_result.missing[i];
+            }
+            msg += ") is missing.";
+            cv::putText(frame, msg, cv::Point(10, frame.rows - 65),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 3);
+            cv::putText(frame, msg, cv::Point(10, frame.rows - 65),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
+        } else if (norm_result.eye_x.has_value() && norm_result.eye_y.has_value()) {
+            char norm_text[128];
+            std::snprintf(norm_text, sizeof(norm_text),
+                          "Eye X: %+.3f   Eye Y: %+.3f",
+                          *norm_result.eye_x, *norm_result.eye_y);
+            cv::putText(frame, norm_text, cv::Point(10, frame.rows - 65),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 3);
+            cv::putText(frame, norm_text, cv::Point(10, frame.rows - 65),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
+        }
+
+        char ratio_text[32];
+        std::snprintf(ratio_text, sizeof(ratio_text), "%.2f%%", best_ratio_under_ellipse * 100);
+        cv::putText(frame, ratio_text, cv::Point(12, 32),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 0, 0), 4);
+        cv::putText(frame, ratio_text, cv::Point(10, 30),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
+
+        // 显示开闭检测双阈值信息
+        char openness_info[128];
+        std::snprintf(openness_info, sizeof(openness_info),
+                      "Openness: [%d, %d] lo=%d hi=%d",
+                      eye_openness_threshold_low_, eye_openness_threshold_high_,
+                      pupil_threshold_low_, pupil_threshold_high_);
+        cv::putText(frame, openness_info, cv::Point(12, 52),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 0), 3);
+        cv::putText(frame, openness_info, cv::Point(10, 50),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(200, 255, 200), 1);
     }
-
-    char ratio_text[32];
-    std::snprintf(ratio_text, sizeof(ratio_text), "%.2f%%", best_ratio_under_ellipse * 100);
-    cv::putText(frame, ratio_text, cv::Point(12, 32),
-                cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 0, 0), 4);
-    cv::putText(frame, ratio_text, cv::Point(10, 30),
-                cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
-
-    // 显示开闭检测双阈值信息
-    char openness_info[128];
-    std::snprintf(openness_info, sizeof(openness_info),
-                  "Openness: [%d, %d] lo=%d hi=%d",
-                  eye_openness_threshold_low_, eye_openness_threshold_high_,
-                  pupil_threshold_low_, pupil_threshold_high_);
-    cv::putText(frame, openness_info, cv::Point(12, 52),
-                cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 0), 3);
-    cv::putText(frame, openness_info, cv::Point(10, 50),
-                cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(200, 255, 200), 1);
 
     cv::imshow(win_name_, frame);
 }

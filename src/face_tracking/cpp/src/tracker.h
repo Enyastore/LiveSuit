@@ -115,6 +115,11 @@ private:
     TrackingResult last_tracking_result_;
     std::vector<cv::Point> stored_intersections_;
 
+    // ========== 上次有效值（低开度跳过时保持，保证外部始终可读） ==========
+    std::optional<double> last_valid_eye_x_;            // 最近一次有效归一化 X
+    std::optional<double> last_valid_eye_y_;            // 最近一次有效归一化 Y
+    std::vector<double> last_valid_gaze_rotated_;       // 最近一次有效注视向量
+
     // ========== 眼球锁定状态 ==========
     bool sphere_radius_locked_ = false;
     double locked_sphere_radius_ = 0;
@@ -195,6 +200,12 @@ private:
     std::tuple<std::optional<cv::Point3f>, std::optional<cv::Point3f>, NormalizeResult>
     compute_gaze_vector(int x, int y, int center_x, int center_y, double confidence_ratio);
 
+    // 推送结果到Python队列（唯一出口；eye_x/eye_y/gaze 无有效值时保持上次有效值）
+    void push_result(const std::optional<std::vector<double>>& gaze_rotated,
+                     const std::optional<double>& eye_x,
+                     const std::optional<double>& eye_y,
+                     double confidence);
+
     // 绘制调试层
     void draw_debug_overlay(cv::Mat& frame, cv::Point model_center_average,
                              const std::optional<cv::RotatedRect>& final_rotated_rect,
@@ -202,7 +213,8 @@ private:
                              const std::optional<cv::Point3f>& center_3d,
                              const std::optional<cv::Point3f>& gaze_rotated,
                              double best_ratio_under_ellipse,
-                             const NormalizeResult& norm_result);
+                             const NormalizeResult& norm_result,
+                             bool draw_tracking_details = true);
 
     // ========== 眼睛开度检测 ==========
     double compute_eye_openness(const cv::Mat& gray_frame);
