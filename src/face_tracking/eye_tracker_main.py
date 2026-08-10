@@ -17,11 +17,17 @@
   module.enter_headless_mode()
   module.exit_headless_mode()
   module.headless_runtime
+
+调试面板（脚本独立运行或由其他模块唤起）：
+  python eye_tracker_main.py                # 独立运行
+  module = launch_debug_panel()             # 程序化唤起（自动创建 Tk 根窗口）
+  module = launch_debug_panel(master=root)  # 挂载到已有 Tk 根窗口（Toplevel 子面板）
 """
 
 __all__ = [
     "EyeTrackingModule",
     "detect_cameras",
+    "launch_debug_panel",
     "AppConfig",
     "CameraConfig",
 ]
@@ -36,6 +42,7 @@ import threading
 import queue
 import os
 import subprocess
+import sys
 import time
 import logging
 import re
@@ -1701,23 +1708,18 @@ def detect_cameras(max_cams: int = 6) -> List[int]:
 # 调试入口
 # ============================================================
 
-if __name__ == "__main__":
-    multiprocessing.set_start_method("spawn", force=True)
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    )
+def _build_debug_panel(module: EyeTrackingModule, window: tk.Widget,
+                       cameras: List[int], stop_on_close: bool = True) -> None:
+    """在给定窗口上构建眼球追踪调试面板 UI。
 
-    cameras = detect_cameras()
-    if not cameras:
-        print("Error: 没有可用相机")
-        exit(1)
-    print(f"可用相机: {cameras}")
-
-    root = tk.Tk()
-    root.title("眼球追踪模块 — 调试面板")
-    module = EyeTrackingModule(headless=False, master=root)
-
-    frame_select = tk.Frame(root)
+    module   : 面板绑定的模块实例（必须 headless=False）。
+    window   : 面板容器，独立运行时为 Tk 根窗口，嵌入其他应用时为 Toplevel。
+    cameras  : 可用相机索引列表（用于左右眼相机下拉框）。
+    stop_on_close : 关闭面板时是否调用 module.stop()。独立运行（面板即主
+        窗口）为 True；作为子面板嵌入其他应用时为 False，仅销毁面板窗口，
+        追踪进程继续运行。
+    """
+    frame_select = tk.Frame(window)
     frame_select.pack(pady=(10, 5))
     tk.Label(frame_select, text="左眼相机").pack(side=tk.LEFT, padx=(10, 5))
     cam_left = ttk.Combobox(frame_select, values=cameras, state="readonly", width=8)
@@ -1738,7 +1740,7 @@ if __name__ == "__main__":
     _set_combo(cam_right, module.config.right.index)
     cam_right.pack(side=tk.LEFT, padx=(0, 10))
 
-    frame_debug = tk.Frame(root)
+    frame_debug = tk.Frame(window)
     frame_debug.pack(pady=5)
 
     btn_debug_left = tk.Button(frame_debug, text="调试剪裁左眼相机", command=lambda: _open_crop_left())
@@ -1762,7 +1764,7 @@ if __name__ == "__main__":
         btn_debug_left.config(state=state)
         btn_debug_right.config(state=state)
 
-    frame_action = tk.Frame(root)
+    frame_action = tk.Frame(window)
     frame_action.pack(pady=(5, 10))
 
     def _start():
@@ -1776,7 +1778,9 @@ if __name__ == "__main__":
         module.stop()
         _set_debug_enabled(True)
 
-    btn_text = tk.StringVar(value="开始眼球追踪")
+    btn_text = tk.StringVar(
+        value="停止眼球追踪" if module.is_running() else "开始眼球追踪"
+    )
 
     def _toggle():
         if module.is_running():
@@ -1788,10 +1792,13 @@ if __name__ == "__main__":
 
     tk.Button(frame_action, textvariable=btn_text, command=_toggle, width=14).pack(side=tk.LEFT, padx=10)
 
-    frame_display = tk.Frame(root)
+    frame_display = tk.Frame(window)
     frame_display.pack(pady=(0, 10))
 
-    display_btn_text = tk.StringVar(value="隐藏OpenCV")
+    display_btn_text = tk.StringVar(
+        value="显示OpenCV" if module.headless_runtime else "隐藏OpenCV"
+    )
+
     def _toggle_display():
         if module.headless_runtime:
             module.exit_headless_mode()
@@ -1805,8 +1812,81 @@ if __name__ == "__main__":
     ).pack(side=tk.LEFT, padx=5)
 
     def _on_close():
-        module.stop()
-        root.destroy()
+        if stop_on_close:
+            module.stop()
+        window.destroy()
 
-    root.protocol("WM_DELETE_WINDOW", _on_close)
-    root.mainloop()
+    window.protocol("WM_DELETE_WINDOW", _on_close)
+
+
+def launch_debug_panel(
+    master: Optional[tk.Tk] = None,
+    config_path: str = "config.yaml",
+    refs_file: str = "references.yaml",
+) -> EyeTrackingModule:
+    """创建并显示眼球追踪调试面板，返回绑定该面板的模块实例。
+
+    脚本独立运行时由 main() 调用；其他模块 ``import eye_tracker_main``
+    后也可调用，从而在模块被调用时唤起调试面板。
+
+    Parameters
+    ----------
+    master : tk.Tk | None
+        为 None 时自动创建并拥有一个 Tk 根窗口，面板直接构建在该窗口上，
+        调用方需执行 ``module._master.mainloop()`` 进入事件循环。
+        传入已有 Tk 根窗口（例如调用方自身的主窗口）时，面板以 Toplevel
+        顶层窗口形式挂载，关闭面板不会停止追踪，也不会销毁调用方主窗口。
+    config_path : str
+        相机配置文件的路径，传给 EyeTrackingModule。
+    refs_file : str
+        参考值文件路径，传给 EyeTrackingModule。
+
+    Returns
+    -------
+    EyeTrackingModule
+        已构建调试面板（未 start）的模块实例。
+    """
+    cameras = detect_cameras()
+    if not cameras:
+        print("Error: 没有可用相机")
+        raise RuntimeError("没有可用相机")
+    print(f"可用相机: {cameras}")
+
+    if master is None:
+        root = tk.Tk()
+        root.title("眼球追踪模块 — 调试面板")
+        module = EyeTrackingModule(
+            headless=False, master=root,
+            config_path=config_path, refs_file=refs_file,
+        )
+        _build_debug_panel(module, root, cameras, stop_on_close=True)
+    else:
+        module = EyeTrackingModule(
+            headless=False, master=master,
+            config_path=config_path, refs_file=refs_file,
+        )
+        panel = tk.Toplevel(master)
+        panel.title("眼球追踪模块 — 调试面板")
+        _build_debug_panel(module, panel, cameras, stop_on_close=False)
+    return module
+
+
+def main() -> int:
+    """脚本独立运行时入口（``python eye_tracker_main.py``）。"""
+    multiprocessing.set_start_method("spawn", force=True)
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    )
+    try:
+        module = launch_debug_panel()
+    except RuntimeError as exc:
+        print(f"Error: {exc}")
+        return 1
+    master = module._master
+    assert master is not None
+    master.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
