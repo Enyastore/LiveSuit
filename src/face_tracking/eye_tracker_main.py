@@ -1417,7 +1417,10 @@ class EyeTrackingModule:
 
         self._cmd_queue_left = multiprocessing.Queue()
         self._cmd_queue_right = multiprocessing.Queue()
-        self._result_queue = multiprocessing.Queue()
+        # maxsize 限制积压深度：C++ 侧 put_nowait 在队列满时抛异常并被静默
+        # 丢弃，保证 Python 侧读到的始终是最近几帧的数据，避免 GIL 竞争
+        # （Canvas 绘制持锁）导致队列无限积压、数据延迟 1s+。
+        self._result_queue = multiprocessing.Queue(maxsize=5)
 
         self._process_left = multiprocessing.Process(
             target=_run_tracker_in_process,
@@ -1497,40 +1500,53 @@ class EyeTrackingModule:
             return
 
         while not self._result_stop.is_set():
-            try:
-                data = result_queue.get(timeout=0.01)
-            except queue.Empty:
+            # 非阻塞快速排空队列积压：Tkinter 主线程绘制 Canvas 期间持锁，
+            # 本线程可能被 GIL 长时间阻塞；每次被调度时一次性消费掉所有积压
+            # 帧并只保留左右眼各自的最新一帧，保证 _latest_state 始终接近实时。
+            latest: dict = {}
+            while True:
+                try:
+                    data = result_queue.get_nowait()
+                except queue.Empty:
+                    break
+                except Exception:
+                    break
+                if data is None or data.get("side") is None:
+                    continue
+                latest[data["side"]] = data  # 后写入覆盖先写入，天然取最新
+
+            if not latest:
+                time.sleep(0.002)  # 队列为空，短暂休眠避免忙轮询空转
                 continue
-            except Exception:
-                continue
 
-            side = data.get("side")
-            if side is None:
-                continue
-            self._raw_gaze[side] = data.get("gaze_rotated")
+            for side in ("left", "right"):
+                data = latest.get(side)
+                if data is None:
+                    continue
+                self._raw_gaze[side] = data.get("gaze_rotated")
 
-            raw_openness = data.get("raw_eye_openness", None)
+                raw_openness = data.get("raw_eye_openness", None)
 
-            # 计算归一化 eye_o
-            eye_o = None
-            if raw_openness is not None and isinstance(raw_openness, (int, float)) and raw_openness > 0:
-                open_ref = openness_normalizer.get_openness_ref(side, "open")
-                close_ref = openness_normalizer.get_openness_ref(side, "close")
-                if open_ref is not None and close_ref is not None and open_ref > close_ref:
-                    eye_o = (raw_openness - close_ref) / (open_ref - close_ref)
-                    eye_o = max(0.0, min(1.0, eye_o))
+                # 计算归一化 eye_o
+                eye_o = None
+                if raw_openness is not None and isinstance(raw_openness, (int, float)) and raw_openness > 0:
+                    open_ref = openness_normalizer.get_openness_ref(side, "open")
+                    close_ref = openness_normalizer.get_openness_ref(side, "close")
+                    if open_ref is not None and close_ref is not None and open_ref > close_ref:
+                        eye_o = (raw_openness - close_ref) / (open_ref - close_ref)
+                        eye_o = max(0.0, min(1.0, eye_o))
 
-            # 快照式整体替换：读者拿到的始终是同一次更新的一致快照
-            new_state = dict(self._latest_state)
-            new_state[side] = {
-                "eye_x": data.get("eye_x"),
-                "eye_y": data.get("eye_y"),
-                "confidence": data.get("confidence"),
-                "raw_eye_openness": raw_openness,
-                "eye_o": eye_o,
-            }
-            new_state["timestamp"] = time.time()
-            self._latest_state = new_state
+                # 快照式整体替换：读者拿到的始终是同一次更新的一致快照
+                new_state = dict(self._latest_state)
+                new_state[side] = {
+                    "eye_x": data.get("eye_x"),
+                    "eye_y": data.get("eye_y"),
+                    "confidence": data.get("confidence"),
+                    "raw_eye_openness": raw_openness,
+                    "eye_o": eye_o,
+                }
+                new_state["timestamp"] = time.time()
+                self._latest_state = new_state
 
     def _stop_internal(self) -> None:
         if self._control_panel is not None:
