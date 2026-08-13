@@ -14,33 +14,40 @@
 
 ## 文件结构（自上而下）
 
-| 行区 | 内容 |
+| 内容 | 职责 |
 |---|---|
-| 59-162 | 相机工具函数：`_setup_camera` / `probe_camera_modes` / `mode_to_label` / `match_current_mode` |
-| 164-195 | 数据模型：`CameraConfig` / `AppConfig` |
-| 197-313 | 配置持久化：`ConfigPersistence` |
-| 315-978 | 裁剪/阈值调试窗口：`CropDebugWindow` |
-| 981-1294 | 控制面板：`ControlPanel` |
-| 1297-1656 | 核心编排：`EyeTrackingModule` |
-| 1658-1704 | 子进程入口：`_run_tracker_in_process`、相机探测：`detect_cameras` |
-| 1707-1871 | 调试面板构建：`_build_debug_panel`、公共入口：`launch_debug_panel` |
-| 1874-1892 | 独立脚本入口：`main()` |
+| 工具函数 `_setup_camera` / `probe_camera_modes` / `mode_to_label` / `match_current_mode` | 相机打开与模式探测 |
+| 数据模型 `CameraConfig` / `AppConfig` | 相机配置数据 |
+| `ConfigPersistence` | `config.yaml` 读写 |
+| `CropDebugWindow` | 单眼裁剪/阈值调试窗口 |
+| `ControlPanel` | 锁定/标定控制面板 |
+| `EyeTrackingModule` | 核心编排，对外唯一入口 |
+| `_run_tracker_in_process` / `detect_cameras` | 追踪子进程入口 / 相机探测 |
+| `_build_debug_panel` / `launch_debug_panel` / `main` | 调试面板 / 公共入口 / 独立运行 |
 
 ## 快速上手
 
 ```python
-# ① 直接运行：自带调试面板
+# ① 独立运行：自带调试面板
 python eye_tracker_main.py
 
 # ② 无 UI 编程使用
 from eye_tracker_main import EyeTrackingModule
-with EyeTrackingModule(headless=True, config_path="config.yaml") as mod:
+with EyeTrackingModule(headless=True) as mod:
     mod.start()
-    state = mod.get_normalized_eye_state()   # 每帧读取结果
+    state = mod.get_normalized_eye_state()   # 轮询读取实时快照 {left,right,timestamp}
 
-# ③ 被其他模块调用时唤起调试面板
-module = launch_debug_panel(master=root)    # 挂载到已有 Tk 主窗口（Toplevel 子面板，关面板不停止追踪）
-module = launch_debug_panel()               # 自建 Tk 根窗口（需 module._master.mainloop()）
+# ③ 外部脚本集成：按钮唤起面板 → 用户配置相机 → 面板点「开始」→ 实时取结果
+import tkinter as tk
+from eye_tracker_main import launch_debug_panel
+
+root = tk.Tk()
+mod = launch_debug_panel(master=root)   # 面板挂到已有主窗口（Toplevel）；关面板不停追踪
+root.mainloop()
+# 任意时刻读取：state = mod.get_normalized_eye_state()
+
+# ④ 不带主窗口，由模块自建根窗口（需自行 mainloop）
+mod = launch_debug_panel()              # module._master.mainloop()
 ```
 
 ## 数据模型与配置
@@ -107,26 +114,24 @@ ControlPanel / CropDebugWindow ──lock_radius / lock_center / 阈值 / 标定
 ## 调试 UI
 
 ### `CropDebugWindow`（Toplevel）
-单眼相机调试窗口：实时画面 + 固定比例(4:3)剪裁 + 垂直翻转 + 明度/对比度 + 分辨率模式下拉 +
-搜索区域比例；右侧为开度/瞳孔二值化调试视口与双阈值滑块（改动实时经 `cmd_queue` 下发子进程）。
-- 构造参数：`(master, cam_index, side, cam_config, on_config_changed, cmd_queue)`；由 `EyeTrackingModule.open_crop_window()` 创建。
-- 关键方法：`close()` / `get_window()`。
+单眼相机调试窗口：实时画面 + 4:3 剪裁 + 翻转 + 明度/对比度 + 分辨率下拉 + 搜索区域；
+右侧为开度/瞳孔二值化调试视口与双阈值滑块（实时经 `cmd_queue` 下发子进程）。
+由 `EyeTrackingModule.open_crop_window()` 创建；方法：`close()` / `get_window()`。
 
 ### `ControlPanel`（Toplevel）
-双眼锁定/标定面板：锁定/解锁眼球半径与中心、十字方向注视极值向量保存（up/down/inner/outer）、
-完全睁眼/闭眼开度参考标定（写入模块共享 Normalizer）、清除参考、最低开度跳过阈值、实时输出显示。
-- 构造参数：`(master, cmd_queue_left, cmd_queue_right, gaze_reader, openness_normalizer, module)`；由 `open_control_panel()` 创建。
-- 关键方法：`destroy()` / `is_open()`。
+双眼锁定/标定面板：锁定半径与中心、注视极值向量（up/down/inner/outer）、
+完全睁眼/闭眼开度标定（写模块共享 Normalizer）、清除参考、最低开度跳过阈值、实时输出。
+由 `open_control_panel()` 创建；方法：`destroy()` / `is_open()`。
 
 ### `_build_debug_panel(module, window, cameras, stop_on_close)`（内部）
-把调试面板 UI 构建到 `window`（Tk 根窗口或 Toplevel）上：左右眼相机下拉框、开始/停止、
+把调试面板 UI 构建到 `window`（Tk 根窗口或 Toplevel）上：左右相机下拉、开始/停止、
 调试剪裁、隐藏/显示 OpenCV。`stop_on_close=True` 时关窗会调 `module.stop()`。
 由 `launch_debug_panel()` 调用，外部一般无需直接使用。
 
 ## 独立入口与调用关系
 
-- `launch_debug_panel(master, config_path, refs_file) -> EyeTrackingModule`：公共入口。`master=None` 自建根窗口（`stop_on_close=True`）；`master=<Tk>` 挂 Toplevel 子面板（`stop_on_close=False`）。无可用相机时抛 `RuntimeError`。
-- `main()`：设置 `multiprocessing` spawn 与 logging → `launch_debug_panel()` → `module._master.mainloop()`；无相机时打印 `Error: 没有可用相机` 并返回 1。`if __name__ == "__main__"` 调 `sys.exit(main())`。
+- `launch_debug_panel(master, config_path, refs_file) -> EyeTrackingModule`：公共入口。`master=None` 自建根窗口（关窗停追踪）；`master=<Tk>` 挂 Toplevel 子面板（关窗不停追踪）。无可用相机时抛 `RuntimeError`。
+- `main()`：spawn + logging → `launch_debug_panel()` → `module._master.mainloop()`；无相机时打印 `Error: 没有可用相机` 并返回 1。`if __name__ == "__main__"` 调 `sys.exit(main())`。
 
 ```
 launch_debug_panel ──► detect_cameras ──► _setup_camera

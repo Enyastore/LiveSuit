@@ -1,27 +1,30 @@
-"""眼球追踪模块主入口。
+"""眼球追踪模块主入口 —— 编排层（用法速查，拷贝即用）。
 
-职责分层：
-  1) 数据模型: CameraConfig, AppConfig
-  2) 配置持久化: ConfigPersistence
-  3) 调试 UI: CropDebugWindow, ControlPanel
-  4) 核心编排: EyeTrackingModule
-  5) 独立入口: __main__
+【场景1】独立运行，自带调试面板：
+    python eye_tracker_main.py
+    操作：选左右相机 → 点「调试剪裁」配置并保存 → 点「开始眼球追踪」
 
-对外接口：
-  module = EyeTrackingModule()
-  module.start()
-  state = module.get_normalized_eye_state()
-  module.stop()
+【场景2】无 GUI 编程使用（headless）：
+    from eye_tracker_main import EyeTrackingModule
+    mod = EyeTrackingModule(headless=True)
+    mod.start()
+    state = mod.get_normalized_eye_state()   # 实时快照 {left, right, timestamp}
+    mod.stop()
 
-调试画面控制（隐藏/显示子进程 OpenCV 窗口）：
-  module.enter_headless_mode()
-  module.exit_headless_mode()
-  module.headless_runtime
+【场景3】外部脚本集成（按钮唤起面板 → 用户配置相机 → 面板点「开始」→ 实时取结果）：
+    import tkinter as tk
+    from eye_tracker_main import launch_debug_panel
+    root = tk.Tk()
+    mod = launch_debug_panel(master=root)    # 面板以 Toplevel 挂到自己的主窗口
+    root.mainloop()                          # 关闭面板不会停止追踪
+    # 任意时刻读取：state = mod.get_normalized_eye_state()
+    # 无主窗口时用 launch_debug_panel()（自建根窗口，需 mod._master.mainloop()）
 
-调试面板（脚本独立运行或由其他模块唤起）：
-  python eye_tracker_main.py                # 独立运行
-  module = launch_debug_panel()             # 程序化唤起（自动创建 Tk 根窗口）
-  module = launch_debug_panel(master=root)  # 挂载到已有 Tk 根窗口（Toplevel 子面板）
+【场景4】运行时切换子进程 OpenCV 调试窗口显隐（不影响 Tk 面板）：
+    mod.enter_headless_mode() / mod.exit_headless_mode() / mod.headless_runtime
+
+职责分层：数据模型 CameraConfig/AppConfig · 持久化 ConfigPersistence ·
+调试 UI CropDebugWindow/ControlPanel · 编排 EyeTrackingModule · 独立入口 __main__
 """
 
 __all__ = [
@@ -1301,32 +1304,28 @@ class ControlPanel:
 class EyeTrackingModule:
     """眼球追踪核心模块 —— 对外唯一入口。
 
-    使用方式：
+    基本用法：
         mod = EyeTrackingModule(headless=True)
         mod.start()
-        state = mod.get_normalized_eye_state()
+        state = mod.get_normalized_eye_state()   # 未启动时返回全 None 占位快照
         mod.stop()
 
-    调试模式：
-        mod = EyeTrackingModule(headless=False, master=root)
-        mod.start()
-        mod.open_control_panel()
+    调试模式（headless=False）：start() 后调 open_crop_window(side) /
+    open_control_panel() 打开调试窗口；也可用 with 语句管理生命周期。
 
-    调试画面控制（仅隐藏/显示子进程 OpenCV 窗口，tkinter 窗口不受影响）：
-        mod.enter_headless_mode()
-        mod.exit_headless_mode()
-        mod.headless_runtime
+    运行期隐藏/显示子进程 OpenCV 调试窗口（不影响 Tk 面板）：
+        mod.enter_headless_mode() / mod.exit_headless_mode() / mod.headless_runtime
 
     Parameters
     ----------
     headless : bool
-        True 时禁止创建任何 GUI 窗口。
+        True 时禁止创建任何 GUI 窗口（open_crop_window / open_control_panel 直接失效）。
     master : tk.Tk | None
-        tkinter 父窗口实例。headless=False 时若为 None 会自动创建一个隐藏窗口。
+        tkinter 父窗口。headless=False 且为 None 时自动创建隐藏根窗口。
     config_path : str
-        相机配置文件的路径。
+        相机配置文件路径（默认 config.yaml）。
     refs_file : str
-        参考值文件的路径（文件名部分）。
+        参考值文件路径（默认 references.yaml）。
     """
 
     def __init__(
