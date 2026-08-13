@@ -1,6 +1,7 @@
 from pathlib import Path
 import sys
 
+
 # 路径解析：兼容本仓库布局（eye_tracker_main.py 位于 src/face_tracking/ 下）
 _HERE = Path(__file__).resolve().parent            # src/servo_control/
 _FACE_TRACKING = _HERE.parent / "face_tracking"    # src/face_tracking/

@@ -3,17 +3,28 @@ from bisect import bisect_right
 
 
 class Filter:
-    """简单的指数移动平均滤波器。"""
-    def __init__(self, alpha: float=0.1, initial_value: float = 0.0):
-        self.alpha = alpha
-        self.previous = initial_value
+    """简单的指数移动平均（EMA）滤波器。
 
-    def update(self, value: float) -> float:
-        """更新滤波器状态并返回滤波后的结果。"""
-        current = value
-        result = self.alpha * current + (1 - self.alpha) * self.previous
-        self.previous = result
-        return result
+    update() 返回 (value, after) 二元组：
+        value —— 原始输入值；输入为 None 时保持上一次有效原值（hold-last）
+        after —— EMA 滤波后的值；输入为 None 时保持上一次滤波值
+
+    输入为 None 时不更新内部状态，直接返回上一次的有效值，
+    避免下游对 None 做算术运算而崩溃，并保证最终输出曲线平滑。
+    """
+    def __init__(self, alpha: float = 0.1, initial_value: float = 0.0):
+        self.alpha = alpha
+        self.previous = initial_value        # 上一次滤波输出
+        self._last_value = initial_value     # 上一次有效输入原值
+
+    def update(self, value):
+        """更新滤波器状态并返回 (value, after)；None 输入时状态不变。"""
+        if value is None:
+            return (self._last_value, self.previous)
+        after = self.alpha * value + (1 - self.alpha) * self.previous
+        self.previous = after
+        self._last_value = value
+        return (value, after)
 
 class Mapper:
     """三阶样条插值映射器（自然三次样条，numpy 实现）。
