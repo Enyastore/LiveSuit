@@ -1359,14 +1359,8 @@ class EyeTrackingModule:
         self._cmd_queue_right: Optional[multiprocessing.Queue] = None
         self._result_queue: Optional[multiprocessing.Queue] = None
 
-        # 结果收集
-        self._latest_state: dict = {
-            "left": {"eye_x": None, "eye_y": None, "confidence": None,
-                     "raw_eye_openness": None, "eye_o": None},
-            "right": {"eye_x": None, "eye_y": None, "confidence": None,
-                      "raw_eye_openness": None, "eye_o": None},
-            "timestamp": 0.0,
-        }
+        # 结果收集（与 _stop_internal 共用 _empty_state，保证结构一致）
+        self._latest_state: dict = self._empty_state()
         self._raw_gaze: Dict[str, Optional[List[float]]] = {"left": None, "right": None}
         self._result_thread: Optional[threading.Thread] = None
         self._result_stop = threading.Event()
@@ -1376,6 +1370,23 @@ class EyeTrackingModule:
         self._control_panel: Optional[ControlPanel] = None
 
         self._headless_runtime: bool = False
+
+    @staticmethod
+    def _make_empty_side_state() -> dict:
+        """构造单眼的空快照（与 _collect_results 写入的结构保持一致）。"""
+        return {
+            "eye_x": None, "eye_y": None, "confidence": None,
+            "raw_eye_openness": None, "eye_o": None,
+        }
+
+    @staticmethod
+    def _empty_state() -> dict:
+        """构造全 None 占位快照：__init__ 与 _stop_internal 共用，保证结构一致。"""
+        return {
+            "left": EyeTrackingModule._make_empty_side_state(),
+            "right": EyeTrackingModule._make_empty_side_state(),
+            "timestamp": 0.0,
+        }
 
     # ----------------------------------------------------------
     # 公共 API
@@ -1570,11 +1581,7 @@ class EyeTrackingModule:
         self._cmd_queue_right = None
         self._result_queue = None
         self._raw_gaze = {"left": None, "right": None}
-        self._latest_state = {
-            "left": {"eye_x": None, "eye_y": None, "confidence": None},
-            "right": {"eye_x": None, "eye_y": None, "confidence": None},
-            "timestamp": 0.0,
-        }
+        self._latest_state = self._empty_state()
         logger.info("眼球追踪已停止")
 
     def get_normalized_eye_state(self) -> dict:
