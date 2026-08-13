@@ -1,3 +1,16 @@
+"""数据提供者汇总（Slots）+ 输出槽位注册中心。
+
+本文件是 LiveSuit 中「输出槽位」的唯一注册来源：
+  - SLOT_SPECS          输出槽位注册表（槽位名 / 显示名 / 归一化范围 / 输出范围）
+  - get_slot_specs()    供 pipeline_manager 读取注册表、构建并行管道
+  - Slots               数据提供者容器（目前对接眼球追踪模块），
+                        get_all_output() 返回 {槽位名: 原始值}
+
+新增输出槽位 / 新数据提供者时，只需在本文件内追加注册表项，
+无需改动 pipeline_manager 或 gui。
+"""
+
+from collections import OrderedDict
 from pathlib import Path
 import sys
 
@@ -11,6 +24,41 @@ sys.path.insert(0, str(_FACE_TRACKING))            # 便于 import eye_tracker_m
 from eye_tracker_main import launch_debug_panel
 
 
+# ============================================================
+# 输出槽位注册表
+# ============================================================
+# 每个槽位对应一条并行管道：
+#     原始数据 -> 归一化(in_range) -> EMA滤波 -> 三次样条 -> 舵机总线(out_range)
+#   key      : 槽位名（即舵机总线面板「角度输入」列的 Label）
+#   label    : 显示用中文名
+#   in_range : 原始数据取值范围（用于归一化到 [0, 1]）
+#   out_range: 三次样条输出范围（映射到舵机角度）
+# ---此处可拓展其他输出槽位
+SLOT_SPECS = OrderedDict([
+    ("a_left_eye_x",  {"label": "左眼注视 X", "in_range": (-1.0, 1.0), "out_range": (0.0, 180.0)}),
+    ("a_left_eye_y",  {"label": "左眼注视 Y", "in_range": (-1.0, 1.0), "out_range": (0.0, 180.0)}),
+    ("a_left_eye_o",  {"label": "左眼开度",    "in_range": (0.0, 1.0),  "out_range": (0.0, 180.0)}),
+    ("a_right_eye_x", {"label": "右眼注视 X", "in_range": (-1.0, 1.0), "out_range": (0.0, 180.0)}),
+    ("a_right_eye_y", {"label": "右眼注视 Y", "in_range": (-1.0, 1.0), "out_range": (0.0, 180.0)}),
+    ("a_right_eye_o", {"label": "右眼开度",    "in_range": (0.0, 1.0),  "out_range": (0.0, 180.0)}),
+])
+
+# 提供者原始键 -> 槽位名（眼球追踪模块输出 left_eye_x 等，映射为 a_left_eye_x 等）
+PROVIDER_KEY_MAP = {
+    "left_eye_x": "a_left_eye_x",
+    "left_eye_y": "a_left_eye_y",
+    "left_eye_o": "a_left_eye_o",
+    "right_eye_x": "a_right_eye_x",
+    "right_eye_y": "a_right_eye_y",
+    "right_eye_o": "a_right_eye_o",
+}
+
+
+def get_slot_specs() -> OrderedDict:
+    """返回输出槽位注册表副本（供 pipeline_manager 构建并行管道）。"""
+    return OrderedDict(SLOT_SPECS)
+
+
 class Slots:
     def __init__(self, root):
         """ 实例化提供者
@@ -21,19 +69,29 @@ class Slots:
         #---此处可拓展其他提供者
 
     def get_all_output(self):
+        """获取所有参数输出，返回 {槽位名: 原始值}。
+
+        键名使用 SLOT_SPECS 中注册的槽位名（经 PROVIDER_KEY_MAP 转换），
+        可直接交给 pipeline_manager 的管道逐槽处理。
+        """
         #获取所有参数输出
         eye_state = self.eye_tracker.get_normalized_eye_state()
         #---此处可拓展其他输出
 
-        #整理为字典格式
-        result = {"left_eye_x" : eye_state["left"]["eye_x"], 
+        #整理为字典格式（provider 原始键）
+        result = {"left_eye_x" : eye_state["left"]["eye_x"],
             "left_eye_y" : eye_state["left"]["eye_y"],
             "left_eye_o" : eye_state["left"]["eye_o"],
-            "right_eye_x" : eye_state["right"]["eye_x"], 
+            "right_eye_x" : eye_state["right"]["eye_x"],
             "right_eye_y" : eye_state["right"]["eye_y"],
             "right_eye_o" : eye_state["right"]["eye_o"],
-            
             #---此处可拓展其他结果
             }
 
-        return result
+        # 映射为槽位名（未在映射表中的键原样保留）
+        return {PROVIDER_KEY_MAP.get(key, key): value for key, value in result.items()}
+
+    @staticmethod
+    def get_current_providers():
+        provider_info = "【眼部追踪】左眼left_eye_x, left_eye_y, left_eye_o三个参数，右眼right_eye_x, right_eye_y, right_eye_o三个参数"
+        return provider_info

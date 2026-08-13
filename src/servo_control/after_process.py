@@ -26,6 +26,14 @@ class Filter:
         self._last_value = value
         return (value, after)
 
+    def set_state(self, value):
+        """重置滤波器内部状态：以 value 同时作为上次有效输入与上次滤波输出。
+
+        用于 EMA 系数变更后以历史初值重新起算，避免出现 0 起始的过渡抖动。
+        """
+        self.previous = value
+        self._last_value = value
+
 class Mapper:
     """三阶样条插值映射器（自然三次样条，numpy 实现）。
 
