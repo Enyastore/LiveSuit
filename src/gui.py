@@ -20,6 +20,7 @@ import argparse
 import math
 import sys
 import tkinter as tk
+import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import messagebox, ttk
 
@@ -31,8 +32,9 @@ if str(_SERVO_CONTROL) not in sys.path:
     sys.path.insert(0, str(_SERVO_CONTROL))
 
 # 输出槽位注册表与真实数据源统一来自 src/servo_control/slots.py（延迟导入，
-# 见 _load_real_runtime）。gui.py 顶层不 import slots，
-# 避免把 cv2 / eye_tracker 等硬件依赖栈强耦合进纯 UI。
+# 见 _load_real_runtime）。gui.py 顶层不 import slots，且真正实例化 Slots
+# （会唤起眼追调试面板）延迟到点击「启动LiveSuit」之后才发生，
+# 避免把 cv2 / eye_tracker 等硬件依赖栈强耦合进纯 UI 或过早弹出眼追面板。
 
 from pipeline_manager import (  # noqa: E402
     CallableSource,
@@ -45,9 +47,10 @@ _LOGO_PATH = _HERE.parent / "LiveSuitLogo.png"   # 仓库根目录下的 Logo
 def _load_real_runtime(root):
     """加载真实运行环境：真实槽位注册表 + 真实数据源（眼球追踪 Slots）。
 
-    延迟导入 slots（含 eye_tracker / cv2 依赖栈），启动眼球追踪提供者；
+    仅在点击「启动LiveSuit」后由 start() 调用：此刻才延迟导入 slots
+    （含 eye_tracker / cv2 依赖栈）并实例化 Slots，唤起眼追调试面板。
     返回 (specs, source, runtime)：runtime 为真实 Slots 提供者，供停止时
-    释放追踪进程。缺依赖 / 无摄像头等异常不再回退，直接冒泡由调用方处理。
+    释放追踪进程。缺依赖 / 无摄像头等异常直接冒泡，由 start() 弹窗提示。
 
     真实数据源为 CallableSource(slots.get_all_output)，直接对接
     src/servo_control/slots.py 的 Slots 提供者。
@@ -342,9 +345,6 @@ class SplineCurveCanvas(tk.Canvas):
             self.create_text(x, py1 + 4, text=f"{xv:.2f}", anchor="n",
                              fill=AXIS_COLOR, font=TINY_FONT, tag="static")
 
-        self.create_text((px0 + px1) / 2, self._ch - 8,
-                         text="归一化输入 x (0~1)  →  角度 (0~180)",
-                         fill=AXIS_COLOR, font=TINY_FONT, tag="static")
 
     # ---- 增量渲染：样条曲线（样本点变化时重建；超限段画红色警示）----
     def _draw_curve(self):
@@ -577,10 +577,6 @@ class EmaFilterCanvas(tk.Canvas):
                 latest = item
         self._update_arrow(latest)
 
-        self.create_text((px0 + px1) / 2, py1 + 4,
-                         text="数值 (归一化 0~1) · 淡=原始 实=滤波",
-                         fill=AXIS_COLOR, font=TINY_FONT, tag=self._hint_tag)
-
     def _clear_series(self):
         """清空折线/箭头（历史为空时调用）。"""
         if self._filter_line_item is not None:
@@ -708,7 +704,7 @@ class SlotControllerWindow(tk.Toplevel):
       # EMA平滑滤波调节窗口（时间轴纵向）
       Alpha 值调节滑条（实时更新波形与指示箭头映射位置）
       舵机绑定状态
-      保存配置 / 重置配置 按钮（窗口最底部同一行，持久化当前槽位配置）
+      保存配置 / 重置配置 按钮
     """
 
     def __init__(self, master, slot, manager=None, on_close=None):
@@ -720,18 +716,24 @@ class SlotControllerWindow(tk.Toplevel):
         self.resizable(True, True)      # 支持动态缩放（画布随窗口伸缩）
         self.minsize(200, 300)
 
-        header = tk.Label(self, text=f"输出参数名: {slot.name}",
+        header = tk.Label(self, text=f"{slot.name}",
                           font=TITLE_FONT)
         header.pack(pady=(6, 2))
 
         tk.Label(self,
-                 text="# 样条曲线 (左键新增/拖拽 · 双击编辑 · 右键删除)",
+                 text="样条曲线",
                  font=TINY_FONT, fg="#333").pack(anchor="w", padx=8)
+
+        tk.Label(self,
+                 text="（左键单击曲线/双击空白处新建点；双击点编辑；右键点删除）",
+                 font=TINY_FONT, fg="#333").pack(anchor="w", padx=8)
+
+
         self.spline = SplineCurveCanvas(self, slot,
                                         on_changed=self._on_spline_changed)
         self.spline.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 4))
 
-        tk.Label(self, text="# EMA滤波 (时间轴纵向)",
+        tk.Label(self, text="EMA滤波",
                  font=TINY_FONT, fg="#333").pack(anchor="w", padx=8)
         self.ema = EmaFilterCanvas(self, slot)
         self.ema.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 4))
@@ -748,7 +750,7 @@ class SlotControllerWindow(tk.Toplevel):
                                     variable=self._alpha_var, showvalue=False,
                                     command=self._on_alpha, length=150)
         self.alpha_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
-        self.alpha_val = tk.Label(self.alpha_row, text=f"{slot.alpha:.2f} (实时)",
+        self.alpha_val = tk.Label(self.alpha_row, text=f"{slot.alpha:.2f} ",
                                   font=VALUE_FONT, width=10, anchor="e")
         self.alpha_val.pack(side=tk.LEFT)
 
@@ -807,7 +809,7 @@ class SlotControllerWindow(tk.Toplevel):
     def _on_alpha(self, _val):
         a = float(self._alpha_var.get())
         self.slot.set_alpha(a)
-        self.alpha_val.config(text=f"{a:.2f} (实时)")
+        self.alpha_val.config(text=f"{a:.2f} ")
         self.redraw()
 
     def _on_spline_changed(self):
@@ -842,7 +844,7 @@ class SlotControllerWindow(tk.Toplevel):
     def _sync_from_slot(self):
         """把槽位当前状态（alpha / 样本点）同步回 UI 控件并重绘。"""
         self._alpha_var.set(self.slot.alpha)
-        self.alpha_val.config(text=f"{self.slot.alpha:.2f} (实时)")
+        self.alpha_val.config(text=f"{self.slot.alpha:.2f} ")
         self.spline.points = [list(p) for p in self.slot.points]
         self.spline.draw()
         self.redraw()
@@ -887,9 +889,9 @@ class ServoBusPanel(tk.Toplevel):
         title = tk.Label(self, text="舵机总线配置面板", font=TITLE_FONT)
         title.grid(row=0, column=0, columnspan=2, pady=(10, 6))
 
-        tk.Label(self, text="角度输入 (自动获取Label)", font=SMALL_FONT, fg="#333")\
+        tk.Label(self, text="角度输入", font=SMALL_FONT, fg="#333")\
             .grid(row=1, column=0, padx=14, sticky="w")
-        tk.Label(self, text="舵机输出 (下拉框选择)", font=SMALL_FONT, fg="#333")\
+        tk.Label(self, text="舵机输出", font=SMALL_FONT, fg="#333")\
             .grid(row=1, column=1, padx=14, sticky="w")
 
         ttk.Separator(self, orient=tk.HORIZONTAL)\
@@ -911,13 +913,6 @@ class ServoBusPanel(tk.Toplevel):
             row += 1
         self._rebuild_options()   # 按已有绑定过滤各下拉框选项
 
-        note = ("约束规则：下拉框选项为 16 路舵机输出 (servo_0 ~ servo_15) + 无绑定；\n"
-                "已选舵机会从其他下拉框中移除（改绑后自动释放）；选定后立即建立 angle->servo 映射。")
-        ttk.Separator(self, orient=tk.HORIZONTAL)\
-            .grid(row=row, column=0, columnspan=2, sticky="ew", padx=8, pady=(6, 2))
-        tk.Label(self, text=note, font=TINY_FONT, fg="#666", justify=tk.LEFT)\
-            .grid(row=row + 1, column=0, columnspan=2, padx=14, pady=(2, 8),
-                  sticky="w")
 
         self.protocol("WM_DELETE_WINDOW", self._handle_close)
 
@@ -980,10 +975,22 @@ class WelcomePage(tk.Frame):
         if self.logo_img is not None:
             tk.Label(self, image=self.logo_img).pack(pady=(24, 8))
 
-        tk.Label(self, text="# LiveSuit", font=BIG_TITLE_FONT).pack(pady=(4, 2))
         tk.Label(self, text="版本: beta1.0", font=BODY_FONT, fg="#444").pack()
-        tk.Label(self, text="简介: LiveSuit是一个个人可动兽装项目。采用MIT许可证。",
-                 font=BODY_FONT, fg="#444").pack(pady=(4, 18))
+        intro_label = tk.Label(
+            self, text="简介: LiveSuit是一个个人可动兽装项目。采用MIT许可证。",
+            font=BODY_FONT, fg="#444")
+        intro_label.pack(pady=(4, 18))
+
+        # 数据提供者信息（来源 slots.PROVIDER_INFO，纯文本常量，无硬件依赖——
+        # slots 已将 cv2 / eye_tracker 依赖栈延迟到提供者实例化时才导入）。
+        # wraplength 取简介标签文本的像素宽度，多行换行后总宽度不超过简介。
+        try:
+            from slots import PROVIDER_INFO  # noqa: PLC0415  轻量导入，仅读取纯文本常量
+        except Exception:  # noqa: BLE001  极端环境兜底，不阻塞欢迎页
+            PROVIDER_INFO = ""
+        wrap_width = tkfont.Font(font=BODY_FONT).measure(intro_label.cget("text"))
+        tk.Label(self, text=PROVIDER_INFO, font=SMALL_FONT, fg="#444",
+                 wraplength=wrap_width, justify=tk.CENTER).pack(pady=(0, 18))
 
         btn_row = tk.Frame(self)
         btn_row.pack(pady=(0, 24))
@@ -1024,10 +1031,12 @@ class LiveSuitApp:
         self.root = root
         self.poll_ms = poll_ms
         self._runtime = None
-        # 接入真实运行环境（眼球追踪数据源）；缺依赖/无相机异常直接冒泡，
-        # 由 main() 统一捕获并提示，不再静默降级
-        specs, source, self._runtime = _load_real_runtime(root)
-        self.manager = PipelineManager(slots_spec=specs, source=source)
+        # 注意：启动阶段不实例化 Slots 提供者（否则会立即唤起眼追调试面板）。
+        # 先用空注册表 + 占位数据源构建占位管理器；真实的槽位注册表与
+        # 眼球追踪数据源在点击「启动LiveSuit」后由 start() 中的
+        # _load_real_runtime() 加载，并重建管理器（沿用同一 Store，保留状态）。
+        self.manager = PipelineManager(slots_spec={},
+                                       source=CallableSource(lambda: {}))
         if initial_headless:
             self.manager.set_render_mode("headless")
         self.store = self.manager.store
@@ -1066,6 +1075,21 @@ class LiveSuitApp:
         if self._started:
             return
         self._started = True
+        # 点击「启动LiveSuit」后才实例化 Slots 提供者（此刻才唤起眼追调试面板）。
+        # 缺依赖 / 无相机等异常在此捕获并弹窗提示，可重试，不影响欢迎页。
+        try:
+            specs, source, self._runtime = _load_real_runtime(self.root)
+        except Exception as exc:  # noqa: BLE001  缺依赖 / 无相机 / 摄像头初始化失败
+            import traceback
+            traceback.print_exc()
+            self._started = False
+            messagebox.showerror(
+                "启动失败",
+                f"无法启动眼球追踪：{exc}\n请检查依赖与摄像头后重新点击启动。")
+            return
+        # 用真实槽位注册表与数据源重建管理器（沿用原 Store，保留渲染模式等状态）
+        self.manager = PipelineManager(slots_spec=specs, source=source,
+                                       store=self.store)
         self.manager.start()
         # 启动时读取槽位配置（alpha + 样本点）；无配置文件则按默认配置新建
         self.manager.load_slot_configs()
@@ -1179,8 +1203,9 @@ def main():
     root = tk.Tk()
     try:
         LiveSuitApp(root, poll_ms=args.poll_ms, initial_headless=args.headless)
-    except (ImportError, RuntimeError) as exc:
-        # 缺依赖 / 无相机等真实启动失败：给出明确提示并退出，不吞异常
+    except Exception as exc:  # noqa: BLE001  构造期异常（如缺 tkinter 依赖）
+        # 注意：缺依赖 / 无相机等眼球追踪运行时错误已不在构造期发生——
+        # 真实运行时在点击「启动LiveSuit」后才加载，失败由 start() 弹窗提示并可重试
         print(f"[gui] 启动失败：{exc}")
         root.destroy()
         sys.exit(1)

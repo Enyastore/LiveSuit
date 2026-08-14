@@ -20,9 +20,9 @@ _HERE = Path(__file__).resolve().parent            # src/servo_control/
 _FACE_TRACKING = _HERE.parent / "face_tracking"    # src/face_tracking/
 sys.path.insert(0, str(_FACE_TRACKING))            # 便于 import eye_tracker_main
 
-
-from eye_tracker_main import launch_debug_panel
-
+# 注意：eye_tracker_main（含 cv2 / numpy / C++ 绑定）延迟到 Slots 实例化时
+# 才导入——保证 `import slots` 是轻量的，纯元数据（SLOT_SPECS / PROVIDER_INFO）
+# 可被纯 UI（gui.py）直接读取，不拉起硬件依赖栈。
 
 # ============================================================
 # 输出槽位注册表
@@ -53,6 +53,8 @@ PROVIDER_KEY_MAP = {
     "right_eye_o": "a_right_eye_o",
 }
 
+#显示在开始页面的提示信息
+PROVIDER_INFO = "【眼部追踪】左眼left_eye_x, left_eye_y, left_eye_o三个参数，右眼right_eye_x, right_eye_y, right_eye_o三个参数"
 
 def get_slot_specs() -> OrderedDict:
     """返回输出槽位注册表副本（供 pipeline_manager 构建并行管道）。"""
@@ -65,6 +67,7 @@ class Slots:
             并将root作为根窗口打开UI
             后续可以添加其他模块
         """
+        from eye_tracker_main import launch_debug_panel  # noqa: PLC0415  延迟到实例化时导入（避免 import slots 即拉起 cv2 / eye_tracker 依赖栈）
         self.eye_tracker = launch_debug_panel(master=root)   # 面板挂到已有主窗口（Toplevel）；关面板不停追踪
         #---此处可拓展其他提供者
 
@@ -91,7 +94,5 @@ class Slots:
         # 映射为槽位名（未在映射表中的键原样保留）
         return {PROVIDER_KEY_MAP.get(key, key): value for key, value in result.items()}
 
-    @staticmethod
-    def get_current_providers():
-        provider_info = "【眼部追踪】左眼left_eye_x, left_eye_y, left_eye_o三个参数，右眼right_eye_x, right_eye_y, right_eye_o三个参数"
-        return provider_info
+
+
