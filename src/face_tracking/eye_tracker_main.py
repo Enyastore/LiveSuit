@@ -37,7 +37,7 @@ __all__ = [
 
 import tkinter as tk
 import cv2
-from tkinter import ttk
+from tkinter import messagebox, ttk
 from PIL import Image, ImageTk
 import yaml
 import multiprocessing
@@ -577,7 +577,10 @@ class CropDebugWindow:
         self._video_label.bind("<ButtonRelease-1>", self._on_release)
 
     def _reset_crop(self) -> None:
-        """重置剪裁黄框为整个画面范围。"""
+        """重置剪裁黄框为整个画面范围（需确认，防止误触）。"""
+        if not messagebox.askokcancel(
+                "重置剪裁", "将重置剪裁区域为整个画面范围！", parent=self._window):
+            return
         self._crop_rect = [0, 0, self._cam_config.frame_width, self._cam_config.frame_height]
 
     def _save_crop_config(self) -> None:
@@ -1206,7 +1209,11 @@ class ControlPanel:
             logger.warning(f"[{side}] 追踪尚未启动，无法保存")
 
     def _clear_extreme_vectors(self, side: str) -> None:
-        """清除指定眼（left/right）的所有极值向量。"""
+        """清除指定眼（left/right）的所有极值向量（需确认，防止误触）。"""
+        side_label = "左眼" if side == "left" else "右眼"
+        if not messagebox.askokcancel(
+                "清除注视参考", f"将清除{side_label}的所有注视极值向量！", parent=self._window):
+            return
         q = self._cmd_queue_left if side == "left" else self._cmd_queue_right
         if q is not None:
             try:
@@ -1281,7 +1288,11 @@ class ControlPanel:
                 logger.warning(f"未能获取 {side} 当前开度值，跳过保存")
 
     def _clear_openness_refs(self, side: str) -> None:
-        """清除指定眼睛（left/right）的开闭参考距离（open/close）并持久化。"""
+        """清除指定眼睛（left/right）的开闭参考距离（open/close）并持久化（需确认，防止误触）。"""
+        side_label = "左眼" if side == "left" else "右眼"
+        if not messagebox.askokcancel(
+                "清除开闭参考", f"将清除{side_label}的开闭度参考值！", parent=self._window):
+            return
         if self._openness_normalizer is not None:
             self._openness_normalizer.clear_openness_ref(side)
             logger.info(f"已清除 {side} 眼开闭参考距离")

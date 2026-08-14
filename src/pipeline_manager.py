@@ -11,6 +11,7 @@
   3. Slot             —— 单个并行管道槽位（归一化 + EMA + 三次样条）
   4. PipelineManager  —— 槽位构建、逐帧处理、舵机总线映射与去重校验
   5. DataSource       —— 数据源抽象（CallableSource 对接真实提供者）
+  6. 槽位配置持久化   —— alpha 与三次样条样本点读写 slot_configs.yaml
 
 槽位注册表（有哪些输出槽位、各自的取值范围）统一由
 src/servo_control/slots.py 的 get_slot_specs() 提供，本模块不硬编码任何槽位，
@@ -24,6 +25,8 @@ import math
 import sys
 from collections import OrderedDict, deque
 from pathlib import Path
+
+import yaml
 
 # ---------------------------------------------------------------
 # 路径解析：兼容本仓库布局（after_process.py 位于 src/servo_control/ 下）
@@ -44,6 +47,52 @@ DEFAULT_NEUTRAL_ANGLE = 90.0    # 未绑定通道的中位角度
 
 # 默认三次样条样本点：仅左右边界，即 [0,1] -> [0,180] 的线性映射
 DEFAULT_POINTS = [(0.0, 0.0), (1.0, 180.0)]
+
+# 槽位配置持久化文件（alpha + 三次样条样本点）
+SLOT_CONFIGS_PATH = _HERE / "slot_configs.yaml"
+
+
+class _FlowList(list):
+    """YAML 行内流式列表标记：slot_configs.yaml 的 point_set 按 [[x,y],...] 写出。"""
+
+
+def _flow_style_list(dumper, data):
+    """把 _FlowList 序列化为行内流式风格（point_set: [[0,0],[1,180]]）。"""
+    return dumper.represent_sequence("tag:yaml.org,2002:seq",
+                                     list(data), flow_style=True)
+
+
+yaml.SafeDumper.add_representer(_FlowList, _flow_style_list)
+
+
+def read_slot_configs(path):
+    """读取槽位配置文件，返回 {slot_name: {alpha, point_set}}。
+
+    - 文件不存在 / 解析失败：返回 None（调用方按默认配置新建）；
+    - 文件存在但内容为空 / 顶层不是字典：返回 {}（各槽位回退默认）。
+    """
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except Exception as exc:  # noqa: BLE001  文件损坏 / 权限等异常按缺失处理
+        print(f"[pipeline_manager] 读取槽位配置失败（{exc}），将按默认配置新建。")
+        return None
+    return data if isinstance(data, dict) else {}
+
+
+def write_slot_configs(path, data):
+    """把 {slot_name: {alpha, point_set}} 写回槽位配置文件。"""
+    payload = {}
+    for name, cfg in data.items():
+        payload[name] = {
+            "alpha": float(cfg["alpha"]),
+            "point_set": _FlowList([list(map(float, p)) for p in cfg["point_set"]]),
+        }
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(payload, f, allow_unicode=True, sort_keys=False)
 
 
 class Store:
@@ -266,12 +315,13 @@ class PipelineManager:
     本类不硬编码任何具体槽位，保证可拓展性。
     """
 
-    def __init__(self, store=None, source=None, slots_spec=None):
+    def __init__(self, store=None, source=None, slots_spec=None, config_path=None):
         self.store = store or Store(initial={
             "render_mode": "debug",
             "started": False,
             "bindings": {},
         })
+        self.config_path = Path(config_path) if config_path else SLOT_CONFIGS_PATH
         if slots_spec is None:
             slots_spec = _load_default_slot_specs()
         self.slots_spec = OrderedDict(slots_spec) if slots_spec else OrderedDict()
@@ -283,6 +333,98 @@ class PipelineManager:
         self.source = source
         self._reverse = {}   # servo_index -> slot_name（去重快速查找）
         self._sync_reverse()
+
+    # ---- 槽位配置持久化（slot_configs.yaml）----
+    def default_slot_config(self):
+        """返回全部槽位的默认配置 {name: {"alpha", "point_set"}}。"""
+        return {
+            name: {
+                "alpha": DEFAULT_ALPHA,
+                "point_set": [list(p) for p in DEFAULT_POINTS],
+            }
+            for name in self.slots
+        }
+
+    @staticmethod
+    def _sanitize_slot_config(name, cfg, default):
+        """校验 / 清洗单个槽位配置；非法字段回退默认，保证加载不抛异常。
+
+        - alpha     ：[0,1] 内的有限浮点数；
+        - point_set ：≥2 个 [x,y]，x∈[0,1] 且严格递增，y∈[0,180]。
+        """
+        if not isinstance(cfg, dict):
+            return dict(default)
+        out = dict(default)
+        try:
+            alpha = float(cfg.get("alpha"))
+            if math.isfinite(alpha) and 0.0 <= alpha <= 1.0:
+                out["alpha"] = alpha
+        except (TypeError, ValueError):
+            pass
+        try:
+            pts = [[float(a), float(b)] for a, b in (cfg.get("point_set") or [])]
+        except (TypeError, ValueError):
+            pts = []
+        if (len(pts) >= 2
+                and all(0.0 <= x <= 1.0 and 0.0 <= y <= 180.0 for x, y in pts)
+                and all(pts[i + 1][0] > pts[i][0] for i in range(len(pts) - 1))):
+            out["point_set"] = pts
+        return out
+
+    def _slot_to_config(self, name):
+        """导出单个槽位当前配置 {alpha, point_set}（y 为角度 0~180）。"""
+        slot = self.slots[name]
+        return {"alpha": slot.alpha,
+                "point_set": [list(p) for p in slot.points]}
+
+    def load_slot_configs(self):
+        """启动时读取 slot_configs.yaml 并应用到各槽位。
+
+        无配置文件 / 读取失败时，按默认配置生成并新建该文件；
+        文件已存在但缺失或含非法字段的槽位项，回退默认配置。
+        """
+        data = read_slot_configs(self.config_path)
+        if data is None:
+            data = self.default_slot_config()
+            write_slot_configs(self.config_path, data)
+        defaults = self.default_slot_config()
+        for name, slot in self.slots.items():
+            cfg = self._sanitize_slot_config(name, data.get(name), defaults[name])
+            slot.set_points(cfg["point_set"])
+            slot.set_alpha(cfg["alpha"])
+        return data
+
+    def save_slot_config(self, name=None):
+        """保存槽位配置到 slot_configs.yaml。
+
+        name 为 None 时保存全部槽位；否则仅更新该槽位，
+        文件内其它槽位已保存的内容保留（合并写入）。
+        """
+        data = read_slot_configs(self.config_path)
+        if data is None:
+            data = self.default_slot_config()   # 无文件：先补全默认再覆盖目标槽位
+        else:
+            data = dict(data)
+        if name is None:
+            for slot_name in self.slots:
+                data[slot_name] = self._slot_to_config(slot_name)
+        else:
+            data[name] = self._slot_to_config(name)
+        write_slot_configs(self.config_path, data)
+
+    def reset_slot_config(self, name):
+        """把指定槽位重置为默认配置（alpha + 样本点），并同步写回配置文件。
+
+        先 set_points 再 set_alpha：set_alpha 会以新样条重算 latest_angle，
+        保证重置后槽位状态与 UI 指示完全一致。
+        """
+        if name not in self.slots:
+            return
+        default = self.default_slot_config()[name]
+        slot = self.slots[name]
+        slot.set_points(default["point_set"])
+        slot.set_alpha(default["alpha"])
+        self.save_slot_config(name)
 
     # ---- 状态 ----
     def _sync_reverse(self):
@@ -414,4 +556,7 @@ __all__ = [
     "DEFAULT_ALPHA",
     "DEFAULT_NEUTRAL_ANGLE",
     "DEFAULT_POINTS",
+    "SLOT_CONFIGS_PATH",
+    "read_slot_configs",
+    "write_slot_configs",
 ]

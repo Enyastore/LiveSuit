@@ -708,6 +708,7 @@ class SlotControllerWindow(tk.Toplevel):
       # EMA平滑滤波调节窗口（时间轴纵向）
       Alpha 值调节滑条（实时更新波形与指示箭头映射位置）
       舵机绑定状态
+      保存配置 / 重置配置 按钮（窗口最底部同一行，持久化当前槽位配置）
     """
 
     def __init__(self, master, slot, manager=None, on_close=None):
@@ -753,6 +754,14 @@ class SlotControllerWindow(tk.Toplevel):
 
         self.binding_label = tk.Label(self, text="", font=SMALL_FONT, fg="#666")
         self.binding_label.pack(pady=(0, 6))
+
+        # 配置操作行：保存配置 / 重置配置（同一行，位于窗口最底部）
+        self.config_btn_row = tk.Frame(self)
+        self.config_btn_row.pack(pady=(0, 8))
+        tk.Button(self.config_btn_row, text="保存配置", width=10,
+                  command=self._on_save_config).pack(side=tk.LEFT, padx=6)
+        tk.Button(self.config_btn_row, text="重置配置", width=10,
+                  command=self._on_reset_config).pack(side=tk.LEFT, padx=6)
 
         self._resize_refresh_pending = False
         self.bind("<Configure>", self._on_window_resize)
@@ -803,6 +812,39 @@ class SlotControllerWindow(tk.Toplevel):
 
     def _on_spline_changed(self):
         # 样条映射变化后立即刷新（上方曲线与下方箭头同步）
+        self.redraw()
+
+    # ---- 配置保存 / 重置 ----
+    def _on_save_config(self):
+        """保存配置：把当前槽位的 alpha + 样本点写入 slot_configs.yaml。"""
+        if self.manager is None:
+            return
+        try:
+            self.manager.save_slot_config(self.slot.name)
+        except Exception as exc:  # noqa: BLE001  磁盘/权限等写入异常需明确提示
+            messagebox.showerror("保存配置失败",
+                                 f"保存 {self.slot.name} 配置时出错：\n{exc}",
+                                 parent=self)
+            return
+        messagebox.showinfo("保存配置", f"{self.slot.name} 配置已保存。", parent=self)
+
+    def _on_reset_config(self):
+        """重置配置：当前槽位恢复默认 alpha + 样本点，并写回配置文件。"""
+        if self.manager is None:
+            return
+        if not messagebox.askokcancel("重置配置", "将重置滤波参数和曲线！", parent=self):
+            return
+        self.manager.reset_slot_config(self.slot.name)
+        self._sync_from_slot()
+        messagebox.showinfo("重置配置",
+                            f"{self.slot.name} 已重置为默认配置。", parent=self)
+
+    def _sync_from_slot(self):
+        """把槽位当前状态（alpha / 样本点）同步回 UI 控件并重绘。"""
+        self._alpha_var.set(self.slot.alpha)
+        self.alpha_val.config(text=f"{self.slot.alpha:.2f} (实时)")
+        self.spline.points = [list(p) for p in self.slot.points]
+        self.spline.draw()
         self.redraw()
 
     def refresh_binding(self):
@@ -1025,6 +1067,8 @@ class LiveSuitApp:
             return
         self._started = True
         self.manager.start()
+        # 启动时读取槽位配置（alpha + 样本点）；无配置文件则按默认配置新建
+        self.manager.load_slot_configs()
         self.servo = _load_servo_controller()   # 缺硬件时为 None，仅跳过下发
         self._build_panels()
         self._apply_render_mode(self.manager.render_mode)
