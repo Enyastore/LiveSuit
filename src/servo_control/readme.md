@@ -9,6 +9,7 @@ src/servo_control/
 ├── servo_controller.py   # PCA9685 舵机驱动（ServoController 类）
 ├── after_process.py      # 信号后处理（Filter 平滑 / Mapper 角度映射）
 ├── slots.py              # 数据提供者汇总（Slots 类，目前对接眼球追踪模块）
+├── test_servo.py         # 单通道舵机行程实验脚本（默认 servo_1）
 └── readme.md             # 本文档
 ```
 
@@ -45,12 +46,18 @@ src/face_tracking/eye_tracker_main.py         src/servo_control/
 
 基于 [Adafruit PCA9685](https://docs.circuitpython.org/projects/pca9685/) 的多路舵机控制器。
 
-- `ServoController(channels=16, address=0x40, frequency=50.0, i2c=None)`
+- `ServoController(channels=16, address=0x40, frequency=50.0, i2c=None,
+  min_pulse=500, max_pulse=2500)`
   - 初始化时绑定 PCA9685 的 `channels` 个通道，每个通道对应一个
     `adafruit_motor.servo.Servo` 对象（列表索引即通道号）。
   - 默认使用 50 Hz 的 PWM 频率（模拟舵机常见频率）。
   - `i2c` 为 `None` 时自动检测默认 SCL/SDA 引脚；也可传入已有的
     `busio.I2C` 对象以便测试或复用总线。
+  - `min_pulse` / `max_pulse`：0° / 180° 对应的 PWM 脉宽（µs），默认
+    500 / 2500（常见 180° 舵机如 SG90 / MG90S / MG996R 的标称范围）。
+    创建 `adafruit_motor.servo.Servo` 时显式传入，避免使用库默认的
+    750~2250 µs 导致 0°/180° 指令行程不足（实测偏转 < 180°）。
+    注意脉宽范围应与舵机机械行程标称一致，设置过宽会在端点堵转。
 - `set_angle(angles)`：接收角度列表（如 `[1, 34, 29, ...]`），把第 `i` 个角度
   写到索引为 `i` 的通道；超出 `[0, 180]` 的角度自动钳制到边界值；角度数量超过
   通道数时抛出 `ValueError`。

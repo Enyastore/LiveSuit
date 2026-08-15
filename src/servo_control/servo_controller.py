@@ -3,6 +3,10 @@
 提供 ServoController 类：管理一块 PCA9685 上的多路舵机，
 set_angle() 接收角度值列表（形如 [1, 34, 29, ...]），将第 i 个角度
 写到对应索引 i 的舵机通道；超出 [0, 180] 的角度自动钳制到边界值。
+
+创建舵机对象时显式传入 min_pulse / max_pulse（默认 500 / 2500 µs），
+避免 adafruit_motor.servo.Servo 的库默认值（750 / 2250 µs）把 0°/180°
+指令映射到偏窄脉宽，导致实测行程不足 180°。
 """
 
 import board
@@ -22,7 +26,8 @@ class ServoController:
     MAX_ANGLE = 180.0   # 角度上限（度）
 
     def __init__(self, channels: int = 16, address: int = 0x40,
-                 frequency: float = 50.0, i2c=None):
+                 frequency: float = 50.0, i2c=None,
+                 min_pulse: int = 500, max_pulse: int = 2500):
         """初始化 PCA9685 并创建各通道的舵机对象。
 
         Parameters
@@ -36,13 +41,33 @@ class ServoController:
         i2c : busio.I2C | None
             外部传入的 I2C 总线；为 None 时自动检测默认 I2C 引脚（SCL/SDA）。
             传入已有总线可便于测试/复用。
+        min_pulse : int
+            0° 对应的 PWM 脉宽（µs）。默认 500，对应常见 180° 舵机
+            （SG90 / MG90S / MG996R 等）的标称下限；请按舵机数据手册调整。
+        max_pulse : int
+            180° 对应的 PWM 脉宽（µs）。默认 2500，对应常见 180° 舵机的
+            标称上限。注意：脉宽范围应与舵机机械行程标称一致，设置过宽
+            会在端点堵转并增大电流。
+
+        Notes
+        -----
+        默认 500~2500 µs 相比 adafruit_motor.servo.Servo 的库默认
+        （750~2250 µs）覆盖了大多数 180° 舵机的完整行程；若沿用库默认，
+        0°/180° 指令会被映射到偏窄的脉宽，实测行程不足 180°。
         """
         if i2c is None:
             i2c = busio.I2C(board.SCL, board.SDA)
         self._pca = PCA9685(i2c, address=address)
         self._pca.frequency = frequency
-        # 每个通道一个舵机对象，列表索引即通道号
-        self._servos = [servo.Servo(self._pca.channels[i])
+        # 每个通道一个舵机对象，列表索引即通道号。
+        # 显式传入 min_pulse/max_pulse：使用库默认 750/2250 µs 会导致
+        # 0°/180° 指令对应脉宽偏窄，实测行程小于 180°。
+        self.min_pulse = min_pulse
+        self.max_pulse = max_pulse
+        self._servos = [servo.Servo(self._pca.channels[i],
+                                    actuation_range=180,
+                                    min_pulse=min_pulse,
+                                    max_pulse=max_pulse)
                         for i in range(channels)]
 
     def set_angle(self, angles):

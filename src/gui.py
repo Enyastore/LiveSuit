@@ -40,6 +40,7 @@ from pipeline_manager import (  # noqa: E402
     CallableSource,
     PipelineManager,
     SERVO_CHANNELS,
+    ServoDebugger,
 )
 
 _LOGO_PATH = _HERE.parent / "LiveSuitLogo.png"   # 仓库根目录下的 Logo
@@ -959,6 +960,114 @@ class ServoBusPanel(tk.Toplevel):
             combo["values"] = opts
 
 
+class ServoToolWindow(tk.Toplevel):
+    """舵机调试工具窗口。
+
+    用于启动 LiveSuit 之前手动调试单个舵机通道：
+      - 标题栏：舵机工具
+      - 第一行：舵机输出 标签 + servo_0~servo_15 下拉框
+      - 第二行：[-] 按钮 + 角度数字输入框（含 ° 单位）+ [+] 按钮
+
+    行为约定：
+      - 下拉选择通道：仅切换并显示该通道当前角度，不下发（防误触发）；
+      - 点击 +/- 或回车输入数值：立即下发到当前选中通道；
+      - 角度范围钳制在 0° ~ 180°，每次 +/- 步长为 1°。
+    """
+
+    def __init__(self, master, app, on_close=None):
+        super().__init__(master)
+        self.app = app
+        self._on_close = on_close
+        self.debugger = app.servo_debug
+        self.title("舵机工具")
+        self.resizable(False, False)
+
+        title = tk.Label(self, text="舵机工具", font=TITLE_FONT)
+        title.pack(pady=(10, 6))
+
+        # 第一行：舵机输出 标签 + 通道下拉框
+        row1 = tk.Frame(self)
+        row1.pack(padx=12, pady=(2, 4))
+        tk.Label(row1, text="舵机输出", font=SMALL_FONT).pack(side=tk.LEFT,
+                                                              padx=(0, 8))
+        self._channels = [f"servo_{i}" for i in range(SERVO_CHANNELS)]
+        self._channel_var = tk.StringVar(value=self._channels[0])
+        self._combo = ttk.Combobox(row1, textvariable=self._channel_var,
+                                   values=self._channels, state="readonly",
+                                   width=14)
+        self._combo.pack(side=tk.LEFT)
+        self._combo.bind("<<ComboboxSelected>>", self._on_channel_select)
+
+        # 第二行：[-] 按钮 + 角度输入框（含 ° 单位）+ [+] 按钮
+        row2 = tk.Frame(self)
+        row2.pack(padx=12, pady=(4, 10))
+        tk.Button(row2, text="-", width=4, command=lambda: self._adjust(-1))\
+            .pack(side=tk.LEFT, padx=6)
+        self._angle_var = tk.StringVar(value=self._fmt(self.debugger.get_angle()))
+        self._angle_entry = tk.Entry(row2, textvariable=self._angle_var,
+                                     width=10, justify=tk.CENTER)
+        self._angle_entry.pack(side=tk.LEFT, padx=6)
+        self._angle_entry.bind("<Return>", self._on_entry_commit)
+        tk.Button(row2, text="+", width=4, command=lambda: self._adjust(1))\
+            .pack(side=tk.LEFT, padx=6)
+
+        self.protocol("WM_DELETE_WINDOW", self._handle_close)
+
+    @staticmethod
+    def _fmt(angle):
+        """角度显示格式：整数不带小数、保留 ° 单位（如 90° / 90.5°）。"""
+        return f"{angle:g}°"
+
+    def _on_channel_select(self, _event=None):
+        """下拉切换通道：仅切换，不下发，数字框显示该通道当前角度。"""
+        idx = int(self._channel_var.get().split("_")[1])
+        angle = self.debugger.select_channel(idx)
+        self._angle_var.set(self._fmt(angle))
+
+    def _adjust(self, delta):
+        """点击 +/-：以 1° 步长增减当前选中通道角度并立即下发。"""
+        angle = self.debugger.adjust(delta)
+        self._angle_var.set(self._fmt(angle))
+        self._output()
+
+    def _parse_angle(self, text):
+        """解析数字框文本，允许带 ° / 度 后缀；非法输入返回 None。"""
+        text = text.strip()
+        if text.endswith("°"):
+            text = text[:-1].strip()
+        elif text.endswith("度"):
+            text = text[:-1].strip()
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    def _on_entry_commit(self, _event=None):
+        """回车提交输入框数值：立即下发；非法输入恢复显示、不下发。"""
+        value = self._parse_angle(self._angle_var.get())
+        if value is None:
+            self._angle_var.set(self._fmt(self.debugger.get_angle()))
+            return
+        angle = self.debugger.set_angle(value)
+        self._angle_var.set(self._fmt(angle))
+        self._output()
+
+    def _output(self):
+        """把当前调试状态（16 路完整向量）立即下发到舵机硬件。"""
+        if self.app.servo is None:
+            return
+        try:
+            self.app.servo.set_angle(self.debugger.get_vector())
+        except Exception as exc:  # noqa: BLE001  硬件下发异常不阻塞 UI
+            print(f"[gui] 舵机调试下发失败（{exc}）")
+
+    def _handle_close(self):
+        """用户关闭本窗口：通知 LiveSuitApp 置空引用后销毁。"""
+        if self._on_close is not None:
+            self._on_close(self)
+        self.destroy()
+
+
 class WelcomePage(tk.Frame):
     """启动后的欢迎页面。
 
@@ -994,22 +1103,28 @@ class WelcomePage(tk.Frame):
 
         btn_row = tk.Frame(self)
         btn_row.pack(pady=(0, 24))
+        # 左列「启动LiveSuit」按钮纵向占两行（与右侧两按钮对齐）
         self.start_btn = tk.Button(btn_row, text="启动LiveSuit", width=16,
                                    command=self.app.start)
-        self.start_btn.pack(side=tk.LEFT, padx=10)
+        self.start_btn.grid(row=0, column=0, rowspan=2, sticky="ns", padx=10)
+        # 右列上方「切换窗口渲染」、下方「打开舵机工具」
         self.toggle_btn = tk.Button(btn_row, text="切换窗口渲染", width=16,
                                     command=self.app.toggle_render,
                                     state=tk.DISABLED)   # 启动前禁用
-        self.toggle_btn.pack(side=tk.LEFT, padx=10)
+        self.toggle_btn.grid(row=0, column=1, padx=10, pady=(0, 3))
+        self.servo_tool_btn = tk.Button(btn_row, text="打开舵机工具", width=16,
+                                        command=self.app.open_servo_tool)
+        self.servo_tool_btn.grid(row=1, column=1, padx=10, pady=(3, 0))
 
         self.render_label = tk.Label(self, text="", font=SMALL_FONT, fg="#666")
         self.render_label.pack(pady=(0, 12))
         self.update_render_label()
 
     def on_started(self):
-        """启动后：启动按钮变为停止按钮，并启用渲染切换。"""
+        """启动后：启动按钮变为停止按钮，启用渲染切换，停用舵机工具。"""
         self.start_btn.config(text="停止", command=self.app.stop)
         self.toggle_btn.config(state=tk.NORMAL)
+        self.servo_tool_btn.config(state=tk.DISABLED)   # 启动后禁止再打开舵机工具
 
     def update_render_label(self, mode=None):
         mode = mode if mode is not None else self.app.manager.render_mode
@@ -1044,6 +1159,8 @@ class LiveSuitApp:
         self._slot_windows = []
         self.servo_panel = None
         self.servo = None              # ServoController，start() 时惰性初始化
+        self.servo_debug = ServoDebugger()   # 舵机调试逻辑（仅启动前使用）
+        self.servo_tool = None         # 舵机调试工具窗口引用
         self._tick_job = None
         self._started = False
 
@@ -1093,7 +1210,12 @@ class LiveSuitApp:
         self.manager.start()
         # 启动时读取槽位配置（alpha + 样本点）；无配置文件则按默认配置新建
         self.manager.load_slot_configs()
-        self.servo = _load_servo_controller()   # 缺硬件时为 None，仅跳过下发
+        # 启动后管线接管舵机逐帧下发：关闭启动前的舵机调试工具窗口，
+        # 并停用「打开舵机工具」按钮（由 welcome.on_started() 完成）。
+        self._close_servo_tool()
+        # 舵机控制器可能已在打开调试工具时惰性初始化，避免重复创建
+        if self.servo is None:
+            self.servo = _load_servo_controller()   # 缺硬件时为 None，仅跳过下发
         self._build_panels()
         self._apply_render_mode(self.manager.render_mode)
         self._schedule_tick()
@@ -1101,6 +1223,42 @@ class LiveSuitApp:
 
     def toggle_render(self):
         self.manager.toggle_render_mode()  # 触发 Store -> _on_state -> _apply_render_mode
+
+    # ---- 舵机调试工具 ----
+    def open_servo_tool(self):
+        """打开舵机调试工具（仅启动前可用）。
+
+        - 启动后（管线运行中）直接返回，防止与逐帧下发冲突；
+        - 舵机控制器未初始化时惰性初始化（无硬件时为 None，仅跳过下发）；
+        - 已打开窗口时置顶复用，避免重复创建。
+        """
+        if self._started:
+            return
+        if self.servo is None:
+            self.servo = _load_servo_controller()
+        if self.servo_tool is not None and self.servo_tool.winfo_exists():
+            self.servo_tool.deiconify()
+            self.servo_tool.lift()
+            return
+        self.servo_tool = ServoToolWindow(self.root, self,
+                                          on_close=self._on_servo_tool_closed)
+
+    def _on_servo_tool_closed(self, tool):
+        """ServoToolWindow 关闭时置空引用。"""
+        if self.servo_tool is tool:
+            self.servo_tool = None
+
+    def _close_servo_tool(self):
+        """直接销毁已打开的舵机调试工具窗口（启动时调用）。
+
+        直接 destroy() 不会触发 WM_DELETE_WINDOW 回调，需手动置空引用。
+        """
+        if self.servo_tool is not None:
+            try:
+                self.servo_tool.destroy()
+            except tk.TclError:   # 窗口可能已销毁
+                pass
+            self.servo_tool = None
 
     def _build_panels(self):
         for name in self.manager.slot_names():

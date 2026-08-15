@@ -535,6 +535,74 @@ class PipelineManager:
         return vec
 
 
+class ServoDebugger:
+    """舵机调试工具（纯逻辑层，不依赖 tkinter 与具体舵机硬件）。
+
+    用于在启动 LiveSuit 之前手动调试单个舵机通道：
+      - 16 个通道各自维护一个当前角度（默认 90° 中位）；
+      - select_channel() 仅切换当前通道，不产生输出指令，并返回该通道
+        当前角度（供 UI 刷新数字框，防止切换通道时误触发下发）；
+      - set_angle() / adjust() 校验并钳制到 [0,180]，返回钳制后的角度；
+      - get_vector() 返回 16 路完整角度向量，可直接交给
+        ServoController.set_angle() 下发。
+
+    该工具仅在启动 LiveSuit 之前可用（启动后按钮停用且已打开的窗口被关闭），
+    因此其手动角度不会与管线逐帧下发发生冲突。
+    """
+
+    def __init__(self, channels=SERVO_CHANNELS, neutral=DEFAULT_NEUTRAL_ANGLE):
+        self.channels = int(channels)
+        self._angles = [float(neutral)] * self.channels
+        self._selected = 0
+
+    @property
+    def selected(self):
+        """当前选中的舵机通道索引。"""
+        return self._selected
+
+    def select_channel(self, index):
+        """切换当前选中通道。
+
+        仅切换选中通道，不产生输出指令；返回该通道当前角度，供调用方
+        （gui）刷新数字框显示。
+        """
+        index = int(index)
+        if not (0 <= index < self.channels):
+            raise ValueError(f"非法舵机通道: {index}")
+        self._selected = index
+        return self._angles[index]
+
+    def get_angle(self, index=None):
+        """读取指定通道（缺省为当前选中通道）的角度。"""
+        if index is None:
+            index = self._selected
+        return self._angles[int(index)]
+
+    def set_angle(self, value, index=None):
+        """设置指定通道（缺省为当前选中通道）的角度，钳制到 [0,180]。
+
+        返回钳制后的角度。
+        """
+        if index is None:
+            index = self._selected
+        index = int(index)
+        if not (0 <= index < self.channels):
+            raise ValueError(f"非法舵机通道: {index}")
+        angle = max(0.0, min(180.0, float(value)))
+        self._angles[index] = angle
+        return angle
+
+    def adjust(self, delta, index=None):
+        """在当前角度基础上增减 delta（步长为 1°），并返回调整后角度。"""
+        if index is None:
+            index = self._selected
+        return self.set_angle(self.get_angle(index) + delta, index)
+
+    def get_vector(self):
+        """返回 16 路完整角度向量（可直接交给 ServoController.set_angle）。"""
+        return list(self._angles)
+
+
 def _load_default_slot_specs():
     """尝试从 servo_control/slots.py 读取默认槽位注册表。"""
     try:
@@ -550,6 +618,7 @@ __all__ = [
     "Normalizer",
     "Slot",
     "PipelineManager",
+    "ServoDebugger",
     "DataSource",
     "CallableSource",
     "SERVO_CHANNELS",
