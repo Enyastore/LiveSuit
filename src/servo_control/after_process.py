@@ -38,14 +38,14 @@ class Mapper:
     """三阶样条插值映射器（自然三次样条，numpy 实现）。
 
     通过样本点建立三次样条曲线，将输入 x 映射到归一化的 y（约定取值 [0, 1]），
-    再通过 range 元组线性映射到实际输出范围（如舵机角度 (0, 180)）。
+    再通过 range 元组线性映射到实际输出范围（如舵机脉宽 (500, 2500)，µs）。
 
     样本点结构为元组套列表 [(x_0, y_0), (x_1, y_1), ..., (x_i, y_i)]，
     实例化后可通过 set_points() 修改样本点并自动重建样条。
     输入超出样本点范围时钳制到边界值（不外推）。
     """
 
-    def __init__(self, points=None, range=(0.0, 180.0)):
+    def __init__(self, points=None, range=None):
         """初始化映射器。
 
         Parameters
@@ -53,10 +53,13 @@ class Mapper:
         points : list[tuple[float, float]] | None
             样本点列表，形如 [(x_0, y_0), (x_1, y_1), ...]。
             y 为归一化值（通常取 [0, 1]），默认 [(0.0, 0.0), (1.0, 1.0)]。
-        range : tuple[float, float]
+        range : tuple[float, float] | None
             输出范围 (lo, hi)。样条求得的归一化 y 会线性映射到该范围，
-            即最终输出 = lo + y * (hi - lo)。默认 (0.0, 180.0)。
+            即最终输出 = lo + y * (hi - lo)。缺省即默认舵机脉宽范围
+            (500, 2500)（µs）。
         """
+        if range is None:
+            range = (500.0, 2500.0)   # 默认舵机脉宽范围（µs）
         self._xs_list = [0.0, 1.0]
         self._coeffs = np.zeros((1, 4))
         self._points = []
@@ -133,7 +136,7 @@ class Mapper:
         Returns
         -------
         float
-            最终映射到 self.range 的输出值（如 range=(0, 180) 时输出 0~180）。
+            最终映射到 self.range 的输出值（如 range=(500, 2500) 时输出脉宽 µs）。
             输入超出样本点范围时钳制到边界值（不外推）。
         """
         x = float(x)

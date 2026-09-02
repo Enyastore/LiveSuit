@@ -1,7 +1,7 @@
 # 面捕追踪代码
 - 目前仅做了两眼追踪，每只眼输出eye_x、eye_y、eye_o三个归一化参数
 - 未来可能扩展嘴巴追踪等
-- 第一次跑眼追后创建config.yaml是相机配置（翻转、裁剪、兴趣椭圆、明度对比度滤镜）
+- 第一次跑眼追后创建camera_configs.yaml是相机配置（翻转、裁剪、兴趣椭圆、明度对比度滤镜）
 - references.yaml存储保存的参考值（注视极值向量、开闭度参考值）
 
 ---
@@ -18,7 +18,7 @@
 |---|---|
 | 工具函数 `_setup_camera` / `probe_camera_modes` / `mode_to_label` / `match_current_mode` | 相机打开与模式探测 |
 | 数据模型 `CameraConfig` / `AppConfig` | 相机配置数据 |
-| `ConfigPersistence` | `config.yaml` 读写 |
+| `ConfigPersistence` | `camera_configs.yaml` 读写 |
 | `CropDebugWindow` | 单眼裁剪/阈值调试窗口 |
 | `ControlPanel` | 锁定/标定控制面板 |
 | `EyeTrackingModule` | 核心编排，对外唯一入口 |
@@ -71,8 +71,8 @@ mod = launch_debug_panel()              # module._master.mainloop()
 - `left` / `right`：两个 `CameraConfig`。
 
 ### `ConfigPersistence` — YAML 读写
-- `load() -> AppConfig`：读取 `config.yaml`；文件不存在时生成默认配置并保存。
-- `save(config)`：写回 `config.yaml`（YAML 键名：`camera_index`、`crop`、`flip`、`frame_width` 等）。
+- `load() -> AppConfig`：读取 `camera_configs.yaml`；文件不存在时生成默认配置并保存。
+- `save(config)`：写回 `camera_configs.yaml`（YAML 键名：`camera_index`、`crop`、`flip`、`frame_width` 等）。
 
 ## 相机工具函数
 
@@ -84,7 +84,7 @@ mod = launch_debug_panel()              # module._master.mainloop()
 
 ## 核心编排 `EyeTrackingModule`
 
-构造：`EyeTrackingModule(headless=False, master=None, config_path="config.yaml", refs_file="references.yaml")`
+构造：`EyeTrackingModule(headless=False, master=None, config_path="camera_configs.yaml", refs_file="references.yaml")`
 - `headless=True`：不创建任何 GUI，`master` 置 None。
 - `master`：父 Tk 窗口；缺省自动创建隐藏根窗口。
 - 内部持有**模块级共享 `Normalizer`**（开度参考缓存），结果收集线程读取、控制面板写入同一个实例。
@@ -144,4 +144,4 @@ EyeTrackingModule.stop  ──► _stop_internal ──► ControlPanel.destroy 
 
 ## 相关文件
 - `eye_tracker_core.py`：`GazeVectorTracker`（C++ 算法封装）、`Normalizer`（注视极值/开度参考）。
-- `config.yaml` / `references.yaml`：运行时生成/读取的相机配置与标定参考值。
+- `camera_configs.yaml` / `references.yaml`：运行时生成/读取的相机配置与标定参考值。

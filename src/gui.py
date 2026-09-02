@@ -19,6 +19,7 @@
 import argparse
 import math
 import sys
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
@@ -37,10 +38,16 @@ if str(_SERVO_CONTROL) not in sys.path:
 # 避免把 cv2 / eye_tracker 等硬件依赖栈强耦合进纯 UI 或过早弹出眼追面板。
 
 from pipeline_manager import (  # noqa: E402
+    DEFAULT_MAX_PULSE,
+    DEFAULT_MIN_PULSE,
+    PULSE_SAFE_MAX,
+    PULSE_SAFE_MIN,
     CallableSource,
     PipelineManager,
-    SERVO_CHANNELS,
+    SERVO_CONFIGS_PATH,
+    SERVO_CONFIG_STATUS_REPLACED,
     ServoDebugger,
+    read_servo_configs,
 )
 
 _LOGO_PATH = _HERE.parent / "LiveSuitLogo.png"   # 仓库根目录下的 Logo
@@ -61,15 +68,18 @@ def _load_real_runtime(root):
     return (get_slot_specs(), CallableSource(slots.get_all_output), slots)
 
 
-def _load_servo_controller():
+def _load_servo_controller(pulse_configs):
     """惰性初始化舵机控制器（依赖 Adafruit CircuitPython 库与 I2C 总线）。
+
+    pulse_configs 为 {通道索引: (min_pulse, max_pulse)} 舵机脉宽注册表
+    （来自 servo_configs.yaml）；仅注册过的通道可下发。
 
     无 PCA9685 硬件 / 缺依赖时打印警告并返回 None（跳过舵机下发），
     不影响 GUI 与管线运行；这是硬件缺失的真实场景，非异常兜底。
     """
     try:
         from servo_controller import ServoController
-        return ServoController()
+        return ServoController(pulse_configs=pulse_configs)
     except Exception as exc:  # noqa: BLE001  缺库 / 无 I2C 设备 / 总线探测失败
         print(f"[gui] 无法初始化舵机控制器（{exc}），将跳过舵机下发。")
         return None
@@ -85,8 +95,12 @@ POINT_COLOR = "#e65100"       # 样本点（橙）
 RAW_SERIES_COLOR = "#78909c"  # EMA 原始序列（蓝灰，中等深度、清晰可见）
 FIL_SERIES_COLOR = "#1565c0"  # EMA 滤波序列（实色）
 ARROW_COLOR = "#c62828"       # 指示箭头（红）
+DANGER_COLOR = "#b71c1c"      # 深红：调试脉宽超出配置范围的警示色
 
 POLL_MS = 30                  # 默认渲染/处理轮询间隔（约 33Hz，≥30Hz 目标留余量）
+
+SERVO_FAIL_STREAK_LIMIT = 30   # 舵机下发连续失败约 1s 后暂停逐帧下发
+SERVO_RETRY_INTERVAL = 600     # 降级后约 20s 周期性重试一次
 
 TINY_FONT = ("Arial", 8)
 SMALL_FONT = ("Arial", 9)
@@ -115,10 +129,12 @@ class SplineCurveCanvas(tk.Canvas):
     交互:
       - 左键单击空白区域 -> 新增样本点
       - 左键拖拽样本点    -> 移动样本点并实时刷新样条曲线
-      - 左键双击样本点    -> 弹出 X(0~1) / Y(0~180) 编辑弹窗
+      - 左键双击样本点    -> 弹出 X(0~1) / Y(MIN~MAX) 编辑弹窗
       - 右键单击样本点    -> 删除样本点（x=0 与 x=1 边界点不可删除）
 
-    X 轴为归一化输入 0~1，Y 轴为角度 0~180。
+    X 轴为归一化输入 0~1，Y 轴为该槽位当前输出脉宽范围 MIN~MAX（µs）。
+    MIN/MAX 来自 slot.out_range：未绑定舵机时为默认 500~2500，绑定某路
+    舵机后为该舵机在 servo_configs.yaml 中注册的真实脉宽范围。
     顶部 X 轴上绘制当前滤波值的映射指示（与下方 EMA 图箭头对齐）。
     """
 
@@ -136,7 +152,7 @@ class SplineCurveCanvas(tk.Canvas):
         self.on_changed = on_changed
         self._cw = width
         self._ch = height
-        self.points = [list(p) for p in slot.points]   # 本画布维护的可编辑样本点
+        self.points = [list(p) for p in slot.points]   # 本画布维护的可编辑样本点（µs）
         self.indicator_x = None                        # 当前滤波值在 X 轴上的位置
         self._drag_index = None
         self._pending_add = None
@@ -153,7 +169,7 @@ class SplineCurveCanvas(tk.Canvas):
         self.bind("<Button-3>", self._on_right)
         self.bind("<Configure>", self._on_configure)
 
-    # ---- 坐标换算 ----
+    # ---- 坐标换算（Y 轴为当前槽位输出脉宽范围，µs）----
     def _plot_w(self):
         return self._cw - self.PAD_R - self.PAD_L
 
@@ -163,14 +179,22 @@ class SplineCurveCanvas(tk.Canvas):
     def _px(self, xv):
         return self.PAD_L + xv * self._plot_w()
 
+    def _y_range(self):
+        """当前生效的输出脉宽范围 (MIN, MAX)。"""
+        return tuple(self.slot.out_range)
+
     def _py(self, yv):
-        return self.PAD_T + (180.0 - yv) / 180.0 * self._plot_h()
+        lo, hi = self._y_range()
+        span = (hi - lo) if hi != lo else 1.0
+        return self.PAD_T + (hi - yv) / span * self._plot_h()
 
     def _ix(self, px):
         return (px - self.PAD_L) / self._plot_w()
 
     def _iy(self, py):
-        return 180.0 - (py - self.PAD_T) / self._plot_h() * 180.0
+        lo, hi = self._y_range()
+        span = (hi - lo) if hi != lo else 1.0
+        return hi - (py - self.PAD_T) / self._plot_h() * span
 
     # ---- 命中检测 ----
     def _find_point(self, px, py):
@@ -220,7 +244,8 @@ class SplineCurveCanvas(tk.Canvas):
         i = self._drag_index
         lo, hi = self._x_bounds(i)
         x = max(lo, min(hi, self._ix(e.x)))
-        y = max(0.0, min(180.0, self._iy(e.y)))
+        ylo, yhi = self._y_range()
+        y = max(ylo, min(yhi, self._iy(e.y)))
         self.points[i] = [x, y]
         self._commit()
 
@@ -249,7 +274,8 @@ class SplineCurveCanvas(tk.Canvas):
 
     def _add_point(self, px, py):
         x = max(0.001, min(0.999, self._ix(px)))
-        y = max(0.0, min(180.0, self._iy(py)))
+        ylo, yhi = self._y_range()
+        y = max(ylo, min(yhi, self._iy(py)))
         for ex, _ey in self.points:
             if abs(ex - x) < 1e-3:
                 return  # 与现有样本点 X 过近则忽略
@@ -259,11 +285,13 @@ class SplineCurveCanvas(tk.Canvas):
 
     def _edit_point(self, i):
         x, y = self.points[i]
-        dlg = EditPointDialog(self, x, y, lock_x=self._is_boundary(i))
+        dlg = EditPointDialog(self, x, y, lock_x=self._is_boundary(i),
+                              y_range=self._y_range())
         if dlg.result is None:
             return
         nx, ny = dlg.result
-        ny = max(0.0, min(180.0, ny))
+        ylo, yhi = self._y_range()
+        ny = max(ylo, min(yhi, ny))
         if self._is_boundary(i):
             # 边界点（x=0 / x=1）X 锁定，仅允许调整 Y
             nx = x
@@ -311,6 +339,18 @@ class SplineCurveCanvas(tk.Canvas):
             self.on_changed()
         self.draw()
 
+    def sync_from_slot(self):
+        """槽位输出范围变化（换绑舵机 / 解绑）后，从槽位重新取样本点并完整重绘。
+
+        slot.set_out_range() 会按归一化比例重缩放样本点（形状保持），
+        本画布持有的本地副本需同步，且静态层（Y 轴刻度）也要按新的
+        MIN~MAX 重建。
+        """
+        self.points = [list(p) for p in self.slot.points]
+        self.delete("static")
+        self._static_drawn = False
+        self.draw()
+
     # ---- 绘制 ----
     def set_indicator(self, norm_x):
         self.indicator_x = norm_x
@@ -332,11 +372,13 @@ class SplineCurveCanvas(tk.Canvas):
         px0, px1 = self.PAD_L, w - self.PAD_R
         py0, py1 = self.PAD_T, h - self.PAD_B
 
-        # 网格 + Y 轴刻度（角度 0~180）
-        for angle in (0, 45, 90, 135, 180):
-            y = self._py(angle)
+        # 网格 + Y 轴刻度（当前脉宽范围 MIN~MAX，µs，5 等分）
+        lo, hi = self._y_range()
+        for k in range(5):
+            v = lo + (hi - lo) * k / 4.0
+            y = self._py(v)
             self.create_line(px0, y, px1, y, fill=GRID_COLOR, tag="static")
-            self.create_text(px0 - 6, y, text=str(angle), anchor="e",
+            self.create_text(px0 - 6, y, text=f"{v:.0f}", anchor="e",
                              fill=AXIS_COLOR, font=TINY_FONT, tag="static")
 
         # 网格 + X 轴刻度（归一化 0~1）
@@ -350,13 +392,14 @@ class SplineCurveCanvas(tk.Canvas):
     # ---- 增量渲染：样条曲线（样本点变化时重建；超限段画红色警示）----
     def _draw_curve(self):
         self.delete("curve")
-        # 采样：y 钳制到 [0,180] 防止飞出画布，同时记录是否超限
+        # 采样：y 钳制到 [MIN,MAX]（µs）防止飞出画布，同时记录是否超限
+        lo, hi = self._y_range()
         samples = []
         for s in range(121):
             xv = s / 120.0
             yv = self.slot.mapper.get_result(xv)
-            over = yv > 180.0 or yv < 0.0
-            yv = max(0.0, min(180.0, yv))
+            over = yv > hi or yv < lo
+            yv = max(lo, min(hi, yv))
             samples.append((self._px(xv), self._py(yv), over))
         # 按超限标志分组：同组连续点连成一条线，超限段用红色凸显
         for is_over, group in self._split_by_flag(samples):
@@ -409,9 +452,10 @@ class SplineCurveCanvas(tk.Canvas):
             return
         ix = self._px(max(0.0, min(1.0, self.indicator_x)))
         py0, py1 = self.PAD_T, self._ch - self.PAD_B
-        # 交点角度同样钳制到 [0,180]，防止样条过冲时交点圆飞出画布
-        iy = self._py(max(0.0, min(180.0,
-                                   self.slot.mapper.get_result(self.indicator_x))))
+        # 交点脉宽同样钳制到 [MIN,MAX]，防止样条过冲时交点圆飞出画布
+        lo, hi = self._y_range()
+        iy = self._py(max(lo, min(hi,
+                                  self.slot.mapper.get_result(self.indicator_x))))
         if self._indicator_items is None:
             line = self.create_line(ix, py0, ix, py1, fill=ARROW_COLOR,
                                     dash=(2, 3), width=1)
@@ -620,13 +664,14 @@ class EditPointDialog(tk.Toplevel):
     """左键双击样本点弹出的 X/Y 数值编辑模态框。
 
     - X 输入范围 0~1（归一化）
-    - Y 输入范围 0~180（角度）
+    - Y 输入范围 MIN~MAX（该槽位当前脉宽范围，µs）
     - 边界点（x=0 / x=1）锁定 X，仅允许修改 Y
     """
 
-    def __init__(self, master, x, y, lock_x=False):
+    def __init__(self, master, x, y, lock_x=False, y_range=(500.0, 2500.0)):
         super().__init__(master.winfo_toplevel())
         self.result = None
+        self._y_range = (float(y_range[0]), float(y_range[1]))
         self.title("编辑样本点")
         self.resizable(False, False)
         self.transient(master.winfo_toplevel())
@@ -639,7 +684,9 @@ class EditPointDialog(tk.Toplevel):
         if lock_x:
             x_entry.config(state="disabled")
         x_entry.grid(row=0, column=1, padx=6, pady=4)
-        tk.Label(body, text="Y (0~180):").grid(row=1, column=0, sticky="e")
+        lo, hi = self._y_range
+        tk.Label(body, text=f"Y ({lo:.0f}~{hi:.0f}µs):")\
+            .grid(row=1, column=0, sticky="e")
         self._y_var = tk.StringVar(value=f"{y:.2f}")
         tk.Entry(body, textvariable=self._y_var, width=12)\
             .grid(row=1, column=1, padx=6, pady=4)
@@ -684,9 +731,12 @@ class EditPointDialog(tk.Toplevel):
         except ValueError:
             messagebox.showerror("输入错误", "请输入有效的数字", parent=self)
             return
-        if not (0.0 <= x <= 1.0) or not (0.0 <= y <= 180.0):
-            messagebox.showerror("输入错误", "X 需在 0~1 之间，Y 需在 0~180 之间",
-                                 parent=self)
+        lo, hi = self._y_range
+        if not (0.0 <= x <= 1.0) or not (lo <= y <= hi):
+            messagebox.showerror(
+                "输入错误",
+                f"X 需在 0~1 之间，Y 需在 {lo:.0f}~{hi:.0f}µs 之间",
+                parent=self)
             return
         self.result = (x, y)
         self.destroy()
@@ -722,7 +772,7 @@ class SlotControllerWindow(tk.Toplevel):
         header.pack(pady=(6, 2))
 
         tk.Label(self,
-                 text="样条曲线",
+                 text="样条曲线（脉宽 µs）",
                  font=TINY_FONT, fg="#333").pack(anchor="w", padx=8)
 
         tk.Label(self,
@@ -767,6 +817,7 @@ class SlotControllerWindow(tk.Toplevel):
                   command=self._on_reset_config).pack(side=tk.LEFT, padx=6)
 
         self._resize_refresh_pending = False
+        self._last_out_range = slot.out_range   # 绑定变化时用于触发样条重绘
         self.bind("<Configure>", self._on_window_resize)
         self.protocol("WM_DELETE_WINDOW", self._handle_close)
         self.refresh_binding()
@@ -853,8 +904,19 @@ class SlotControllerWindow(tk.Toplevel):
     def refresh_binding(self):
         if self.manager is None:
             return
+        # 换绑舵机 / 解绑会改变槽位输出脉宽范围（MIN~MAX）：
+        # 检测到变化时同步画布样本点并重绘静态层（Y 轴刻度）。
+        if self.slot.out_range != self._last_out_range:
+            self._last_out_range = self.slot.out_range
+            self.spline.sync_from_slot()
+            self.ema.redraw()
         idx = self.manager.get_binding(self.slot.name)
-        text = f"已绑定舵机: servo_{idx}" if idx is not None else "未绑定舵机"
+        lo, hi = self.slot.out_range
+        if idx is not None:
+            text = (f"已绑定舵机: servo_{idx}（{lo:.0f}~{hi:.0f}µs）")
+        else:
+            text = (f"未绑定舵机（默认 {DEFAULT_MIN_PULSE:.0f}~"
+                    f"{DEFAULT_MAX_PULSE:.0f}µs）")
         if self.binding_label.cget("text") != text:   # 脏检查，避免每帧重建
             self.binding_label.config(text=text)
 
@@ -870,12 +932,14 @@ class SlotControllerWindow(tk.Toplevel):
 class ServoBusPanel(tk.Toplevel):
     """舵机总线配置面板。
 
-    - 角度输入列：自动检测当前系统所有可用输入槽位（来自 slots.py 注册表），
+    - 输入槽位列：自动检测当前系统所有可用输入槽位（来自 slots.py 注册表），
       以 Label 文本呈现；
-    - 舵机输出列：每个槽位一个下拉框，选项为 servo_0 ~ servo_15 与「无」；
+    - 舵机输出列：每个槽位一个下拉框，选项为 servo_configs.yaml 中注册过的
+      舵机与「无」；
     - 去重校验：同一舵机通道只能绑定一个槽位；已选舵机自动从其他
       下拉框中移除，取消选择后重新出现（无需弹窗）；
-    - 实时绑定：选定后立即建立 angle -> servo 的映射。
+    - 实时绑定：选定后立即建立 slot -> servo 的映射，且槽位输出脉宽范围
+      切换为该舵机注册的 [min,max]（µs）。
     """
 
     def __init__(self, master, manager, on_close=None):
@@ -890,7 +954,7 @@ class ServoBusPanel(tk.Toplevel):
         title = tk.Label(self, text="舵机总线配置面板", font=TITLE_FONT)
         title.grid(row=0, column=0, columnspan=2, pady=(10, 6))
 
-        tk.Label(self, text="角度输入", font=SMALL_FONT, fg="#333")\
+        tk.Label(self, text="输入槽位", font=SMALL_FONT, fg="#333")\
             .grid(row=1, column=0, padx=14, sticky="w")
         tk.Label(self, text="舵机输出", font=SMALL_FONT, fg="#333")\
             .grid(row=1, column=1, padx=14, sticky="w")
@@ -898,7 +962,9 @@ class ServoBusPanel(tk.Toplevel):
         ttk.Separator(self, orient=tk.HORIZONTAL)\
             .grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=2)
 
-        options = ["无"] + [f"servo_{i}" for i in range(SERVO_CHANNELS)]
+        # 只列出 servo_configs.yaml 中注册过的舵机（只有注册过的才可用）
+        options = ["无"] + [f"servo_{i}"
+                           for i in self.manager.registered_servo_indices()]
         row = 3
         for name in self.manager.slot_names():
             tk.Label(self, text=name, font=("Courier", 10, "bold"))\
@@ -953,25 +1019,30 @@ class ServoBusPanel(tk.Toplevel):
             cur = self.manager.get_binding(name)
             if cur is not None:
                 used.add(cur)
+        registered = set(self.manager.registered_servo_indices())
         for name, combo in self._combos.items():
             own = self.manager.get_binding(name)
-            opts = ["无"] + [f"servo_{i}" for i in range(SERVO_CHANNELS)
+            opts = ["无"] + [f"servo_{i}" for i in sorted(registered)
                              if i not in used or i == own]
             combo["values"] = opts
 
 
 class ServoToolWindow(tk.Toplevel):
-    """舵机调试工具窗口。
+    """舵机调试工具窗口（脉宽标定）。
 
     用于启动 LiveSuit 之前手动调试单个舵机通道：
       - 标题栏：舵机工具
-      - 第一行：舵机输出 标签 + servo_0~servo_15 下拉框
-      - 第二行：[-] 按钮 + 角度数字输入框（含 ° 单位）+ [+] 按钮
+      - 第一行：舵机输出 标签 + 下拉框（仅列 servo_configs.yaml 注册舵机）
+      - 第二行：[-] 按钮 + 脉宽数字输入框（µs）+ [+] 按钮
+      - 第三行：状态提示（配置范围 / 安全范围 / 越界警示）
 
     行为约定：
-      - 下拉选择通道：仅切换并显示该通道当前角度，不下发（防误触发）；
+      - 下拉选择通道：仅切换并显示该通道当前脉宽，不下发（防误触发）；
       - 点击 +/- 或回车输入数值：立即下发到当前选中通道；
-      - 角度范围钳制在 0° ~ 180°，每次 +/- 步长为 1°。
+      - 允许设置 servo_configs.yaml 推荐范围之外的脉宽（便于实测找最佳值
+        写回配置文件），但硬钳制到全局安全范围 [400, 2700]µs；
+      - 当数值超出该通道配置范围时，输入框与提示变为深红色并显示舵机
+        损坏风险警示；每次 +/- 步长 1µs。
     """
 
     def __init__(self, master, app, on_close=None):
@@ -985,12 +1056,12 @@ class ServoToolWindow(tk.Toplevel):
         title = tk.Label(self, text="舵机工具", font=TITLE_FONT)
         title.pack(pady=(10, 6))
 
-        # 第一行：舵机输出 标签 + 通道下拉框
+        # 第一行：舵机输出 标签 + 通道下拉框（仅注册舵机）
         row1 = tk.Frame(self)
         row1.pack(padx=12, pady=(2, 4))
         tk.Label(row1, text="舵机输出", font=SMALL_FONT).pack(side=tk.LEFT,
                                                               padx=(0, 8))
-        self._channels = [f"servo_{i}" for i in range(SERVO_CHANNELS)]
+        self._channels = [f"servo_{i}" for i in self.debugger.registered_indices()]
         self._channel_var = tk.StringVar(value=self._channels[0])
         self._combo = ttk.Combobox(row1, textvariable=self._channel_var,
                                    values=self._channels, state="readonly",
@@ -998,45 +1069,77 @@ class ServoToolWindow(tk.Toplevel):
         self._combo.pack(side=tk.LEFT)
         self._combo.bind("<<ComboboxSelected>>", self._on_channel_select)
 
-        # 第二行：[-] 按钮 + 角度输入框（含 ° 单位）+ [+] 按钮
+        # 第二行：[-] 按钮 + 脉宽输入框（µs）+ [+] 按钮
         row2 = tk.Frame(self)
         row2.pack(padx=12, pady=(4, 10))
         tk.Button(row2, text="-", width=4, command=lambda: self._adjust(-1))\
             .pack(side=tk.LEFT, padx=6)
-        self._angle_var = tk.StringVar(value=self._fmt(self.debugger.get_angle()))
-        self._angle_entry = tk.Entry(row2, textvariable=self._angle_var,
-                                     width=10, justify=tk.CENTER)
-        self._angle_entry.pack(side=tk.LEFT, padx=6)
-        self._angle_entry.bind("<Return>", self._on_entry_commit)
+        self._pulse_var = tk.StringVar(value=self._fmt(self.debugger.get_pulse()))
+        self._pulse_entry = tk.Entry(row2, textvariable=self._pulse_var,
+                                     width=12, justify=tk.CENTER)
+        self._pulse_entry.pack(side=tk.LEFT, padx=6)
+        self._pulse_entry.bind("<Return>", self._on_entry_commit)
+        tk.Label(row2, text="µs", font=SMALL_FONT).pack(side=tk.LEFT, padx=(0, 6))
         tk.Button(row2, text="+", width=4, command=lambda: self._adjust(1))\
             .pack(side=tk.LEFT, padx=6)
 
+        # 第三行：状态提示（配置范围 / 安全范围 / 越界警示）
+        self._status_label = tk.Label(self, text="", font=SMALL_FONT,
+                                      fg="#666", wraplength=280, justify=tk.CENTER)
+        self._status_label.pack(padx=12, pady=(0, 10))
+
         self.protocol("WM_DELETE_WINDOW", self._handle_close)
+        self._update_status()
 
     @staticmethod
-    def _fmt(angle):
-        """角度显示格式：整数不带小数、保留 ° 单位（如 90° / 90.5°）。"""
-        return f"{angle:g}°"
+    def _fmt(pulse):
+        """脉宽显示格式：整数不带小数（µs，如 1500 / 1450.5）。"""
+        return f"{pulse:g}"
+
+    def _update_status(self):
+        """根据当前脉宽相对配置范围的状态刷新输入框颜色与警示标签。
+
+        在推荐范围内：正常黑色 + 提示「配置范围 / 安全范围」；
+        超出推荐范围：输入框与提示变深红 + 舵机损坏风险警示。
+        """
+        out = self.debugger.is_out_of_range()
+        lo, hi = self.debugger.config_range()
+        if out:
+            self._pulse_entry.config(fg=DANGER_COLOR)
+            self._status_label.config(
+                fg=DANGER_COLOR,
+                text=(f"⚠ 超出配置范围 {lo:.0f}~{hi:.0f}µs，"
+                      f"可能有舵机损坏风险（安全范围 {PULSE_SAFE_MIN:.0f}~"
+                      f"{PULSE_SAFE_MAX:.0f}µs）"))
+        else:
+            self._pulse_entry.config(fg="#000000")
+            self._status_label.config(
+                fg="#666",
+                text=(f"配置范围: {lo:.0f}~{hi:.0f}µs · "
+                      f"安全范围: {PULSE_SAFE_MIN:.0f}~{PULSE_SAFE_MAX:.0f}µs"))
 
     def _on_channel_select(self, _event=None):
-        """下拉切换通道：仅切换，不下发，数字框显示该通道当前角度。"""
+        """下拉切换通道：仅切换，不下发，数字框显示该通道当前脉宽。"""
         idx = int(self._channel_var.get().split("_")[1])
-        angle = self.debugger.select_channel(idx)
-        self._angle_var.set(self._fmt(angle))
+        pulse = self.debugger.select_channel(idx)
+        self._pulse_var.set(self._fmt(pulse))
+        self._update_status()
 
     def _adjust(self, delta):
-        """点击 +/-：以 1° 步长增减当前选中通道角度并立即下发。"""
-        angle = self.debugger.adjust(delta)
-        self._angle_var.set(self._fmt(angle))
+        """点击 +/-：以 1µs 步长增减当前选中通道脉宽并立即下发。"""
+        pulse = self.debugger.adjust(delta)
+        self._pulse_var.set(self._fmt(pulse))
         self._output()
+        self._update_status()
 
-    def _parse_angle(self, text):
-        """解析数字框文本，允许带 ° / 度 后缀；非法输入返回 None。"""
+    @staticmethod
+    def _parse_pulse(text):
+        """解析数字框文本，允许 µs / us / 微秒 后缀；非法输入返回 None。"""
         text = text.strip()
-        if text.endswith("°"):
-            text = text[:-1].strip()
-        elif text.endswith("度"):
-            text = text[:-1].strip()
+        for suffix in ("µs", "us", "微秒", "μs"):
+            if text.endswith(suffix):
+                text = text[:-len(suffix)].strip()
+                break
         try:
             return float(text)
         except ValueError:
@@ -1044,20 +1147,22 @@ class ServoToolWindow(tk.Toplevel):
 
     def _on_entry_commit(self, _event=None):
         """回车提交输入框数值：立即下发；非法输入恢复显示、不下发。"""
-        value = self._parse_angle(self._angle_var.get())
+        value = self._parse_pulse(self._pulse_var.get())
         if value is None:
-            self._angle_var.set(self._fmt(self.debugger.get_angle()))
+            self._pulse_var.set(self._fmt(self.debugger.get_pulse()))
+            self._update_status()
             return
-        angle = self.debugger.set_angle(value)
-        self._angle_var.set(self._fmt(angle))
+        pulse = self.debugger.set_pulse(value)
+        self._pulse_var.set(self._fmt(pulse))
         self._output()
+        self._update_status()
 
     def _output(self):
-        """把当前调试状态（16 路完整向量）立即下发到舵机硬件。"""
+        """把当前调试状态（16 路完整脉宽向量）立即下发到舵机硬件。"""
         if self.app.servo is None:
             return
         try:
-            self.app.servo.set_angle(self.debugger.get_vector())
+            self.app.servo.set_pulse(self.debugger.get_vector())
         except Exception as exc:  # noqa: BLE001  硬件下发异常不阻塞 UI
             print(f"[gui] 舵机调试下发失败（{exc}）")
 
@@ -1146,12 +1251,17 @@ class LiveSuitApp:
         self.root = root
         self.poll_ms = poll_ms
         self._runtime = None
+        # 每次运行都读取 servo_configs.yaml（缺失自动生成默认 16 路，非法则
+        # 用默认覆盖并打印/弹窗提示）；只有注册过的舵机在后续可用。
+        servo_configs, servo_cfg_status = read_servo_configs(SERVO_CONFIGS_PATH)
+        self.servo_pulse_configs = servo_configs
         # 注意：启动阶段不实例化 Slots 提供者（否则会立即唤起眼追调试面板）。
         # 先用空注册表 + 占位数据源构建占位管理器；真实的槽位注册表与
         # 眼球追踪数据源在点击「启动LiveSuit」后由 start() 中的
         # _load_real_runtime() 加载，并重建管理器（沿用同一 Store，保留状态）。
         self.manager = PipelineManager(slots_spec={},
-                                       source=CallableSource(lambda: {}))
+                                       source=CallableSource(lambda: {}),
+                                       servo_pulse_configs=servo_configs)
         if initial_headless:
             self.manager.set_render_mode("headless")
         self.store = self.manager.store
@@ -1159,10 +1269,21 @@ class LiveSuitApp:
         self._slot_windows = []
         self.servo_panel = None
         self.servo = None              # ServoController，start() 时惰性初始化
-        self.servo_debug = ServoDebugger()   # 舵机调试逻辑（仅启动前使用）
+        self.servo_debug = ServoDebugger(pulse_configs=servo_configs)
         self.servo_tool = None         # 舵机调试工具窗口引用
         self._tick_job = None
+        self._tick_count = 0              # 逐帧计数（降级后用于周期性重试舵机）
+        self._servo_fail_streak = 0       # 舵机下发连续失败帧数
+        self._servo_degraded = False      # 连续失败后暂停逐帧下发
+        self._last_tick_err = 0.0         # 单帧异常日志限频时间戳
         self._started = False
+
+        # servo_configs.yaml 非法被默认覆盖时给出明确提示（read 已打印详情）
+        if servo_cfg_status == SERVO_CONFIG_STATUS_REPLACED:
+            messagebox.showwarning(
+                "舵机配置提示",
+                "servo_configs.yaml 不合法，已用默认配置（servo_0~15，"
+                "500~2500µs）覆盖该文件。\n请按实际舵机型号编辑该文件。")
 
         root.title("LiveSuit")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -1206,7 +1327,8 @@ class LiveSuitApp:
             return
         # 用真实槽位注册表与数据源重建管理器（沿用原 Store，保留渲染模式等状态）
         self.manager = PipelineManager(slots_spec=specs, source=source,
-                                       store=self.store)
+                                       store=self.store,
+                                       servo_pulse_configs=self.servo_pulse_configs)
         self.manager.start()
         # 启动时读取槽位配置（alpha + 样本点）；无配置文件则按默认配置新建
         self.manager.load_slot_configs()
@@ -1215,7 +1337,7 @@ class LiveSuitApp:
         self._close_servo_tool()
         # 舵机控制器可能已在打开调试工具时惰性初始化，避免重复创建
         if self.servo is None:
-            self.servo = _load_servo_controller()   # 缺硬件时为 None，仅跳过下发
+            self.servo = _load_servo_controller(self.servo_pulse_configs)
         self._build_panels()
         self._apply_render_mode(self.manager.render_mode)
         self._schedule_tick()
@@ -1234,8 +1356,16 @@ class LiveSuitApp:
         """
         if self._started:
             return
+        if not self.servo_debug.registered_indices():
+            # 无任何注册舵机时无法调试：提示后直接返回，
+            # 避免 ServoToolWindow 对空通道列表取 [0] 崩溃。
+            messagebox.showwarning(
+                "舵机工具",
+                "servo_configs.yaml 中没有注册任何舵机，无法调试。\n"
+                "请先在配置文件中添加 min_pulse / max_pulse 条目。")
+            return
         if self.servo is None:
-            self.servo = _load_servo_controller()
+            self.servo = _load_servo_controller(self.servo_pulse_configs)
         if self.servo_tool is not None and self.servo_tool.winfo_exists():
             self.servo_tool.deiconify()
             self.servo_tool.lift()
@@ -1310,15 +1440,42 @@ class LiveSuitApp:
     def _tick(self):
         try:
             self.manager.tick()
-            # 舵机下发：绑定通道取槽位最新角度，未绑定通道保持 90° 中位
+            # 舵机下发：绑定通道取槽位最新脉宽，注册未绑定通道保持中点脉宽，
+            # 未注册通道不下发（None）
             if self.servo is not None:
-                self.servo.set_angle(self.manager.get_servo_vector())
+                degraded = self._servo_degraded
+                # 降级期间不再逐帧尝试，仅周期性重试以观察是否恢复
+                if not degraded or self._tick_count % SERVO_RETRY_INTERVAL == 0:
+                    try:
+                        self.servo.set_pulse(self.manager.get_servo_vector())
+                        if degraded:
+                            self._servo_degraded = False
+                            print("[gui] 舵机下发已恢复")
+                        self._servo_fail_streak = 0
+                    except Exception as exc:  # noqa: BLE001  硬件故障不中断渲染
+                        self._servo_fail_streak += 1
+                        if self._servo_fail_streak >= SERVO_FAIL_STREAK_LIMIT:
+                            self._servo_degraded = True
+                        # 限频提示：首次与每 300 帧打印一次，避免 30ms 刷屏
+                        if (self._servo_fail_streak == 1
+                                or self._servo_fail_streak % 300 == 0):
+                            print(f"[gui] 舵机下发失败（{exc}），"
+                                  f"连续 {self._servo_fail_streak} 帧"
+                                  + ("，已暂停逐帧下发" if self._servo_degraded else ""))
             # 无头模式下跳过子面板渲染，最大化节约系统资源
             if self.manager.render_mode == "debug":
                 self._prune_slot_windows()
                 for w in self._slot_windows:
                     w.redraw()
+        except Exception:  # noqa: BLE001  单帧数据管道异常不中断渲染循环
+            # 限频打印一次 traceback，避免 Tk 每帧隐式刷屏
+            now = time.time()
+            if now - self._last_tick_err > 2.0:
+                import traceback
+                traceback.print_exc()
+                self._last_tick_err = now
         finally:
+            self._tick_count += 1
             # 兜底：单帧异常（如子窗口竞态）不中断渲染循环，保证续排
             self._tick_job = self.root.after(self.poll_ms, self._tick)
 

@@ -28,19 +28,20 @@ sys.path.insert(0, str(_FACE_TRACKING))            # 便于 import eye_tracker_m
 # 输出槽位注册表
 # ============================================================
 # 每个槽位对应一条并行管道：
-#     原始数据 -> 归一化(in_range) -> EMA滤波 -> 三次样条 -> 舵机总线(out_range)
-#   key      : 槽位名（即舵机总线面板「角度输入」列的 Label）
+#     原始数据 -> 归一化(in_range) -> EMA滤波 -> 三次样条 -> 舵机总线(脉宽 µs)
+#   key      : 槽位名（即舵机总线面板「输入槽位」列的 Label）
 #   label    : 显示用中文名
 #   in_range : 原始数据取值范围（用于归一化到 [0, 1]）
-#   out_range: 三次样条输出范围（映射到舵机角度）
+# 注意：槽位的输出范围（脉宽 MIN~MAX）不再在此注册——它由该槽位绑定
+# 的舵机决定（servo_configs.yaml 中每路舵机的 min_pulse/max_pulse）。
 # ---此处可拓展其他输出槽位
 SLOT_SPECS = OrderedDict([
-    ("a_left_eye_x",  {"label": "左眼注视 X", "in_range": (-1.0, 1.0), "out_range": (0.0, 180.0)}),
-    ("a_left_eye_y",  {"label": "左眼注视 Y", "in_range": (-1.0, 1.0), "out_range": (0.0, 180.0)}),
-    ("a_left_eye_o",  {"label": "左眼开度",    "in_range": (0.0, 1.0),  "out_range": (0.0, 180.0)}),
-    ("a_right_eye_x", {"label": "右眼注视 X", "in_range": (-1.0, 1.0), "out_range": (0.0, 180.0)}),
-    ("a_right_eye_y", {"label": "右眼注视 Y", "in_range": (-1.0, 1.0), "out_range": (0.0, 180.0)}),
-    ("a_right_eye_o", {"label": "右眼开度",    "in_range": (0.0, 1.0),  "out_range": (0.0, 180.0)}),
+    ("a_left_eye_x",  {"label": "左眼注视 X", "in_range": (-1.0, 1.0)}),
+    ("a_left_eye_y",  {"label": "左眼注视 Y", "in_range": (-1.0, 1.0)}),
+    ("a_left_eye_o",  {"label": "左眼开度",    "in_range": (0.0, 1.0)}),
+    ("a_right_eye_x", {"label": "右眼注视 X", "in_range": (-1.0, 1.0)}),
+    ("a_right_eye_y", {"label": "右眼注视 Y", "in_range": (-1.0, 1.0)}),
+    ("a_right_eye_o", {"label": "右眼开度",    "in_range": (0.0, 1.0)}),
 ])
 
 # 提供者原始键 -> 槽位名（眼球追踪模块输出 left_eye_x 等，映射为 a_left_eye_x 等）

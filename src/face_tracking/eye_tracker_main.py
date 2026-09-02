@@ -58,6 +58,9 @@ from eye_tracker_core import GazeVectorTracker, Normalizer
 
 logger = logging.getLogger(__name__)
 
+# 子进程启动确认超时（秒）：轮询替代固定 sleep，兼容树莓派慢启动
+START_TIMEOUT = 5.0
+
 
 # ============================================================
 # 工具函数
@@ -204,7 +207,7 @@ class AppConfig:
 class ConfigPersistence:
     """负责 AppConfig 的 YAML 文件读写。"""
 
-    def __init__(self, filepath: str = "config.yaml"):
+    def __init__(self, filepath: str = "camera_configs.yaml"):
         self._filepath = filepath
 
     def load(self) -> AppConfig:
@@ -717,6 +720,11 @@ class CropDebugWindow:
         """搜索区域滑块回调：更新配置，实时发送到子进程。"""
         scale = float(val)
         self._cam_config.dark_search_roi_scale = scale
+        if self._cmd_queue is not None:
+            try:
+                self._cmd_queue.put_nowait(("set_search_roi_scale", scale))
+            except Exception as e:
+                logger.error(f"[{self._side}] 发送搜索区域比例失败: {e}")
         logger.info(f"[{self._side}] 搜索区域比例: {scale:.2f}")
 
     def _on_postprocess_changed(self, val: str = None) -> None:
@@ -1334,7 +1342,7 @@ class EyeTrackingModule:
     master : tk.Tk | None
         tkinter 父窗口。headless=False 且为 None 时自动创建隐藏根窗口。
     config_path : str
-        相机配置文件路径（默认 config.yaml）。
+        相机配置文件路径（默认 camera_configs.yaml）。
     refs_file : str
         参考值文件路径（默认 references.yaml）。
     """
@@ -1343,7 +1351,7 @@ class EyeTrackingModule:
         self,
         headless: bool = False,
         master: Optional[tk.Tk] = None,
-        config_path: str = "config.yaml",
+        config_path: str = "camera_configs.yaml",
         refs_file: str = "references.yaml",
     ):
         self._headless = headless
@@ -1375,6 +1383,9 @@ class EyeTrackingModule:
         self._raw_gaze: Dict[str, Optional[List[float]]] = {"left": None, "right": None}
         self._result_thread: Optional[threading.Thread] = None
         self._result_stop = threading.Event()
+        # 子进程死亡告警去重标记（_warn_if_tracker_died 使用）
+        self._death_logged_left = False
+        self._death_logged_right = False
 
         self._crop_window_left: Optional[CropDebugWindow] = None
         self._crop_window_right: Optional[CropDebugWindow] = None
@@ -1485,18 +1496,30 @@ class EyeTrackingModule:
         )
         self._process_right.start()
 
-        time.sleep(0.5)
-        left_alive = self._process_left.is_alive()
-        right_alive = self._process_right.is_alive()
+        # 轮询等待两个子进程确认存活（替代固定 sleep 的竞态探测）：
+        # 任一进程已退出则提前失败，并携带 exitcode 便于定位（如相机打开
+        # 失败时子进程会以 0 退出码快速结束）。
+        left_proc, right_proc = self._process_left, self._process_right
+        deadline = time.time() + START_TIMEOUT
+        left_alive = right_alive = False
+        while time.time() < deadline:
+            left_alive = left_proc.is_alive()
+            right_alive = right_proc.is_alive()
+            if left_alive and right_alive:
+                break
+            if not left_alive or not right_alive:
+                break
+            time.sleep(0.1)
 
         if not left_alive or not right_alive:
-            self._stop_internal()
             failed_side = []
             if not left_alive:
-                failed_side.append("左眼")
+                failed_side.append(f"左眼(exitcode={left_proc.exitcode})")
             if not right_alive:
-                failed_side.append("右眼")
-            raise RuntimeError(f"{'、'.join(failed_side)}追踪子进程启动失败（相机不可用或索引错误）")
+                failed_side.append(f"右眼(exitcode={right_proc.exitcode})")
+            self._stop_internal()
+            raise RuntimeError(
+                f"{'、'.join(failed_side)}追踪子进程启动失败（相机不可用或索引错误）")
 
         # 启动结果收集线程
         self._start_result_collector()
@@ -1520,6 +1543,8 @@ class EyeTrackingModule:
         if result_queue is None:
             return
 
+        last_err_log = 0.0   # 异常日志限频（秒），避免故障时刷屏
+
         while not self._result_stop.is_set():
             # 非阻塞快速排空队列积压：Tkinter 主线程绘制 Canvas 期间持锁，
             # 本线程可能被 GIL 长时间阻塞；每次被调度时一次性消费掉所有积压
@@ -1531,48 +1556,90 @@ class EyeTrackingModule:
                 except queue.Empty:
                     break
                 except Exception:
+                    # 队列被关闭/损坏等异常：限频记录后退出本次排空，
+                    # 不让采集线程静默死亡（否则数据冻结且无任何日志）。
+                    if time.time() - last_err_log > 2.0:
+                        logger.exception("读取追踪结果队列失败")
+                        last_err_log = time.time()
                     break
                 if data is None or data.get("side") is None:
                     continue
                 latest[data["side"]] = data  # 后写入覆盖先写入，天然取最新
 
-            if not latest:
+            if latest:
+                for side in ("left", "right"):
+                    data = latest.get(side)
+                    if data is None:
+                        continue
+                    try:
+                        self._apply_side_result(side, data, openness_normalizer)
+                    except Exception:
+                        # 单侧处理异常不影响另一侧；限频记录，防止线程静默死亡
+                        if time.time() - last_err_log > 2.0:
+                            logger.exception(f"[{side}] 处理追踪结果失败")
+                            last_err_log = time.time()
+            else:
                 time.sleep(0.002)  # 队列为空，短暂休眠避免忙轮询空转
-                continue
+            self._warn_if_tracker_died()
 
-            for side in ("left", "right"):
-                data = latest.get(side)
-                if data is None:
-                    continue
-                self._raw_gaze[side] = data.get("gaze_rotated")
+    def _apply_side_result(self, side: str, data: dict,
+                           openness_normalizer: Normalizer) -> None:
+        """把单眼一帧结果合并进 _latest_state（快照式整体替换）。"""
+        self._raw_gaze[side] = data.get("gaze_rotated")
 
-                raw_openness = data.get("raw_eye_openness", None)
+        raw_openness = data.get("raw_eye_openness", None)
 
-                # 计算归一化 eye_o
-                eye_o = None
-                if raw_openness is not None and isinstance(raw_openness, (int, float)) and raw_openness > 0:
-                    open_ref = openness_normalizer.get_openness_ref(side, "open")
-                    close_ref = openness_normalizer.get_openness_ref(side, "close")
-                    if open_ref is not None and close_ref is not None and open_ref > close_ref:
-                        eye_o = (raw_openness - close_ref) / (open_ref - close_ref)
-                        eye_o = max(0.0, min(1.0, eye_o))
+        # 计算归一化 eye_o
+        eye_o = None
+        if raw_openness is not None and isinstance(raw_openness, (int, float)) and raw_openness > 0:
+            open_ref = openness_normalizer.get_openness_ref(side, "open")
+            close_ref = openness_normalizer.get_openness_ref(side, "close")
+            if open_ref is not None and close_ref is not None and open_ref > close_ref:
+                eye_o = (raw_openness - close_ref) / (open_ref - close_ref)
+                eye_o = max(0.0, min(1.0, eye_o))
 
-                # 快照式整体替换：读者拿到的始终是同一次更新的一致快照
-                new_state = dict(self._latest_state)
-                new_state[side] = {
-                    "eye_x": data.get("eye_x"),
-                    "eye_y": data.get("eye_y"),
-                    "confidence": data.get("confidence"),
-                    "raw_eye_openness": raw_openness,
-                    "eye_o": eye_o,
-                }
-                new_state["timestamp"] = time.time()
-                self._latest_state = new_state
+        # 快照式整体替换：读者拿到的始终是同一次更新的一致快照
+        new_state = dict(self._latest_state)
+        new_state[side] = {
+            "eye_x": data.get("eye_x"),
+            "eye_y": data.get("eye_y"),
+            "confidence": data.get("confidence"),
+            "raw_eye_openness": raw_openness,
+            "eye_o": eye_o,
+        }
+        new_state["timestamp"] = time.time()
+        self._latest_state = new_state
+
+    def _warn_if_tracker_died(self) -> None:
+        """轻量存活监控：追踪子进程退出时限频记录告警（仅日志，不触碰 Tk）。
+
+        数据源（GUI/外部脚本）应通过 is_running() 感知进程状态；本方法只负责
+        在采集线程里留下可排查的日志痕迹。
+        """
+        for side, proc in (("left", self._process_left), ("right", self._process_right)):
+            if proc is not None and not proc.is_alive():
+                flag = "_death_logged_left" if side == "left" else "_death_logged_right"
+                if not getattr(self, flag, False):
+                    logger.warning(
+                        f"追踪子进程 {side} 已退出（exitcode={proc.exitcode}），"
+                        f"该眼数据将停止更新")
+                    setattr(self, flag, True)
 
     def _stop_internal(self) -> None:
         if self._control_panel is not None:
             self._control_panel.destroy()
             self._control_panel = None
+
+        # 关闭裁剪调试窗口并释放其独占的相机句柄：避免与追踪子进程双开
+        # 同一相机，以及 stop 后重启时相机被占用导致启动失败。
+        for attr in ("_crop_window_left", "_crop_window_right"):
+            win = getattr(self, attr, None)
+            if win is not None:
+                try:
+                    win.close()
+                except Exception:  # noqa: BLE001  窗口可能已被用户销毁
+                    pass
+                setattr(self, attr, None)
 
         # 停止结果收集线程
         self._result_stop.set()
@@ -1593,6 +1660,9 @@ class EyeTrackingModule:
         self._result_queue = None
         self._raw_gaze = {"left": None, "right": None}
         self._latest_state = self._empty_state()
+        # 重置子进程死亡告警去重标记（下次 start 重新监控）
+        self._death_logged_left = False
+        self._death_logged_right = False
         logger.info("眼球追踪已停止")
 
     def get_normalized_eye_state(self) -> dict:
@@ -1854,7 +1924,7 @@ def _build_debug_panel(module: EyeTrackingModule, window: tk.Widget,
 
 def launch_debug_panel(
     master: Optional[tk.Tk] = None,
-    config_path: str = "config.yaml",
+    config_path: str = "camera_configs.yaml",
     refs_file: str = "references.yaml",
 ) -> EyeTrackingModule:
     """创建并显示眼球追踪调试面板，返回绑定该面板的模块实例。

@@ -12,8 +12,6 @@ import os
 from eye_tracker_core_cpp import (
     Normalizer as _CppNormalizer,
     GazeVectorTracker as _CppGazeVectorTracker,
-    NormalizeResult,
-    TrackingResult,
     PupilDebugResult,
     OpennessDebugResult,
 )

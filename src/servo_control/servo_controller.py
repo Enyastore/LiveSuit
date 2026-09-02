@@ -1,39 +1,44 @@
-"""PCA9685 舵机控制器。
+"""PCA9685 舵机控制器（直接脉宽标定）。
 
 提供 ServoController 类：管理一块 PCA9685 上的多路舵机，
-set_angle() 接收角度值列表（形如 [1, 34, 29, ...]），将第 i 个角度
-写到对应索引 i 的舵机通道；超出 [0, 180] 的角度自动钳制到边界值。
+set_pulse() 接收脉宽值列表（形如 [1500, 1450, None, ...]），把第 i 个脉宽
+（µs）直接换算为 duty cycle 写到对应索引 i 的舵机通道。
 
-创建舵机对象时显式传入 min_pulse / max_pulse（默认 500 / 2500 µs），
-避免 adafruit_motor.servo.Servo 的库默认值（750 / 2250 µs）把 0°/180°
-指令映射到偏窄脉宽，导致实测行程不足 180°。
+与旧的 set_angle()（通过 adafruit_motor.Servo 做角度->脉宽换算）不同，
+本实现完全绕过角度数学：每个通道只按全局安全范围 [400, 2700]µs 钳制后
+直写 PCA9685，避免「厂商标称脉宽与实际偏转不一致」时角度换算引入的二次
+误差。各通道的推荐范围（servo_configs.yaml 注册的 min_pulse/max_pulse）
+由上层 Slot/调试工具负责约束与警示，换用不同脉宽范围的舵机型号时只需
+调整注册表，无需改动控制逻辑。
 """
 
 import board
 import busio
-from adafruit_motor import servo
 from adafruit_pca9685 import PCA9685
+
+# 全局绝对安全脉宽范围（µs）：任何通道下发都不允许越过该硬边界
+# （与 pipeline_manager.PULSE_SAFE_MIN / PULSE_SAFE_MAX 保持一致，
+#  对应实验脚本实测的 400~2700µs 无堵转区间）。
+PULSE_SAFE_MIN = 400.0
+PULSE_SAFE_MAX = 2700.0
 
 
 class ServoController:
-    """基于 PCA9685 的多路舵机控制器。
+    """基于 PCA9685 的多路舵机控制器（直接写脉宽 duty cycle）。
 
-    每个通道预先绑定一个 adafruit_motor.servo.Servo 对象，
-    调用 set_angle() 即可一次下发多路角度。
+    只向 servo_configs.yaml 中注册过的通道下发；下发时硬钳制到全局安全
+    范围 [400, 2700]µs（各通道注册的 [min_pulse, max_pulse] 由上层约束）。
     """
 
-    MIN_ANGLE = 0.0     # 角度下限（度）
-    MAX_ANGLE = 180.0   # 角度上限（度）
-
-    def __init__(self, channels: int = 16, address: int = 0x40,
-                 frequency: float = 50.0, i2c=None,
-                 min_pulse: int = 500, max_pulse: int = 2500):
-        """初始化 PCA9685 并创建各通道的舵机对象。
+    def __init__(self, pulse_configs=None, address: int = 0x40,
+                 frequency: float = 50.0, i2c=None):
+        """初始化 PCA9685 并登记各通道的脉宽范围。
 
         Parameters
         ----------
-        channels : int
-            使用的舵机通道数（PCA9685 最多 16 路），默认 16。
+        pulse_configs : dict | None
+            {通道索引: (min_pulse, max_pulse)}（µs），仅这些注册通道可写。
+            索引须在 0~15 且 0 < min_pulse < max_pulse，非法项自动忽略。
         address : int
             PCA9685 的 I2C 地址，默认 0x40。
         frequency : float
@@ -41,56 +46,58 @@ class ServoController:
         i2c : busio.I2C | None
             外部传入的 I2C 总线；为 None 时自动检测默认 I2C 引脚（SCL/SDA）。
             传入已有总线可便于测试/复用。
-        min_pulse : int
-            0° 对应的 PWM 脉宽（µs）。默认 500，对应常见 180° 舵机
-            （SG90 / MG90S / MG996R 等）的标称下限；请按舵机数据手册调整。
-        max_pulse : int
-            180° 对应的 PWM 脉宽（µs）。默认 2500，对应常见 180° 舵机的
-            标称上限。注意：脉宽范围应与舵机机械行程标称一致，设置过宽
-            会在端点堵转并增大电流。
 
         Notes
         -----
-        默认 500~2500 µs 相比 adafruit_motor.servo.Servo 的库默认
-        （750~2250 µs）覆盖了大多数 180° 舵机的完整行程；若沿用库默认，
-        0°/180° 指令会被映射到偏窄的脉宽，实测行程不足 180°。
+        每路舵机的 min/max 脉宽来自 servo_configs.yaml 注册表（无该文件时
+        gui 会按默认 500~2500 生成），因此不同通道可用不同的脉宽范围，
+        换用其他型号舵机只需修改注册表，无需改代码。
         """
         if i2c is None:
             i2c = busio.I2C(board.SCL, board.SDA)
         self._pca = PCA9685(i2c, address=address)
         self._pca.frequency = frequency
-        # 每个通道一个舵机对象，列表索引即通道号。
-        # 显式传入 min_pulse/max_pulse：使用库默认 750/2250 µs 会导致
-        # 0°/180° 指令对应脉宽偏窄，实测行程小于 180°。
-        self.min_pulse = min_pulse
-        self.max_pulse = max_pulse
-        self._servos = [servo.Servo(self._pca.channels[i],
-                                    actuation_range=180,
-                                    min_pulse=min_pulse,
-                                    max_pulse=max_pulse)
-                        for i in range(channels)]
+        # 只保留合法注册通道
+        self.pulse_configs = {}
+        for idx, (lo, hi) in dict(pulse_configs or {}).items():
+            idx = int(idx)
+            if 0 <= idx < 16 and 0.0 < float(lo) < float(hi):
+                self.pulse_configs[idx] = (float(lo), float(hi))
+        # 已下发脉宽缓存：值未变化时跳过重复 I2C 写，降低总线流量与 UI 阻塞
+        self._last_pulses = {}
 
-    def set_angle(self, angles):
-        """将角度值列表下发到对应索引的舵机。
+    @staticmethod
+    def _pulse_to_duty(pulse_us: float, frequency: float) -> int:
+        """把脉宽（µs）换算为 PCA9685 16-bit duty cycle（0~65535）。"""
+        duty = int(round(pulse_us * frequency * 65535.0 / 1_000_000.0))
+        return max(0, min(65535, duty))
+
+    def set_pulse(self, pulses):
+        """将脉宽值列表下发到对应索引的舵机。
 
         Parameters
         ----------
-        angles : list[float] | tuple[float]
-            形如 [1, 34, 29, ...] 的角度列表，第 i 个值作用于第 i 路舵机；
-            超出 [0, 180] 的角度会被钳制到边界值。
+        pulses : list[float | None] | tuple[float | None]
+            形如 [1500, 1450, None, ...] 的脉宽列表（µs），第 i 个值作用于
+            第 i 路舵机；None 或未注册通道跳过不写；已注册通道硬钳制到
+            全局安全范围 [400, 2700]µs。
 
-        Raises
-        ------
-        ValueError
-            角度数量多于舵机通道数时抛出。
+        Notes
+        -----
+        钳制到安全范围而非各通道注册的 [min,max]：运行管线侧的值已在
+        PipelineManager / Slot 中按绑定舵机注册范围钳制（⊂ 安全范围），
+        因此不受影响；而舵机调试工具可以在安全范围内探索注册范围之外的
+        脉宽，以实测最佳值。
         """
-        if len(angles) > len(self._servos):
-            raise ValueError(
-                f"角度数量({len(angles)})超过舵机通道数({len(self._servos)})"
-            )
-        for index, angle in enumerate(angles):
-            clamped = min(max(float(angle), self.MIN_ANGLE), self.MAX_ANGLE)
-            self._servos[index].angle = clamped
+        for index in self.pulse_configs:
+            if index >= len(pulses) or pulses[index] is None:
+                continue
+            pulse = max(PULSE_SAFE_MIN, min(PULSE_SAFE_MAX, float(pulses[index])))
+            if self._last_pulses.get(index) == pulse:
+                continue
+            self._pca.channels[index].duty_cycle = self._pulse_to_duty(
+                pulse, self._pca.frequency)
+            self._last_pulses[index] = pulse
 
     def deinit(self):
         """释放 PCA9685 资源（停用芯片 PWM 输出）。"""
