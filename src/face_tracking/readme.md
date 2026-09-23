@@ -3,6 +3,8 @@
 - 未来可能扩展嘴巴追踪等
 - 第一次跑眼追后创建camera_configs.yaml是相机配置（翻转、裁剪、兴趣椭圆、明度对比度滤镜）
 - references.yaml存储保存的参考值（注视极值向量、开闭度参考值）
+- 运行期配置文件统一放在仓库 `src/` 目录下且与当前工作目录无关：`src/camera_configs.yaml`、
+  `src/references.yaml`（与 `src/slot_configs.yaml`、`src/servo_configs.yaml` 同一策略）。
 
 ---
 

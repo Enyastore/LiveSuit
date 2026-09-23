@@ -40,13 +40,12 @@ if str(_SERVO_CONTROL) not in sys.path:
 from pipeline_manager import (  # noqa: E402
     DEFAULT_MAX_PULSE,
     DEFAULT_MIN_PULSE,
-    PULSE_SAFE_MAX,
-    PULSE_SAFE_MIN,
     CallableSource,
     PipelineManager,
     SERVO_CONFIGS_PATH,
     SERVO_CONFIG_STATUS_REPLACED,
     ServoDebugger,
+    Store,
     read_servo_configs,
 )
 
@@ -68,18 +67,20 @@ def _load_real_runtime(root):
     return (get_slot_specs(), CallableSource(slots.get_all_output), slots)
 
 
-def _load_servo_controller(pulse_configs):
+def _load_servo_controller(pulse_configs, safe_range):
     """惰性初始化舵机控制器（依赖 Adafruit CircuitPython 库与 I2C 总线）。
 
     pulse_configs 为 {通道索引: (min_pulse, max_pulse)} 舵机脉宽注册表
-    （来自 servo_configs.yaml）；仅注册过的通道可下发。
+    （来自 servo_configs.yaml）；safe_range 为全局安全范围 (min, max)（µs，
+    来自 servo_configs.yaml 顶层 safe_pulse_min/max）。仅注册过的通道可下发。
 
     无 PCA9685 硬件 / 缺依赖时打印警告并返回 None（跳过舵机下发），
     不影响 GUI 与管线运行；这是硬件缺失的真实场景，非异常兜底。
     """
     try:
         from servo_controller import ServoController
-        return ServoController(pulse_configs=pulse_configs)
+        return ServoController(pulse_configs=pulse_configs,
+                               safe_min=safe_range[0], safe_max=safe_range[1])
     except Exception as exc:  # noqa: BLE001  缺库 / 无 I2C 设备 / 总线探测失败
         print(f"[gui] 无法初始化舵机控制器（{exc}），将跳过舵机下发。")
         return None
@@ -1104,19 +1105,20 @@ class ServoToolWindow(tk.Toplevel):
         """
         out = self.debugger.is_out_of_range()
         lo, hi = self.debugger.config_range()
+        safe_lo, safe_hi = self.app.servo_safe
         if out:
             self._pulse_entry.config(fg=DANGER_COLOR)
             self._status_label.config(
                 fg=DANGER_COLOR,
                 text=(f"⚠ 超出配置范围 {lo:.0f}~{hi:.0f}µs，"
-                      f"可能有舵机损坏风险（安全范围 {PULSE_SAFE_MIN:.0f}~"
-                      f"{PULSE_SAFE_MAX:.0f}µs）"))
+                      f"可能有舵机损坏风险（安全范围 {safe_lo:.0f}~"
+                      f"{safe_hi:.0f}µs）"))
         else:
             self._pulse_entry.config(fg="#000000")
             self._status_label.config(
                 fg="#666",
                 text=(f"配置范围: {lo:.0f}~{hi:.0f}µs · "
-                      f"安全范围: {PULSE_SAFE_MIN:.0f}~{PULSE_SAFE_MAX:.0f}µs"))
+                      f"安全范围: {safe_lo:.0f}~{safe_hi:.0f}µs"))
 
     def _on_channel_select(self, _event=None):
         """下拉切换通道：仅切换，不下发，数字框显示该通道当前脉宽。"""
@@ -1232,7 +1234,7 @@ class WelcomePage(tk.Frame):
         self.servo_tool_btn.config(state=tk.DISABLED)   # 启动后禁止再打开舵机工具
 
     def update_render_label(self, mode=None):
-        mode = mode if mode is not None else self.app.manager.render_mode
+        mode = mode if mode is not None else self.app.store.get("render_mode")
         text = ("当前渲染: 调试模式（显示所有子面板）"
                 if mode == "debug" else
                 "当前渲染: 无头模式（隐藏并停止渲染所有子面板）")
@@ -1253,23 +1255,27 @@ class LiveSuitApp:
         self._runtime = None
         # 每次运行都读取 servo_configs.yaml（缺失自动生成默认 16 路，非法则
         # 用默认覆盖并打印/弹窗提示）；只有注册过的舵机在后续可用。
-        servo_configs, servo_cfg_status = read_servo_configs(SERVO_CONFIGS_PATH)
+        # safe_range 为全局安全脉宽范围（顶层 safe_pulse_min/max）。
+        servo_configs, servo_cfg_status, self.servo_safe = read_servo_configs(
+            SERVO_CONFIGS_PATH)
         self.servo_pulse_configs = servo_configs
-        # 注意：启动阶段不实例化 Slots 提供者（否则会立即唤起眼追调试面板）。
-        # 先用空注册表 + 占位数据源构建占位管理器；真实的槽位注册表与
-        # 眼球追踪数据源在点击「启动LiveSuit」后由 start() 中的
-        # _load_real_runtime() 加载，并重建管理器（沿用同一 Store，保留状态）。
-        self.manager = PipelineManager(slots_spec={},
-                                       source=CallableSource(lambda: {}),
-                                       servo_pulse_configs=servo_configs)
-        if initial_headless:
-            self.manager.set_render_mode("headless")
-        self.store = self.manager.store
+
+        # Store 是跨组件共享的单数据源，独立于 manager 先建立（欢迎页需要在
+        # 启动前读取 render_mode）。真实 PipelineManager 延迟到点击
+        # 「启动LiveSuit」后由 start() 用真实槽位表 / 数据源构建，并复用同一个 Store。
+        self.manager = None
+        self.store = Store(initial={
+            "render_mode": "headless" if initial_headless else "debug",
+            "started": False,
+            "bindings": {},
+        })
 
         self._slot_windows = []
         self.servo_panel = None
         self.servo = None              # ServoController，start() 时惰性初始化
-        self.servo_debug = ServoDebugger(pulse_configs=servo_configs)
+        self.servo_debug = ServoDebugger(
+            pulse_configs=servo_configs,
+            safe_min=self.servo_safe[0], safe_max=self.servo_safe[1])
         self.servo_tool = None         # 舵机调试工具窗口引用
         self._tick_job = None
         self._tick_count = 0              # 逐帧计数（降级后用于周期性重试舵机）
@@ -1325,7 +1331,7 @@ class LiveSuitApp:
                 "启动失败",
                 f"无法启动眼球追踪：{exc}\n请检查依赖与摄像头后重新点击启动。")
             return
-        # 用真实槽位注册表与数据源重建管理器（沿用原 Store，保留渲染模式等状态）
+        # 用真实槽位注册表与数据源构建管理器（复用 __init__ 建立的 Store，保留渲染模式等状态）
         self.manager = PipelineManager(slots_spec=specs, source=source,
                                        store=self.store,
                                        servo_pulse_configs=self.servo_pulse_configs)
@@ -1337,7 +1343,8 @@ class LiveSuitApp:
         self._close_servo_tool()
         # 舵机控制器可能已在打开调试工具时惰性初始化，避免重复创建
         if self.servo is None:
-            self.servo = _load_servo_controller(self.servo_pulse_configs)
+            self.servo = _load_servo_controller(self.servo_pulse_configs,
+                                                self.servo_safe)
         self._build_panels()
         self._apply_render_mode(self.manager.render_mode)
         self._schedule_tick()
@@ -1365,7 +1372,8 @@ class LiveSuitApp:
                 "请先在配置文件中添加 min_pulse / max_pulse 条目。")
             return
         if self.servo is None:
-            self.servo = _load_servo_controller(self.servo_pulse_configs)
+            self.servo = _load_servo_controller(self.servo_pulse_configs,
+                                                self.servo_safe)
         if self.servo_tool is not None and self.servo_tool.winfo_exists():
             self.servo_tool.deiconify()
             self.servo_tool.lift()

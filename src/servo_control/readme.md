@@ -57,6 +57,8 @@ src/face_tracking/eye_tracker_main.py         src/servo_control/
 `src/servo_configs.yaml` 声明实际使用的舵机及其脉宽范围。每次运行 `gui.py` 都会读取：
 
 ```yaml
+safe_pulse_min: 400      # 全局安全脉宽下限（µs，可选）
+safe_pulse_max: 2700     # 全局安全脉宽上限（µs，可选）
 servo_0:
   min_pulse: 450
   max_pulse: 2650
@@ -67,6 +69,8 @@ servo_1:
 
 规则：
 - **只有写入该文件且合法的舵机才可用**（调试工具 / 总线面板 / 逐帧下发均只作用于注册舵机）；
+- 顶层可选保留键 `safe_pulse_min` / `safe_pulse_max` 覆盖全局安全范围（缺省 400~2700µs），
+  调试工具下发与输入框警示均以该值为准；
 - 文件缺失时自动生成默认 `servo_0 ~ servo_15`（500~2500µs）；
 - 文件不合法（YAML 解析失败 / 顶层非字典 / 无任何有效条目）时打印错误并弹出提示，
   同时用默认参数**覆盖**该文件；
@@ -79,13 +83,14 @@ servo_1:
 
 基于 [Adafruit PCA9685](https://docs.circuitpython.org/projects/pca9685/) 的多路舵机控制器。
 
-- `ServoController(pulse_configs=None, address=0x40, frequency=50.0, i2c=None)`
+- `ServoController(pulse_configs=None, address=0x40, frequency=50.0, i2c=None, safe_min=400, safe_max=2700)`
   - `pulse_configs`：`{通道索引: (min_pulse, max_pulse)}`（µs），仅这些注册通道可写。
+  - `safe_min` / `safe_max`：全局安全脉宽范围（µs），由 `servo_configs.yaml` 顶层提供。
   - 不再使用 `adafruit_motor.Servo` 的角度换算，直接计算 duty cycle 写入 PCA9685，
     从根本上避免「角度 -> 脉宽」换算误差。
 - `set_pulse(pulses)`：接收脉宽列表（如 `[1500, 1450, None, ...]`，µs），第 `i` 个值
   写到索引 `i` 的通道；`None` 或未注册通道跳过不写；已注册通道硬钳制到
-  全局安全范围 **400~2700µs**。
+  全局安全范围（缺省 400~2700µs，由 `safe_pulse_min/max` 覆盖）。
   > 钳制到安全范围而非各通道注册范围：运行管线侧的值已在 Slot 中按绑定舵机的
   > 注册范围钳制（⊂ 安全范围），不受影响；而舵机调试工具可以在安全范围内
   > 探索注册范围之外的脉宽，用于实测找最佳值并写回 `servo_configs.yaml`。
@@ -94,7 +99,8 @@ servo_1:
 ### 舵机调试工具（GUI：打开舵机工具）
 
 - 允许设置 `servo_configs.yaml` 推荐范围之外的脉宽（方便实测机械行程极限），
-  但**不可超过全局安全范围 [400, 2700]µs**（超出自动钳制）。
+  但**不可超过全局安全范围**（缺省 [400, 2700]µs，由顶层 `safe_pulse_min/max`
+  覆盖；超出自动钳制）。
 - 当数值超出该通道配置范围时，输入框与提示变**深红色**，并显示
   「⚠ 超出配置范围 …µs，可能有舵机损坏风险」；回到范围内自动恢复正常显示。
 - 找到最佳脉宽后，把对应通道的 `min_pulse` / `max_pulse` 写回 `servo_configs.yaml`。

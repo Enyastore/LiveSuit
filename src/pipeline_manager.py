@@ -54,8 +54,34 @@ DEFAULT_PULSE_RANGE = (DEFAULT_MIN_PULSE, DEFAULT_MAX_PULSE)
 
 # 调试工具允许的绝对安全脉宽范围（µs）：运行/调试时任何通道都不允许越过
 # 该硬边界（对应 test_servo.py 实测的 400~2700µs 无堵转区间）。
+# 该值可由 servo_configs.yaml 顶层的 safe_pulse_min / safe_pulse_max 覆盖，
+# 这里的常量是文件缺失/字段非法时的兜底默认。
 PULSE_SAFE_MIN = 400.0
 PULSE_SAFE_MAX = 2700.0
+
+# servo_configs.yaml 中用于覆盖全局安全范围的保留键
+SERVO_CONFIG_SAFE_MIN_KEY = "safe_pulse_min"
+SERVO_CONFIG_SAFE_MAX_KEY = "safe_pulse_max"
+_SERVO_CONFIG_SAFE_KEYS = (SERVO_CONFIG_SAFE_MIN_KEY, SERVO_CONFIG_SAFE_MAX_KEY)
+
+
+def sanitize_pulse_configs(configs, channels=SERVO_CHANNELS):
+    """清洗 {索引: (min_pulse, max_pulse)}，仅保留合法项。
+
+    仅保留 ``0 <= 索引 < channels`` 且 ``0 < min_pulse < max_pulse`` 的条目，
+    非法键/非二元组/非数字项一律丢弃。供 ServoController 与 ServoDebugger
+    共用，避免两处各写一份校验逻辑（曾因手动同步而分叉）。
+    """
+    out = OrderedDict()
+    for idx, limits in dict(configs or {}).items():
+        try:
+            idx = int(idx)
+            lo, hi = float(limits[0]), float(limits[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if 0 <= idx < channels and 0.0 < lo < hi:
+            out[idx] = (lo, hi)
+    return out
 
 # 默认三次样条样本点：仅左右边界，即 [0,1] -> [min_pulse,max_pulse] 的线性映射
 DEFAULT_POINTS = [(0.0, DEFAULT_MIN_PULSE), (1.0, DEFAULT_MAX_PULSE)]
@@ -130,24 +156,47 @@ def default_servo_pulse_configs(channels=SERVO_CHANNELS):
     )
 
 
-def write_servo_configs(path, configs):
+def _parse_servo_safe_range(data):
+    """解析 servo_configs.yaml 顶层的可选安全范围；缺失/非法回退默认。"""
+    try:
+        lo = float(data.get(SERVO_CONFIG_SAFE_MIN_KEY, PULSE_SAFE_MIN))
+        hi = float(data.get(SERVO_CONFIG_SAFE_MAX_KEY, PULSE_SAFE_MAX))
+    except (TypeError, ValueError):
+        lo = hi = None
+    if lo is not None and math.isfinite(lo) and math.isfinite(hi) and 0.0 < lo < hi:
+        return (lo, hi)
+    if SERVO_CONFIG_SAFE_MIN_KEY in data or SERVO_CONFIG_SAFE_MAX_KEY in data:
+        print(f"[pipeline_manager] {SERVO_CONFIG_SAFE_MIN_KEY}/"
+              f"{SERVO_CONFIG_SAFE_MAX_KEY} 非法，回退默认 "
+              f"{PULSE_SAFE_MIN:.0f}~{PULSE_SAFE_MAX:.0f}µs")
+    return (PULSE_SAFE_MIN, PULSE_SAFE_MAX)
+
+
+def write_servo_configs(path, configs, safe_range=None):
     """把 {索引: (min_pulse, max_pulse)} 写为 servo_configs.yaml。
 
-    文件格式：:
+    safe_range 为可选的全局安全脉宽范围 (min, max)（µs），缺省用
+    PULSE_SAFE_MIN/MAX。文件格式：:
 
+        safe_pulse_min: 400
+        safe_pulse_max: 2700
         servo_0:
           min_pulse: 450
           max_pulse: 2650
         servo_1:
           ...
     """
+    safe_lo, safe_hi = (safe_range if safe_range is not None
+                        else (PULSE_SAFE_MIN, PULSE_SAFE_MAX))
     payload = {
-        f"servo_{int(idx)}": {
+        SERVO_CONFIG_SAFE_MIN_KEY: int(round(float(safe_lo))),
+        SERVO_CONFIG_SAFE_MAX_KEY: int(round(float(safe_hi))),
+    }
+    for idx, (lo, hi) in (configs or {}).items():
+        payload[f"servo_{int(idx)}"] = {
             "min_pulse": int(round(float(lo))),
             "max_pulse": int(round(float(hi))),
         }
-        for idx, (lo, hi) in (configs or {}).items()
-    }
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(payload, f, allow_unicode=True, sort_keys=False)
 
@@ -165,10 +214,11 @@ def _parse_servo_key(key):
 
 
 def read_servo_configs(path):
-    """加载舵机脉宽注册表，返回 (configs, status)。
+    """加载舵机脉宽注册表，返回 (configs, status, safe_range)。
 
     configs 为 {通道索引: (min_pulse, max_pulse)}（仅包含合法注册项），
-    status 取值见 SERVO_CONFIG_STATUS_* 常量。
+    status 取值见 SERVO_CONFIG_STATUS_* 常量，safe_range 为全局安全范围
+    (min, max)（µs，缺省见 PULSE_SAFE_MIN/MAX）。
 
     规则：
       - 文件不存在            -> 新建默认 16 路（500/2500）并写盘，status=created；
@@ -176,14 +226,16 @@ def read_servo_configs(path):
         非字典 / 无任何合法条目
       - 单条非法（键非 servo_N / 越界 / min>=max / 非正数）-> 丢弃该条并打印提示，
         其余合法条目照常生效（只有写入且合法的舵机才可用）。
+      - 顶层保留键 safe_pulse_min / safe_pulse_max 可选覆盖全局安全范围。
     """
     path = Path(path)
     defaults = default_servo_pulse_configs()
+    default_safe = (PULSE_SAFE_MIN, PULSE_SAFE_MAX)
 
     if not path.exists():
         print(f"[pipeline_manager] 未找到 {path.name}，已生成默认 16 路舵机配置。")
         write_servo_configs(path, defaults)
-        return defaults, SERVO_CONFIG_STATUS_CREATED
+        return defaults, SERVO_CONFIG_STATUS_CREATED, default_safe
 
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -192,16 +244,19 @@ def read_servo_configs(path):
         print(f"[pipeline_manager] 读取 {path.name} 失败（{exc}），"
               f"将用默认配置覆盖该文件。")
         write_servo_configs(path, defaults)
-        return defaults, SERVO_CONFIG_STATUS_REPLACED
+        return defaults, SERVO_CONFIG_STATUS_REPLACED, default_safe
 
     if not isinstance(data, dict):
         print(f"[pipeline_manager] {path.name} 顶层结构非法（不是字典），"
               f"将用默认配置覆盖该文件。")
         write_servo_configs(path, defaults)
-        return defaults, SERVO_CONFIG_STATUS_REPLACED
+        return defaults, SERVO_CONFIG_STATUS_REPLACED, default_safe
 
+    safe_range = _parse_servo_safe_range(data)
     configs = OrderedDict()
     for key, value in data.items():
+        if key in _SERVO_CONFIG_SAFE_KEYS:
+            continue
         idx = _parse_servo_key(key)
         if idx is None:
             print(f"[pipeline_manager] 忽略非法舵机条目: {key!r}")
@@ -231,10 +286,10 @@ def read_servo_configs(path):
     if not configs:
         print(f"[pipeline_manager] {path.name} 中没有任何有效舵机条目，"
               f"将用默认配置覆盖该文件。")
-        write_servo_configs(path, defaults)
-        return defaults, SERVO_CONFIG_STATUS_REPLACED
+        write_servo_configs(path, defaults, safe_range)
+        return defaults, SERVO_CONFIG_STATUS_REPLACED, safe_range
 
-    return configs, SERVO_CONFIG_STATUS_OK
+    return configs, SERVO_CONFIG_STATUS_OK, safe_range
 
 
 class Store:
@@ -361,9 +416,8 @@ class Slot:
         self._points = new_points
         self.out_range = (nlo, nhi)
         self._rebuild_mapper()
-        if self.latest_filtered is not None:
-            self.latest_pulse = max(nlo, min(nhi,
-                                             self.mapper.get_result(self.latest_filtered)))
+        self.latest_pulse = max(nlo, min(nhi,
+                                         self.mapper.get_result(self.latest_filtered)))
 
     @property
     def points(self):
@@ -505,7 +559,7 @@ class PipelineManager:
         # 舵机脉宽注册表 {通道索引: (min_pulse, max_pulse)}；未传入时从
         # servo_configs.yaml 读取（gui 每次运行都会显式加载并传入）。
         if servo_pulse_configs is None:
-            servo_pulse_configs, _ = read_servo_configs(SERVO_CONFIGS_PATH)
+            servo_pulse_configs, _, _ = read_servo_configs(SERVO_CONFIGS_PATH)
         self.servo_pulse_configs = dict(servo_pulse_configs or {})
         self._reverse = {}   # servo_index -> slot_name（去重快速查找）
         self._sync_reverse()
@@ -776,14 +830,13 @@ class ServoDebugger:
     因此其手动脉宽不会与管线逐帧下发发生冲突。
     """
 
-    def __init__(self, pulse_configs=None, channels=SERVO_CHANNELS):
+    def __init__(self, pulse_configs=None, channels=SERVO_CHANNELS,
+                 safe_min=PULSE_SAFE_MIN, safe_max=PULSE_SAFE_MAX):
         self.channels = int(channels)
+        self.safe_min = float(safe_min)
+        self.safe_max = float(safe_max)
         # 只登记合法注册通道：{索引: (min_pulse, max_pulse)}
-        self.pulse_configs = {}
-        for idx, (lo, hi) in dict(pulse_configs or {}).items():
-            idx = int(idx)
-            if 0 <= idx < self.channels and 0.0 < lo < hi:
-                self.pulse_configs[idx] = (float(lo), float(hi))
+        self.pulse_configs = sanitize_pulse_configs(pulse_configs, self.channels)
         # 每路舵机初始为自身范围中点
         self._pulses = {idx: (lo + hi) / 2.0
                         for idx, (lo, hi) in self.pulse_configs.items()}
@@ -818,8 +871,8 @@ class ServoDebugger:
         """设置指定通道（缺省为当前选中通道）的脉宽，硬钳制到全局安全范围。
 
         允许设置 servo_configs.yaml 推荐范围（[min,max]）之外的数值，便于
-        实测找最佳脉宽写回配置文件；但不可超过安全范围 [400, 2700]µs，
-        防止机械堵转损坏舵机。
+        实测找最佳脉宽写回配置文件；但不可超过安全范围
+        [self.safe_min, self.safe_max]µs，防止机械堵转损坏舵机。
 
         返回钳制后的脉宽（µs）。
         """
@@ -828,7 +881,7 @@ class ServoDebugger:
         index = int(index)
         if index not in self.pulse_configs:
             raise ValueError(f"舵机通道未注册或非法: {index}")
-        pulse = max(PULSE_SAFE_MIN, min(PULSE_SAFE_MAX, float(value)))
+        pulse = max(self.safe_min, min(self.safe_max, float(value)))
         self._pulses[index] = pulse
         return pulse
 
@@ -868,13 +921,12 @@ class ServoDebugger:
 
 
 def _load_default_slot_specs():
-    """尝试从 servo_control/slots.py 读取默认槽位注册表。"""
+    """从 servo_control/slots.py 读取默认槽位注册表；失败直接抛出，不静默降级。"""
     try:
         import slots  # noqa: PLC0415  servo_control/slots.py（_SERVO_CONTROL 已在 sys.path）
-        return slots.get_slot_specs()
-    except Exception as exc:  # noqa: BLE001  无硬件/缺依赖环境下回退为空注册表
-        print(f"[pipeline_manager] 无法读取默认槽位注册表: {exc}")
-        return OrderedDict()
+    except Exception as exc:  # noqa: BLE001  路径/依赖异常需显式暴露
+        raise RuntimeError(f"无法导入默认槽位注册表 slots: {exc}") from exc
+    return slots.get_slot_specs()
 
 
 __all__ = [
@@ -903,4 +955,7 @@ __all__ = [
     "read_servo_configs",
     "write_servo_configs",
     "default_servo_pulse_configs",
+    "sanitize_pulse_configs",
+    "SERVO_CONFIG_SAFE_MIN_KEY",
+    "SERVO_CONFIG_SAFE_MAX_KEY",
 ]

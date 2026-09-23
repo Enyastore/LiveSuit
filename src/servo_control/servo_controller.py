@@ -5,33 +5,44 @@ set_pulse() 接收脉宽值列表（形如 [1500, 1450, None, ...]），把第 i
 （µs）直接换算为 duty cycle 写到对应索引 i 的舵机通道。
 
 与旧的 set_angle()（通过 adafruit_motor.Servo 做角度->脉宽换算）不同，
-本实现完全绕过角度数学：每个通道只按全局安全范围 [400, 2700]µs 钳制后
+本实现完全绕过角度数学：每个通道只按全局安全范围（servo_configs.yaml 顶层
+safe_pulse_min/max，缺省 [400, 2700]µs）钳制后
 直写 PCA9685，避免「厂商标称脉宽与实际偏转不一致」时角度换算引入的二次
 误差。各通道的推荐范围（servo_configs.yaml 注册的 min_pulse/max_pulse）
 由上层 Slot/调试工具负责约束与警示，换用不同脉宽范围的舵机型号时只需
 调整注册表，无需改动控制逻辑。
 """
 
+import sys
+from pathlib import Path
+
 import board
 import busio
 from adafruit_pca9685 import PCA9685
 
-# 全局绝对安全脉宽范围（µs）：任何通道下发都不允许越过该硬边界
-# （与 pipeline_manager.PULSE_SAFE_MIN / PULSE_SAFE_MAX 保持一致，
-#  对应实验脚本实测的 400~2700µs 无堵转区间）。
-PULSE_SAFE_MIN = 400.0
-PULSE_SAFE_MAX = 2700.0
+# 全局安全脉宽常量与通道校验统一复用 pipeline_manager，避免两处手动同步。
+_SRC_DIR = Path(__file__).resolve().parent.parent
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from pipeline_manager import (  # noqa: E402
+    PULSE_SAFE_MAX,
+    PULSE_SAFE_MIN,
+    sanitize_pulse_configs,
+)
 
 
 class ServoController:
     """基于 PCA9685 的多路舵机控制器（直接写脉宽 duty cycle）。
 
     只向 servo_configs.yaml 中注册过的通道下发；下发时硬钳制到全局安全
-    范围 [400, 2700]µs（各通道注册的 [min_pulse, max_pulse] 由上层约束）。
+    范围 [safe_min, safe_max]µs（各通道注册的 [min_pulse, max_pulse] 由上层约束）。
     """
 
     def __init__(self, pulse_configs=None, address: int = 0x40,
-                 frequency: float = 50.0, i2c=None):
+                 frequency: float = 50.0, i2c=None,
+                 safe_min: float = PULSE_SAFE_MIN,
+                 safe_max: float = PULSE_SAFE_MAX):
         """初始化 PCA9685 并登记各通道的脉宽范围。
 
         Parameters
@@ -46,6 +57,9 @@ class ServoController:
         i2c : busio.I2C | None
             外部传入的 I2C 总线；为 None 时自动检测默认 I2C 引脚（SCL/SDA）。
             传入已有总线可便于测试/复用。
+        safe_min / safe_max : float
+            全局安全脉宽范围（µs），来自 servo_configs.yaml 顶层
+            safe_pulse_min / safe_pulse_max，缺省 400 / 2700。
 
         Notes
         -----
@@ -55,14 +69,12 @@ class ServoController:
         """
         if i2c is None:
             i2c = busio.I2C(board.SCL, board.SDA)
+        self.safe_min = float(safe_min)
+        self.safe_max = float(safe_max)
         self._pca = PCA9685(i2c, address=address)
         self._pca.frequency = frequency
         # 只保留合法注册通道
-        self.pulse_configs = {}
-        for idx, (lo, hi) in dict(pulse_configs or {}).items():
-            idx = int(idx)
-            if 0 <= idx < 16 and 0.0 < float(lo) < float(hi):
-                self.pulse_configs[idx] = (float(lo), float(hi))
+        self.pulse_configs = sanitize_pulse_configs(pulse_configs)
         # 已下发脉宽缓存：值未变化时跳过重复 I2C 写，降低总线流量与 UI 阻塞
         self._last_pulses = {}
 
@@ -80,7 +92,7 @@ class ServoController:
         pulses : list[float | None] | tuple[float | None]
             形如 [1500, 1450, None, ...] 的脉宽列表（µs），第 i 个值作用于
             第 i 路舵机；None 或未注册通道跳过不写；已注册通道硬钳制到
-            全局安全范围 [400, 2700]µs。
+            全局安全范围 [safe_min, safe_max]µs。
 
         Notes
         -----
@@ -92,7 +104,7 @@ class ServoController:
         for index in self.pulse_configs:
             if index >= len(pulses) or pulses[index] is None:
                 continue
-            pulse = max(PULSE_SAFE_MIN, min(PULSE_SAFE_MAX, float(pulses[index])))
+            pulse = max(self.safe_min, min(self.safe_max, float(pulses[index])))
             if self._last_pulses.get(index) == pulse:
                 continue
             self._pca.channels[index].duty_cycle = self._pulse_to_duty(

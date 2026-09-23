@@ -12,31 +12,28 @@ import os
 from eye_tracker_core_cpp import (
     Normalizer as _CppNormalizer,
     GazeVectorTracker as _CppGazeVectorTracker,
-    PupilDebugResult,
-    OpennessDebugResult,
 )
 
 logger = logging.getLogger(__name__)
 
-# 本模块所在目录（用于解析 references.yaml 的相对路径，避免依赖当前工作目录）
-_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 运行期配置文件统一锚定到 src/（与 pipeline_manager 的 slot/servo 配置同目录），
+# 不依赖当前工作目录。
+_SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _resolve_refs_file(refs_file: str) -> str:
-    """将相对路径的 refs_file 解析为模块目录下的绝对路径。
+    """把相对路径的 refs_file 解析为 src/ 下的绝对路径。
 
-    若传入的是绝对路径，或模块目录下不存在该文件，则原样返回。
+    绝对路径原样返回；相对路径一律锚定到 src/（不再回退当前工作目录），
+    保证无论从哪个目录启动都读写同一份 references.yaml。
     """
     if os.path.isabs(refs_file):
         return refs_file
-    resolved = os.path.join(_MODULE_DIR, refs_file)
-    if os.path.exists(resolved):
-        return resolved
-    return refs_file  # 回退原值
+    return os.path.join(_SRC_DIR, refs_file)
 
 # V4L2 四字符码整数值（直接设置 CAP_PROP_FOURCC 使用）
-# 保留在此以便 eye_tracker_main 等模块引用
-_V4L2_FOURCC_MAP = {
+# eye_tracker_main 等模块从此处导入，避免多处各存一份。
+V4L2_FOURCC_MAP = {
     "YUYV": 0x56595559,
     "MJPG": 0x47504A4D,
     "NV12": 0x3231564E,
