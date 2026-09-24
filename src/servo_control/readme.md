@@ -16,7 +16,7 @@ src/servo_control/
 ├── slots.py              # 数据提供者汇总（Slots 类，目前对接眼球追踪模块）
 └── readme.md             # 本文档
 src/
-├── servo_configs.yaml    # 舵机脉宽注册表（每路舵机的 min_pulse/max_pulse）
+├── servo_configs.yaml    # 舵机脉宽注册表（顶层 global_* 默认 + 各通道覆盖）
 └── slot_configs.yaml     # 槽位曲线配置（alpha + 归一化样本点）
 ```
 
@@ -47,35 +47,40 @@ src/face_tracking/eye_tracker_main.py         src/servo_control/
 数据从 `face_tracking` 模块获取（左/右眼的注视归一化坐标与开度），经 `after_process`
 平滑、映射为脉宽（µs），最后由 `servo_controller` 通过 PCA9685 一次性下发到多路舵机。
 
-槽位样条曲线的输出范围（MIN~MAX）由该槽位**绑定的舵机**决定：未绑定时为默认
-500~2500µs；绑定 `servo_N` 后自动切换为该舵机在 `servo_configs.yaml` 中注册的
-`[min_pulse, max_pulse]`。曲线以**归一化形状**存储，换绑不同脉宽范围的舵机时
-形状保持不变，仅 Y 轴数值按新范围重新标定。
+槽位在**未绑定舵机**时输出为纯归一化值（0~1），不涉及脉宽；**绑定 `servo_N`**
+后自动切换为该舵机在 `servo_configs.yaml` 中注册的 `[min_pulse, max_pulse]`，
+输出脉宽（µs）。曲线始终以**归一化形状**存储，换绑不同脉宽范围的舵机时形状保持
+不变，仅 Y 轴数值按新范围重新标定。
 
 ## servo_configs.yaml —— 舵机脉宽注册表
 
-`src/servo_configs.yaml` 声明实际使用的舵机及其脉宽范围。每次运行 `gui.py` 都会读取：
+`src/servo_configs.yaml` 声明实际使用的舵机及其脉宽范围。顶层 `global_*` 定义
+全局默认，`servo_N` 条目只写与该全局不同的字段，**留空即继承全局**；每次运行
+`gui.py` 都会读取：
 
 ```yaml
-safe_pulse_min: 400      # 全局安全脉宽下限（µs，可选）
-safe_pulse_max: 2700     # 全局安全脉宽上限（µs，可选）
-servo_0:
-  min_pulse: 450
-  max_pulse: 2650
-servo_1:
-  min_pulse: 450
-  max_pulse: 2650
+global_min_pulse: 500          # 机械范围下限（µs，全局默认）
+global_max_pulse: 2500         # 机械范围上限
+global_safe_pulse_min: 400     # 安全提示范围下限（提醒用，非硬边界）
+global_safe_pulse_max: 2700    # 安全提示范围上限
+servo_0:                       # 存在该键 = 注册该通道
+  min_pulse: 450               # 覆盖全局机械下限
+  max_pulse: 2650              # 覆盖全局机械上限
+  safe_pulse_min: 400          # 覆盖全局安全下限
+  safe_pulse_max: 2700         # 覆盖全局安全上限
+servo_1: {}                    # 全继承全局
 ```
 
 规则：
 - **只有写入该文件且合法的舵机才可用**（调试工具 / 总线面板 / 逐帧下发均只作用于注册舵机）；
-- 顶层可选保留键 `safe_pulse_min` / `safe_pulse_max` 覆盖全局安全范围（缺省 400~2700µs），
-  调试工具下发与输入框警示均以该值为准；
-- 文件缺失时自动生成默认 `servo_0 ~ servo_15`（500~2500µs）；
-- 文件不合法（YAML 解析失败 / 顶层非字典 / 无任何有效条目）时打印错误并弹出提示，
+- 顶层 `global_*` 定义全局默认；通道条目中缺失的字段继承全局，便于统一更换型号
+  或只替换单路舵机；
+- `safe_pulse_*` 是**安全提示范围**（非硬边界），用于调试工具告警与钳制，提醒用户
+  别把脉宽设得过于极端；未包住机械范围时仅告警；
+- 文件缺失时自动生成默认 `servo_0 ~ servo_15`（全局 500~2500µs，安全 400~2700µs）；
+- 文件不合法（YAML 解析失败 / 顶层非字典 / 无任何通道条目）时打印错误并弹出提示，
   同时用默认参数**覆盖**该文件；
-- 单条非法（键非 `servo_N` / 通道越界 / 不满足 `0 < min_pulse < max_pulse`）
-  会被丢弃并打印提示，其余合法条目照常生效。
+- 单条字段非法（非数字 / `min_pulse >= max_pulse`）时**仅告警并回退全局**，仍注册该通道。
 
 ## 模块说明
 
@@ -83,14 +88,15 @@ servo_1:
 
 基于 [Adafruit PCA9685](https://docs.circuitpython.org/projects/pca9685/) 的多路舵机控制器。
 
-- `ServoController(pulse_configs=None, address=0x40, frequency=50.0, i2c=None, safe_min=400, safe_max=2700)`
+- `ServoController(pulse_configs=None, address=0x40, frequency=50.0, i2c=None, safe_limits=None)`
   - `pulse_configs`：`{通道索引: (min_pulse, max_pulse)}`（µs），仅这些注册通道可写。
-  - `safe_min` / `safe_max`：全局安全脉宽范围（µs），由 `servo_configs.yaml` 顶层提供。
+  - `safe_limits`：`{通道索引: (safe_min, safe_max)}`（µs），每路的安全提示范围；
+    缺省（或该通道缺省）时回退为该通道的 `[min_pulse, max_pulse]`。
   - 不再使用 `adafruit_motor.Servo` 的角度换算，直接计算 duty cycle 写入 PCA9685，
     从根本上避免「角度 -> 脉宽」换算误差。
 - `set_pulse(pulses)`：接收脉宽列表（如 `[1500, 1450, None, ...]`，µs），第 `i` 个值
-  写到索引 `i` 的通道；`None` 或未注册通道跳过不写；已注册通道硬钳制到
-  全局安全范围（缺省 400~2700µs，由 `safe_pulse_min/max` 覆盖）。
+  写到索引 `i` 的通道；`None` 或未注册通道跳过不写；已注册通道钳制到该通道的
+  安全提示范围。
   > 钳制到安全范围而非各通道注册范围：运行管线侧的值已在 Slot 中按绑定舵机的
   > 注册范围钳制（⊂ 安全范围），不受影响；而舵机调试工具可以在安全范围内
   > 探索注册范围之外的脉宽，用于实测找最佳值并写回 `servo_configs.yaml`。
@@ -99,8 +105,8 @@ servo_1:
 ### 舵机调试工具（GUI：打开舵机工具）
 
 - 允许设置 `servo_configs.yaml` 推荐范围之外的脉宽（方便实测机械行程极限），
-  但**不可超过全局安全范围**（缺省 [400, 2700]µs，由顶层 `safe_pulse_min/max`
-  覆盖；超出自动钳制）。
+  但**不超过该通道的安全提示范围**（缺省为该通道 `[min_pulse, max_pulse]`，
+  也可由 `safe_pulse_min/max` 覆盖；超出自动钳制）。
 - 当数值超出该通道配置范围时，输入框与提示变**深红色**，并显示
   「⚠ 超出配置范围 …µs，可能有舵机损坏风险」；回到范围内自动恢复正常显示。
 - 找到最佳脉宽后，把对应通道的 `min_pulse` / `max_pulse` 写回 `servo_configs.yaml`。
@@ -113,9 +119,10 @@ servo_1:
   - `update(value)` 返回 `(value, after)`：`value` 为原始输入，`after` 为平滑后输出。
   - 输入为 `None` 时不更新内部状态，直接返回上一次的有效值（hold-last）。
   - `alpha` 越小平滑力度越大（响应越慢）。
-- `Mapper(points=None, range=(500.0, 2500.0))` — 自然三次样条插值映射器
+- `Mapper(points=None, range=(0.0, 1.0))` — 自然三次样条插值映射器
   - 通过样本点建立三次样条曲线，把输入 `x` 映射为归一化 `y`（约定取值 `[0, 1]`），
-    再线性映射到 `range` 指定的实际输出范围（µs，默认即默认舵机脉宽范围）。
+    再线性映射到 `range` 指定的实际输出范围（缺省 (0,1) 纯归一化；绑定舵机时
+    由 Slot 传入脉宽范围 `(min_pulse, max_pulse)`）。
   - 样本点格式：`[(x_0, y_0), (x_1, y_1), ...]`，默认 `[(0,0), (1,1)]`。
   - 要求至少 2 个样本点且 `x` 严格递增，否则抛 `ValueError`。
   - 输入超出样本点范围时钳制到边界值（不外推）。
@@ -145,7 +152,7 @@ servo_1:
 from servo_controller import ServoController
 from after_process import Filter, Mapper
 
-# 1. 后处理：平滑 + 映射到默认脉宽范围（500~2500µs）
+# 1. 后处理：平滑 + 映射到脉宽范围（0~1 -> 500~2500µs）
 smoother = Filter(alpha=0.2)
 mapper   = Mapper(points=[(0.0, 0.0), (0.5, 0.5), (1.0, 1.0)],
                   range=(500.0, 2500.0))

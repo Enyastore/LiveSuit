@@ -2,7 +2,9 @@
 
 数据流拓扑（每个槽位一条并行管道，最终汇总到舵机控制总线）::
 
-    原始数据(Slot i) -> 归一化 -> EMA滤波 -> 三次样条插值 -> 舵机控制总线（脉宽 µs）
+    原始数据(Slot i) -> 归一化 -> EMA滤波 -> 三次样条
+      - 未绑定舵机：输出归一化 [0,1]
+      - 绑定舵机后：输出该舵机脉宽（µs），汇入舵机控制总线
 
 本模块是纯逻辑层（不依赖 tkinter），负责:
   1. Store            —— Zustand/Redux 风格的单数据源状态管理
@@ -12,10 +14,10 @@
   4. PipelineManager  —— 槽位构建、逐帧处理、舵机总线映射与去重校验
   5. DataSource       —— 数据源抽象（CallableSource 对接真实提供者）
   6. 槽位配置持久化   —— alpha 与三次样条样本点读写 slot_configs.yaml
-  7. 舵机脉宽注册表   —— servo_configs.yaml（每路舵机独立的 min_pulse/max_pulse）
+  7. 舵机脉宽注册表   —— servo_configs.yaml（顶层 global_* 默认 + 各通道覆盖）
 
-管线输出为「脉宽（µs）」而非角度：样条曲线以归一化形状存储，输出范围由
-该槽位绑定的舵机决定（servo_configs.yaml 中注册的 min_pulse ~ max_pulse），
+槽位输出范围由绑定状态决定：未绑定为纯归一化 (0,1)；绑定后为 servo_configs.yaml
+中该舵机注册的 [min_pulse, max_pulse]。样条曲线始终以归一化形状存储，
 因此换用不同脉宽范围的舵机型号时无需重新标定曲线形状。
 
 槽位注册表（有哪些输出槽位）统一由 src/servo_control/slots.py 的
@@ -27,7 +29,7 @@ Mapper(自然三次样条插值)。
 
 import math
 import sys
-from collections import OrderedDict, deque
+from collections import OrderedDict, deque, namedtuple
 from pathlib import Path
 
 import yaml
@@ -47,49 +49,43 @@ from after_process import Filter, Mapper  # noqa: E402  EMA / 三次样条
 # ---------------------------------------------------------------
 SERVO_CHANNELS = 16             # 舵机总线物理通道数上限（servo_0 ~ servo_15）
 DEFAULT_ALPHA = 0.85            # 默认 EMA 平滑系数
-DEFAULT_MIN_PULSE = 500.0       # 默认脉宽下限（µs）
-DEFAULT_MAX_PULSE = 2500.0      # 默认脉宽上限（µs）
-# 槽位未绑定舵机时的默认输出范围（µs）；绑定后切换为对应舵机的实际范围
-DEFAULT_PULSE_RANGE = (DEFAULT_MIN_PULSE, DEFAULT_MAX_PULSE)
 
-# 调试工具允许的绝对安全脉宽范围（µs）：运行/调试时任何通道都不允许越过
-# 该硬边界（对应 test_servo.py 实测的 400~2700µs 无堵转区间）。
-# 该值可由 servo_configs.yaml 顶层的 safe_pulse_min / safe_pulse_max 覆盖，
-# 这里的常量是文件缺失/字段非法时的兜底默认。
-PULSE_SAFE_MIN = 400.0
-PULSE_SAFE_MAX = 2700.0
+# 未绑定舵机时槽位的输出范围：纯归一化 [0,1]（不涉及脉宽）。
+# 绑定舵机后 set_out_range() 会切换到该舵机注册的 [min_pulse, max_pulse]。
+NORMALIZED_RANGE = (0.0, 1.0)
 
-# servo_configs.yaml 中用于覆盖全局安全范围的保留键
-SERVO_CONFIG_SAFE_MIN_KEY = "safe_pulse_min"
-SERVO_CONFIG_SAFE_MAX_KEY = "safe_pulse_max"
-_SERVO_CONFIG_SAFE_KEYS = (SERVO_CONFIG_SAFE_MIN_KEY, SERVO_CONFIG_SAFE_MAX_KEY)
+# 生成默认 servo_configs.yaml 时使用的占位值（bootstrap）。
+# 运行期一切脉宽范围都来自配置文件，代码不再以这些值充当业务默认。
+_BOOTSTRAP_MIN_PULSE = 500.0
+_BOOTSTRAP_MAX_PULSE = 2500.0
+_BOOTSTRAP_SAFE_PULSE_MIN = 400.0
+_BOOTSTRAP_SAFE_PULSE_MAX = 2700.0
 
+# servo_configs.yaml 顶层全局默认键（global_ 前缀）；通道条目留空即继承。
+GLOBAL_MIN_PULSE_KEY = "global_min_pulse"
+GLOBAL_MAX_PULSE_KEY = "global_max_pulse"
+GLOBAL_SAFE_PULSE_MIN_KEY = "global_safe_pulse_min"
+GLOBAL_SAFE_PULSE_MAX_KEY = "global_safe_pulse_max"
+_GLOBAL_KEYS = (GLOBAL_MIN_PULSE_KEY, GLOBAL_MAX_PULSE_KEY,
+                GLOBAL_SAFE_PULSE_MIN_KEY, GLOBAL_SAFE_PULSE_MAX_KEY)
 
-def sanitize_pulse_configs(configs, channels=SERVO_CHANNELS):
-    """清洗 {索引: (min_pulse, max_pulse)}，仅保留合法项。
+# 每路舵机的有效脉宽限定（µs）：
+#   min_pulse/max_pulse       —— 机械行程（绑定后槽位输出的脉宽范围）
+#   safe_pulse_min/max        —— 安全提示范围（仅用于调试告警/钳制，非硬边界）
+ServoLimits = namedtuple(
+    "ServoLimits", "min_pulse max_pulse safe_pulse_min safe_pulse_max")
 
-    仅保留 ``0 <= 索引 < channels`` 且 ``0 < min_pulse < max_pulse`` 的条目，
-    非法键/非二元组/非数字项一律丢弃。供 ServoController 与 ServoDebugger
-    共用，避免两处各写一份校验逻辑（曾因手动同步而分叉）。
-    """
-    out = OrderedDict()
-    for idx, limits in dict(configs or {}).items():
-        try:
-            idx = int(idx)
-            lo, hi = float(limits[0]), float(limits[1])
-        except (TypeError, ValueError, IndexError):
-            continue
-        if 0 <= idx < channels and 0.0 < lo < hi:
-            out[idx] = (lo, hi)
-    return out
+_BOOTSTRAP_LIMITS = ServoLimits(_BOOTSTRAP_MIN_PULSE, _BOOTSTRAP_MAX_PULSE,
+                                _BOOTSTRAP_SAFE_PULSE_MIN,
+                                _BOOTSTRAP_SAFE_PULSE_MAX)
 
-# 默认三次样条样本点：仅左右边界，即 [0,1] -> [min_pulse,max_pulse] 的线性映射
-DEFAULT_POINTS = [(0.0, DEFAULT_MIN_PULSE), (1.0, DEFAULT_MAX_PULSE)]
+# 默认三次样条样本点：仅左右边界，即 [0,1] -> [0,1] 的线性映射
+DEFAULT_POINTS = [(0.0, 0.0), (1.0, 1.0)]
 
 # 槽位配置持久化文件（alpha + 三次样条样本点；point_set 的 y 以归一化 [0,1] 存储）
 SLOT_CONFIGS_PATH = _HERE / "slot_configs.yaml"
 
-# 舵机脉宽注册表文件（每路舵机独立的 min_pulse/max_pulse，µs）
+# 舵机脉宽注册表文件（顶层 global_* 默认 + 各通道覆盖，µs）
 SERVO_CONFIGS_PATH = _HERE / "servo_configs.yaml"
 
 # read_servo_configs() 返回的状态：ok=正常读取 / created=缺失新建 / replaced=非法被默认覆盖
@@ -146,56 +142,118 @@ def write_slot_configs(path, data):
 # ---------------------------------------------------------------
 
 def default_servo_pulse_configs(channels=SERVO_CHANNELS):
-    """返回默认舵机脉宽注册表 {索引: (min_pulse, max_pulse)}。
+    """返回默认舵机脉宽注册表 {索引: ServoLimits}（仅用于生成默认配置文件）。
 
-    默认生成 servo_0 ~ servo_{channels-1}，全部为 500~2500 µs。
+    全部通道使用 bootstrap 占位值（500~2500µs，安全提示 400~2700µs）。
     """
-    return OrderedDict(
-        (i, (float(DEFAULT_MIN_PULSE), float(DEFAULT_MAX_PULSE)))
-        for i in range(int(channels))
-    )
+    return OrderedDict((i, _BOOTSTRAP_LIMITS) for i in range(int(channels)))
 
 
-def _parse_servo_safe_range(data):
-    """解析 servo_configs.yaml 顶层的可选安全范围；缺失/非法回退默认。"""
+def _as_float(value):
+    """把值转为有限浮点数；失败返回 None。"""
     try:
-        lo = float(data.get(SERVO_CONFIG_SAFE_MIN_KEY, PULSE_SAFE_MIN))
-        hi = float(data.get(SERVO_CONFIG_SAFE_MAX_KEY, PULSE_SAFE_MAX))
+        v = float(value)
     except (TypeError, ValueError):
-        lo = hi = None
-    if lo is not None and math.isfinite(lo) and math.isfinite(hi) and 0.0 < lo < hi:
-        return (lo, hi)
-    if SERVO_CONFIG_SAFE_MIN_KEY in data or SERVO_CONFIG_SAFE_MAX_KEY in data:
-        print(f"[pipeline_manager] {SERVO_CONFIG_SAFE_MIN_KEY}/"
-              f"{SERVO_CONFIG_SAFE_MAX_KEY} 非法，回退默认 "
-              f"{PULSE_SAFE_MIN:.0f}~{PULSE_SAFE_MAX:.0f}µs")
-    return (PULSE_SAFE_MIN, PULSE_SAFE_MAX)
+        return None
+    return v if math.isfinite(v) else None
 
 
-def write_servo_configs(path, configs, safe_range=None):
-    """把 {索引: (min_pulse, max_pulse)} 写为 servo_configs.yaml。
+def _resolve_global_limits(data):
+    """解析顶层 global_* 全局默认；缺失回退 bootstrap，非法则告警后回退。"""
+    values = []
+    for key, fallback in zip(_GLOBAL_KEYS, _BOOTSTRAP_LIMITS):
+        if key not in data:
+            values.append(fallback)
+            continue
+        v = _as_float(data.get(key))
+        if v is None:
+            print(f"[pipeline_manager] 全局默认 {key} 非法，回退 {fallback:g}")
+            values.append(fallback)
+        else:
+            values.append(v)
+    limits = ServoLimits(*values)
+    if not (limits.min_pulse < limits.max_pulse):
+        print(f"[pipeline_manager] {GLOBAL_MIN_PULSE_KEY} 需小于 "
+              f"{GLOBAL_MAX_PULSE_KEY}，回退默认")
+        limits = limits._replace(min_pulse=_BOOTSTRAP_LIMITS.min_pulse,
+                                 max_pulse=_BOOTSTRAP_LIMITS.max_pulse)
+    if not (limits.safe_pulse_min < limits.safe_pulse_max):
+        print(f"[pipeline_manager] {GLOBAL_SAFE_PULSE_MIN_KEY} 需小于 "
+              f"{GLOBAL_SAFE_PULSE_MAX_KEY}，回退默认")
+        limits = limits._replace(
+            safe_pulse_min=_BOOTSTRAP_LIMITS.safe_pulse_min,
+            safe_pulse_max=_BOOTSTRAP_LIMITS.safe_pulse_max)
+    return limits
 
-    safe_range 为可选的全局安全脉宽范围 (min, max)（µs），缺省用
-    PULSE_SAFE_MIN/MAX。文件格式：:
 
-        safe_pulse_min: 400
-        safe_pulse_max: 2700
+def _resolve_field(value, field, fallback, key):
+    """从通道条目取一个字段；缺失返回 fallback，非法则告警后回退 fallback。"""
+    if field not in value:
+        return fallback
+    v = _as_float(value.get(field))
+    if v is None:
+        print(f"[pipeline_manager] {key} 的 {field} 非法，回退 {fallback:g}")
+        return fallback
+    return v
+
+
+def _resolve_channel_limits(value, global_limits, key):
+    """解析单个通道条目：缺失字段继承全局；非法仅告警，不丢弃通道。"""
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        print(f"[pipeline_manager] {key!r} 配置不是字典，按全局默认注册该通道")
+        value = {}
+    g = global_limits
+    min_p = _resolve_field(value, "min_pulse", g.min_pulse, key)
+    max_p = _resolve_field(value, "max_pulse", g.max_pulse, key)
+    if not (min_p < max_p):
+        print(f"[pipeline_manager] {key} 的 min_pulse 需小于 max_pulse，"
+              f"回退全局默认 {g.min_pulse:g}~{g.max_pulse:g}")
+        min_p, max_p = g.min_pulse, g.max_pulse
+    s_min = _resolve_field(value, "safe_pulse_min", g.safe_pulse_min, key)
+    s_max = _resolve_field(value, "safe_pulse_max", g.safe_pulse_max, key)
+    if not (s_min < s_max):
+        print(f"[pipeline_manager] {key} 的 safe_pulse_min 需小于 "
+              f"safe_pulse_max，回退全局默认")
+        s_min, s_max = g.safe_pulse_min, g.safe_pulse_max
+    # 安全提示范围未包住机械范围仅告警（safe 非硬边界，只提醒用户别太过分）
+    if not (s_min <= min_p <= max_p <= s_max):
+        print(f"[pipeline_manager] 提示：{key} 的安全范围 {s_min:g}~{s_max:g} "
+              f"未完整包住机械范围 {min_p:g}~{max_p:g}")
+    return ServoLimits(min_p, max_p, s_min, s_max)
+
+
+def write_servo_configs(path, configs, global_limits=None):
+    """把 {索引: ServoLimits} 写为 servo_configs.yaml（每路显式列出全部字段）。
+
+    global_limits 为顶层全局默认 ServoLimits；缺省用 bootstrap 占位值。
+    文件对用户可读，样式：:
+
+        global_min_pulse: 500
+        global_max_pulse: 2500
+        global_safe_pulse_min: 400
+        global_safe_pulse_max: 2700
         servo_0:
           min_pulse: 450
           max_pulse: 2650
-        servo_1:
-          ...
+          safe_pulse_min: 400
+          safe_pulse_max: 2700
+        ...
     """
-    safe_lo, safe_hi = (safe_range if safe_range is not None
-                        else (PULSE_SAFE_MIN, PULSE_SAFE_MAX))
+    g = global_limits or _BOOTSTRAP_LIMITS
     payload = {
-        SERVO_CONFIG_SAFE_MIN_KEY: int(round(float(safe_lo))),
-        SERVO_CONFIG_SAFE_MAX_KEY: int(round(float(safe_hi))),
+        GLOBAL_MIN_PULSE_KEY: int(round(g.min_pulse)),
+        GLOBAL_MAX_PULSE_KEY: int(round(g.max_pulse)),
+        GLOBAL_SAFE_PULSE_MIN_KEY: int(round(g.safe_pulse_min)),
+        GLOBAL_SAFE_PULSE_MAX_KEY: int(round(g.safe_pulse_max)),
     }
-    for idx, (lo, hi) in (configs or {}).items():
+    for idx, lim in (configs or {}).items():
         payload[f"servo_{int(idx)}"] = {
-            "min_pulse": int(round(float(lo))),
-            "max_pulse": int(round(float(hi))),
+            "min_pulse": int(round(lim.min_pulse)),
+            "max_pulse": int(round(lim.max_pulse)),
+            "safe_pulse_min": int(round(lim.safe_pulse_min)),
+            "safe_pulse_max": int(round(lim.safe_pulse_max)),
         }
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(payload, f, allow_unicode=True, sort_keys=False)
@@ -214,28 +272,27 @@ def _parse_servo_key(key):
 
 
 def read_servo_configs(path):
-    """加载舵机脉宽注册表，返回 (configs, status, safe_range)。
+    """加载舵机脉宽注册表，返回 (configs, status)。
 
-    configs 为 {通道索引: (min_pulse, max_pulse)}（仅包含合法注册项），
-    status 取值见 SERVO_CONFIG_STATUS_* 常量，safe_range 为全局安全范围
-    (min, max)（µs，缺省见 PULSE_SAFE_MIN/MAX）。
+    configs 为 {通道索引: ServoLimits}（仅包含合法注册项），status 取值见
+    SERVO_CONFIG_STATUS_* 常量。
 
+    Schema：
+      - 顶层 `global_*` 定义全局默认（缺省用 bootstrap 占位值）；
+      - `servo_N` 存在即注册该通道，条目中缺失的字段继承全局。
     规则：
-      - 文件不存在            -> 新建默认 16 路（500/2500）并写盘，status=created；
+      - 文件不存在            -> 生成默认 16 路并写盘，status=created；
       - YAML 解析失败 / 顶层   -> 打印错误，用默认参数覆盖错误文件，status=replaced；
-        非字典 / 无任何合法条目
-      - 单条非法（键非 servo_N / 越界 / min>=max / 非正数）-> 丢弃该条并打印提示，
-        其余合法条目照常生效（只有写入且合法的舵机才可用）。
-      - 顶层保留键 safe_pulse_min / safe_pulse_max 可选覆盖全局安全范围。
+        非字典 / 无任何通道条目
+      - 单条字段非法          -> 仅告警并回退全局，仍注册该通道。
     """
     path = Path(path)
     defaults = default_servo_pulse_configs()
-    default_safe = (PULSE_SAFE_MIN, PULSE_SAFE_MAX)
 
     if not path.exists():
         print(f"[pipeline_manager] 未找到 {path.name}，已生成默认 16 路舵机配置。")
         write_servo_configs(path, defaults)
-        return defaults, SERVO_CONFIG_STATUS_CREATED, default_safe
+        return defaults, SERVO_CONFIG_STATUS_CREATED
 
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -244,52 +301,36 @@ def read_servo_configs(path):
         print(f"[pipeline_manager] 读取 {path.name} 失败（{exc}），"
               f"将用默认配置覆盖该文件。")
         write_servo_configs(path, defaults)
-        return defaults, SERVO_CONFIG_STATUS_REPLACED, default_safe
+        return defaults, SERVO_CONFIG_STATUS_REPLACED
 
     if not isinstance(data, dict):
         print(f"[pipeline_manager] {path.name} 顶层结构非法（不是字典），"
               f"将用默认配置覆盖该文件。")
         write_servo_configs(path, defaults)
-        return defaults, SERVO_CONFIG_STATUS_REPLACED, default_safe
+        return defaults, SERVO_CONFIG_STATUS_REPLACED
 
-    safe_range = _parse_servo_safe_range(data)
+    global_limits = _resolve_global_limits(data)
     configs = OrderedDict()
     for key, value in data.items():
-        if key in _SERVO_CONFIG_SAFE_KEYS:
+        if key in _GLOBAL_KEYS:
             continue
         idx = _parse_servo_key(key)
         if idx is None:
-            print(f"[pipeline_manager] 忽略非法舵机条目: {key!r}")
+            print(f"[pipeline_manager] 忽略未知顶层条目: {key!r}")
             continue
         if not (0 <= idx < SERVO_CHANNELS):
             print(f"[pipeline_manager] 忽略越界舵机条目: {key!r}"
                   f"（通道需在 0~{SERVO_CHANNELS - 1}）")
             continue
-        if not isinstance(value, dict):
-            print(f"[pipeline_manager] 忽略非法舵机条目: {key!r}（配置不是字典）")
-            continue
-        try:
-            lo = float(value.get("min_pulse"))
-            hi = float(value.get("max_pulse"))
-        except (TypeError, ValueError):
-            lo = hi = None
-        if lo is None or not (math.isfinite(lo) and math.isfinite(hi)):
-            print(f"[pipeline_manager] 忽略非法舵机条目: {key!r}（min_pulse/"
-                  f"max_pulse 缺失或非数字）")
-            continue
-        if not (0.0 < lo < hi):
-            print(f"[pipeline_manager] 忽略非法舵机条目: {key!r}"
-                  f"（需要 0 < min_pulse < max_pulse，当前 {lo:g}/{hi:g}）")
-            continue
-        configs[idx] = (lo, hi)
+        configs[idx] = _resolve_channel_limits(value, global_limits, key)
 
     if not configs:
-        print(f"[pipeline_manager] {path.name} 中没有任何有效舵机条目，"
+        print(f"[pipeline_manager] {path.name} 中没有任何舵机条目，"
               f"将用默认配置覆盖该文件。")
-        write_servo_configs(path, defaults, safe_range)
-        return defaults, SERVO_CONFIG_STATUS_REPLACED, safe_range
+        write_servo_configs(path, defaults, global_limits)
+        return defaults, SERVO_CONFIG_STATUS_REPLACED
 
-    return configs, SERVO_CONFIG_STATUS_OK, safe_range
+    return configs, SERVO_CONFIG_STATUS_OK
 
 
 class Store:
@@ -364,18 +405,19 @@ class Normalizer:
 
 
 class Slot:
-    """单个并行管道槽位：归一化 -> EMA滤波 -> 三次样条插值 -> 脉宽（µs）。
+    """单个并行管道槽位：归一化 -> EMA滤波 -> 三次样条映射。
 
-    输出范围（out_range）是当前生效的脉宽范围：未绑定舵机时为默认 500~2500，
-    绑定某路舵机后切换为该舵机在 servo_configs.yaml 中注册的 [min,max]。
-    切换范围时样本点按归一化比例重缩放（曲线形状保持，换舵机型号无需重调）。
+    未绑定舵机时输出范围是纯归一化 ``(0, 1)``（输出即归一化值，不涉及脉宽）；
+    绑定某路舵机后切换为该舵机在 servo_configs.yaml 中注册的
+    [min_pulse, max_pulse]（输出为脉宽 µs）。切换范围时样本点按归一化比例
+    重缩放（曲线形状保持，换舵机型号无需重调）。
 
     维护一个滚动历史缓冲 history（供 GUI 的 EMA 纵向时间轴图表使用）:
       每条记录为 (raw_norm, filtered)，raw_norm 可能为 None（无效采样）。
     """
 
     def __init__(self, name, spec=None, alpha=DEFAULT_ALPHA,
-                 points=DEFAULT_POINTS, out_range=DEFAULT_PULSE_RANGE,
+                 points=DEFAULT_POINTS, out_range=NORMALIZED_RANGE,
                  max_history=320):
         spec = spec or {}
         self.name = name
@@ -387,7 +429,7 @@ class Slot:
         self.alpha = float(alpha)
         self.filter = Filter(alpha=self.alpha)
 
-        # 样本点以当前输出范围（脉宽 µs）存储，映射到 Mapper 时换算成归一化 y
+        # 样本点以当前输出范围存储（未绑定：归一化；绑定：脉宽 µs）
         self._points = [list(p) for p in points]
         self.mapper = Mapper(points=None, range=self.out_range)
         self._rebuild_mapper()
@@ -397,14 +439,15 @@ class Slot:
 
         self.latest_raw = None        # 最新原始归一化值（可能为 None）
         self.latest_filtered = 0.0    # 最新滤波值（归一化 0~1）
-        self.latest_pulse = None      # 最新映射输出脉宽（µs）
+        self.latest_output = None     # 最新输出（未绑定：归一化 0~1；绑定：脉宽 µs）
 
     # ---- 输出范围 / 样本点管理 ----
     def set_out_range(self, out_range):
-        """切换槽位输出脉宽范围并保持曲线形状（按归一化比例重缩放样本点）。
+        """切换槽位输出范围并保持曲线形状（按归一化比例重缩放样本点）。
 
-        绑定舵机 / 解绑时调用：新样本点 y' = new_lo + (y-old_lo)/span * new_span，
-        保证曲线形状（归一化 y）不变，仅 Y 轴数值按新 MIN~MAX 重新标定。
+        绑定 / 解绑舵机时调用：未绑定传 NORMALIZED_RANGE，绑定传该舵机脉宽范围。
+        新样本点 y' = new_lo + (y-old_lo)/span * new_span，保证曲线形状
+        （归一化 y）不变，仅 Y 轴数值按新范围重新标定。
         """
         lo, hi = self.out_range
         nlo, nhi = (float(out_range[0]), float(out_range[1]))
@@ -416,12 +459,12 @@ class Slot:
         self._points = new_points
         self.out_range = (nlo, nhi)
         self._rebuild_mapper()
-        self.latest_pulse = max(nlo, min(nhi,
-                                         self.mapper.get_result(self.latest_filtered)))
+        self.latest_output = max(nlo, min(nhi,
+                                          self.mapper.get_result(self.latest_filtered)))
 
     @property
     def points(self):
-        """返回样本点副本列表 [(x, y), ...]，y 为当前输出范围的脉宽（µs）。"""
+        """返回样本点副本列表 [(x, y), ...]，y 为当前输出范围的数值。"""
         return [tuple(p) for p in self._points]
 
     def set_points(self, points):
@@ -430,7 +473,7 @@ class Slot:
         self._rebuild_mapper()
 
     def _rebuild_mapper(self):
-        """把脉宽样本点换算为 Mapper 的归一化 y 并重建样条。
+        """把输出单位样本点换算为 Mapper 的归一化 y 并重建样条。
 
         同步 Mapper 的 range 到当前 out_range；样本点由调用方保证合法
         （≥2 个且 x 严格递增，Mapper 要求）；非法输入直接抛 ValueError
@@ -472,30 +515,30 @@ class Slot:
         self.history = deque(new_history, maxlen=self.max_history)
         self.latest_filtered = filtered
         lo, hi = self.out_range
-        self.latest_pulse = max(lo, min(hi, self.mapper.get_result(filtered)))
+        self.latest_output = max(lo, min(hi, self.mapper.get_result(filtered)))
 
     # ---- 逐帧处理 ----
     def process(self, raw):
-        """处理一帧原始数据，返回最终输出脉宽（µs）。
+        """处理一帧原始数据，返回最终输出。
 
-        输出脉宽钳制到 out_range：三次样条在自然边界下可能过冲
-        （归一化 y 越界导致脉宽超出 MIN~MAX），必须钳制，防止舵机
-        收到超范围脉宽而异常运动。
+        未绑定舵机时输出为归一化 [0,1]；绑定后为脉宽（µs），并钳制到
+        out_range（三次样条在自然边界下可能过冲，必须钳制，防止舵机收到
+        超范围脉宽而异常运动）。
         """
         norm = self.normalizer.map(raw)
         if norm is None:
             _, filtered = self.filter.update(None)
         else:
             _, filtered = self.filter.update(norm)
-        pulse = self.mapper.get_result(filtered)
+        output = self.mapper.get_result(filtered)
         lo, hi = self.out_range
-        pulse = max(lo, min(hi, pulse))
+        output = max(lo, min(hi, output))
 
         self.latest_raw = norm
         self.latest_filtered = filtered
-        self.latest_pulse = pulse
+        self.latest_output = output
         self.history.append((norm, filtered))
-        return pulse
+        return output
 
 
 class DataSource:
@@ -559,7 +602,7 @@ class PipelineManager:
         # 舵机脉宽注册表 {通道索引: (min_pulse, max_pulse)}；未传入时从
         # servo_configs.yaml 读取（gui 每次运行都会显式加载并传入）。
         if servo_pulse_configs is None:
-            servo_pulse_configs, _, _ = read_servo_configs(SERVO_CONFIGS_PATH)
+            servo_pulse_configs, _ = read_servo_configs(SERVO_CONFIGS_PATH)
         self.servo_pulse_configs = dict(servo_pulse_configs or {})
         self._reverse = {}   # servo_index -> slot_name（去重快速查找）
         self._sync_reverse()
@@ -569,7 +612,7 @@ class PipelineManager:
         """返回全部槽位的默认配置 {name: {"alpha", "point_set"}}。
 
         point_set 的 y 为归一化值 [0,1]（与文件存储格式一致），
-        应用时由 _expand_points() 展开为默认脉宽范围。
+        应用时由 _expand_points() 展开到槽位当前输出范围。
         """
         return {
             name: {
@@ -581,13 +624,13 @@ class PipelineManager:
 
     @staticmethod
     def _expand_points(points, out_range=None):
-        """把归一化样本点 [(x, y∈[0,1]), ...] 展开到脉宽范围（µs）。
+        """把归一化样本点 [(x, y∈[0,1]), ...] 展开到指定输出范围。
 
-        out_range 缺省为默认脉宽范围；槽位重置时应传入槽位当前 out_range
-        （绑定的舵机范围），避免展开结果与槽位输出范围不一致导致曲线被削平、
-        保存后无法重新加载。
+        out_range 缺省为 NORMALIZED_RANGE（未绑定，即恒等）；槽位已绑定舵机
+        时应传入槽位当前 out_range（脉宽范围），避免展开结果与槽位输出范围
+        不一致导致曲线被削平、保存后无法重新加载。
         """
-        lo, hi = out_range if out_range is not None else DEFAULT_PULSE_RANGE
+        lo, hi = out_range if out_range is not None else NORMALIZED_RANGE
         span = (hi - lo) if hi != lo else 1.0
         return [[float(x), lo + float(y) * span] for x, y in points]
 
@@ -633,7 +676,7 @@ class PipelineManager:
 
         无配置文件 / 读取失败时，按默认配置生成并新建该文件；
         文件已存在但缺失或含非法字段的槽位项，回退默认配置。
-        文件内 point_set 为归一化 y，加载时按默认脉宽范围展开。
+        文件内 point_set 为归一化 y，加载时按槽位当前输出范围展开。
         """
         data = read_slot_configs(self.config_path)
         if data is None:
@@ -642,7 +685,8 @@ class PipelineManager:
         defaults = self.default_slot_config()
         for name, slot in self.slots.items():
             cfg = self._sanitize_slot_config(name, data.get(name), defaults[name])
-            slot.set_points(self._expand_points(cfg["point_set"]))
+            slot.set_points(self._expand_points(cfg["point_set"],
+                                                out_range=slot.out_range))
             slot.set_alpha(cfg["alpha"])
         return data
 
@@ -667,7 +711,7 @@ class PipelineManager:
     def reset_slot_config(self, name):
         """把指定槽位重置为默认配置（alpha + 样本点），并同步写回配置文件。
 
-        先 set_points 再 set_alpha：set_alpha 会以新样条重算 latest_pulse，
+        先 set_points 再 set_alpha：set_alpha 会以新样条重算 latest_output，
         保证重置后槽位状态与 UI 指示完全一致。
         """
         if name not in self.slots:
@@ -745,7 +789,8 @@ class PipelineManager:
 
         去重校验：同一舵机通道只能绑定一个槽位，冲突时拒绝并返回提示；
         只能绑定 servo_configs.yaml 中注册过的舵机（未注册直接拒绝）。
-        绑定成功 / 解绑后，槽位输出脉宽范围切换为该舵机的 [min,max] 或默认范围。
+        绑定后槽位输出切换为该舵机的 [min_pulse, max_pulse]；解绑后回到
+        归一化输出 (0,1)。
 
         返回 (ok: bool, message: str)。
         """
@@ -761,15 +806,15 @@ class PipelineManager:
             bindings[name] = None
             # 先应用输出范围再通知 Store：订阅者（槽位窗口）可在同一轮
             # 通知中立即检测到范围变化并同步样条曲线。
-            self.slots[name].set_out_range(DEFAULT_PULSE_RANGE)
+            self.slots[name].set_out_range(NORMALIZED_RANGE)
             self.store.set({"bindings": bindings})
-            return (True, f"{name} 已解除绑定")
+            return (True, f"{name} 已解除绑定（输出归一化 0~1）")
 
         if not (0 <= servo_index < SERVO_CHANNELS):
             return (False, f"非法舵机通道: {servo_index}")
 
-        pulse_range = self.servo_pulse_configs.get(servo_index)
-        if pulse_range is None:
+        limits = self.servo_pulse_configs.get(servo_index)
+        if limits is None:
             return (False, f"servo_{servo_index} 未在 servo_configs.yaml 中注册，禁止绑定")
 
         existing = self._reverse.get(servo_index)
@@ -784,10 +829,10 @@ class PipelineManager:
         self._reverse[servo_index] = name
         bindings[name] = servo_index
         # 先应用输出范围再通知 Store（见解绑分支的说明）
-        self.slots[name].set_out_range(pulse_range)
+        self.slots[name].set_out_range((limits.min_pulse, limits.max_pulse))
         self.store.set({"bindings": bindings})
-        return (True, f"{name} -> servo_{servo_index}（{pulse_range[0]:.0f}~"
-                      f"{pulse_range[1]:.0f}µs）")
+        return (True, f"{name} -> servo_{servo_index}（{limits.min_pulse:.0f}~"
+                      f"{limits.max_pulse:.0f}µs）")
 
     def get_servo_vector(self):
         """构造 16 路舵机脉宽输出向量（µs）。
@@ -799,15 +844,15 @@ class PipelineManager:
         结果可直接交给 ServoController.set_pulse() 下发。
         """
         vec = [None] * SERVO_CHANNELS
-        for idx, (lo, hi) in self.servo_pulse_configs.items():
+        for idx, limits in self.servo_pulse_configs.items():
             if 0 <= idx < SERVO_CHANNELS:
-                vec[idx] = (lo + hi) / 2.0   # 注册未绑定 -> 中点脉宽
+                vec[idx] = (limits.min_pulse + limits.max_pulse) / 2.0
         for name, idx in self.store.get("bindings", {}).items():
             if idx is None or idx not in self.servo_pulse_configs:
                 continue
             slot = self.slots.get(name)
-            if slot is not None and slot.latest_pulse is not None:
-                vec[idx] = float(slot.latest_pulse)
+            if slot is not None and slot.latest_output is not None:
+                vec[idx] = float(slot.latest_output)
         return vec
 
 
@@ -820,7 +865,7 @@ class ServoDebugger:
       - select_channel() 仅切换当前通道，不产生输出指令，并返回该通道
         当前脉宽（供 UI 刷新数字框，防止切换通道时误触发下发）；
       - set_pulse() / adjust() 允许设置推荐范围之外的脉宽（便于实测找
-        最佳值写回配置文件），但硬钳制到全局安全范围 [400, 2700]µs；
+        最佳值写回配置文件），但钳制到该通道的安全提示范围；
       - is_out_of_range() 判断当前脉宽是否超出该通道推荐范围（供 UI
         红色警示舵机损坏风险）；
       - get_vector() 返回 16 路完整脉宽向量（未注册通道为 None），
@@ -830,16 +875,31 @@ class ServoDebugger:
     因此其手动脉宽不会与管线逐帧下发发生冲突。
     """
 
-    def __init__(self, pulse_configs=None, channels=SERVO_CHANNELS,
-                 safe_min=PULSE_SAFE_MIN, safe_max=PULSE_SAFE_MAX):
+    def __init__(self, pulse_configs=None, channels=SERVO_CHANNELS):
         self.channels = int(channels)
-        self.safe_min = float(safe_min)
-        self.safe_max = float(safe_max)
-        # 只登记合法注册通道：{索引: (min_pulse, max_pulse)}
-        self.pulse_configs = sanitize_pulse_configs(pulse_configs, self.channels)
+        # 输入为 {索引: ServoLimits}；同时容忍 (min,max) 或 (min,max,safe_min,safe_max)
+        self.pulse_configs = {}      # 索引 -> 推荐机械范围 (min, max)
+        self.safe_limits = {}        # 索引 -> 安全提示范围 (safe_min, safe_max)
+        for idx, lim in dict(pulse_configs or {}).items():
+            try:
+                idx = int(idx)
+                if isinstance(lim, (tuple, list)):
+                    if len(lim) >= 4:
+                        mp, xp, sm, sx = (float(v) for v in lim[:4])
+                    else:
+                        mp, xp = float(lim[0]), float(lim[1])
+                        sm, sx = mp, xp
+                else:
+                    mp, xp = float(lim.min_pulse), float(lim.max_pulse)
+                    sm, sx = float(lim.safe_pulse_min), float(lim.safe_pulse_max)
+            except (TypeError, ValueError, IndexError, AttributeError):
+                continue
+            if 0 <= idx < self.channels and 0.0 < mp < xp:
+                self.pulse_configs[idx] = (mp, xp)
+                self.safe_limits[idx] = (sm, sx) if 0.0 < sm < sx else (mp, xp)
         # 每路舵机初始为自身范围中点
-        self._pulses = {idx: (lo + hi) / 2.0
-                        for idx, (lo, hi) in self.pulse_configs.items()}
+        self._pulses = {idx: (mp + xp) / 2.0
+                        for idx, (mp, xp) in self.pulse_configs.items()}
         self._selected = min(self.pulse_configs) if self.pulse_configs else 0
 
     def registered_indices(self):
@@ -868,11 +928,11 @@ class ServoDebugger:
         return self._pulses[index]
 
     def set_pulse(self, value, index=None):
-        """设置指定通道（缺省为当前选中通道）的脉宽，硬钳制到全局安全范围。
+        """设置指定通道（缺省为当前选中通道）的脉宽，钳制到该通道安全范围。
 
         允许设置 servo_configs.yaml 推荐范围（[min,max]）之外的数值，便于
-        实测找最佳脉宽写回配置文件；但不可超过安全范围
-        [self.safe_min, self.safe_max]µs，防止机械堵转损坏舵机。
+        实测找最佳脉宽写回配置文件；但不可超过该通道的安全提示范围，
+        避免用户把脉宽设得过于极端。
 
         返回钳制后的脉宽（µs）。
         """
@@ -881,7 +941,8 @@ class ServoDebugger:
         index = int(index)
         if index not in self.pulse_configs:
             raise ValueError(f"舵机通道未注册或非法: {index}")
-        pulse = max(self.safe_min, min(self.safe_max, float(value)))
+        s_lo, s_hi = self.safe_limits[index]
+        pulse = max(s_lo, min(s_hi, float(value)))
         self._pulses[index] = pulse
         return pulse
 
@@ -912,6 +973,12 @@ class ServoDebugger:
             index = self._selected
         return self.pulse_configs[int(index)]
 
+    def safe_range(self, index=None):
+        """返回指定通道（缺省为当前选中通道）的安全提示范围 (min, max)。"""
+        if index is None:
+            index = self._selected
+        return self.safe_limits[int(index)]
+
     def get_vector(self):
         """返回 16 路完整脉宽向量（未注册通道为 None，可直接交给 set_pulse）。"""
         vec = [None] * self.channels
@@ -939,12 +1006,13 @@ __all__ = [
     "CallableSource",
     "SERVO_CHANNELS",
     "DEFAULT_ALPHA",
-    "DEFAULT_MIN_PULSE",
-    "DEFAULT_MAX_PULSE",
-    "DEFAULT_PULSE_RANGE",
-    "PULSE_SAFE_MIN",
-    "PULSE_SAFE_MAX",
+    "NORMALIZED_RANGE",
+    "ServoLimits",
     "DEFAULT_POINTS",
+    "GLOBAL_MIN_PULSE_KEY",
+    "GLOBAL_MAX_PULSE_KEY",
+    "GLOBAL_SAFE_PULSE_MIN_KEY",
+    "GLOBAL_SAFE_PULSE_MAX_KEY",
     "SLOT_CONFIGS_PATH",
     "SERVO_CONFIGS_PATH",
     "SERVO_CONFIG_STATUS_OK",
@@ -955,7 +1023,4 @@ __all__ = [
     "read_servo_configs",
     "write_servo_configs",
     "default_servo_pulse_configs",
-    "sanitize_pulse_configs",
-    "SERVO_CONFIG_SAFE_MIN_KEY",
-    "SERVO_CONFIG_SAFE_MAX_KEY",
 ]
