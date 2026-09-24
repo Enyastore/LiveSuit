@@ -22,32 +22,38 @@ src/
 
 ## 整体数据流
 
+信息流分三层，由 `core/pipeline.py` 的 `PipelineManager` 编排（接线持久化在
+`src/pipeline.yaml`）：
+
 ```
-src/face_tracking/eye_tracker_main.py         src/servo_control/
-┌─────────────────────────────┐   get_normalized_    ┌──────────────────────────┐
-│ EyeTrackingModule           │───eye_state()──────▶ │ Slots.get_all_output()   │
-│  .get_normalized_eye_state()│                     │  返回 {left/right:        │
-│  → {left, right, timestamp} │                     │    eye_x, eye_y, eye_o}   │
-└─────────────────────────────┘                     └───────────┬──────────────┘
-                                                                ▼
+src/face_tracking/eye_tracker_main.py        src/core/ + src/effects/
+┌─────────────────────────────┐  get_all_output  ┌──────────────────────────────┐
+│ EyeTrackingModule           │─────────────────▶│ 参数输出层 ParamSource        │
+│  .get_normalized_eye_state()│  {slot_name: val}│  归一化 -> [0,1]（in_range）   │
+└─────────────────────────────┘                  └───────────────┬──────────────┘
+                                                                 ▼
                                               ┌──────────────────────────────┐
-                                              │ after_process.py              │
-                                              │  Filter   → EMA 平滑（抗抖动） │
-                                              │  Mapper   → 三次样条映射到脉宽 │
-                                              │             （µs）             │
-                                              └───────────┬──────────────────┘
-                                                          ▼
+                                              │ 效果器层 Effector（可多入多出）│
+                                              │  EMAEffector / 混合器 …       │
+                                              └───────────────┬──────────────┘
+                                                              ▼
+                                              ┌──────────────────────────────┐
+                                              │ 舵机控制层 ServoChannel       │
+                                              │  Mapper(样条) -> 未绑定归一化  │
+                                              │  / 绑定后映射为脉宽（µs）      │
+                                              └───────────────┬──────────────┘
+                                                              ▼
                                               ┌──────────────────────────────┐
                                               │ ServoController.set_pulse()  │
-                                              │  将脉宽列表直写 PCA9685 通道， │
-                                              │  每路按自身 min/max 钳制       │
+                                              │  将脉宽列表直写 PCA9685 通道   │
                                               └──────────────────────────────┘
 ```
 
-数据从 `face_tracking` 模块获取（左/右眼的注视归一化坐标与开度），经 `after_process`
-平滑、映射为脉宽（µs），最后由 `servo_controller` 通过 PCA9685 一次性下发到多路舵机。
+数据从 `face_tracking` 模块获取（左/右眼的注视归一化坐标与开度），在**参数输出层**
+按 `in_range` 归一化，经**效果器层**（如 EMA 平滑）后由**舵机控制层**的三次样条映射
+为脉宽（µs），最后由 `servo_controller` 通过 PCA9685 一次性下发到多路舵机。
 
-槽位在**未绑定舵机**时输出为纯归一化值（0~1），不涉及脉宽；**绑定 `servo_N`**
+通道在**未绑定舵机**时输出为纯归一化值（0~1），不涉及脉宽；**绑定 `servo_N`**
 后自动切换为该舵机在 `servo_configs.yaml` 中注册的 `[min_pulse, max_pulse]`，
 输出脉宽（µs）。曲线始终以**归一化形状**存储，换绑不同脉宽范围的舵机时形状保持
 不变，仅 Y 轴数值按新范围重新标定。

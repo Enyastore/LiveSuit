@@ -1,13 +1,13 @@
 """数据提供者汇总（Slots）+ 输出槽位注册中心。
 
-本文件是 LiveSuit 中「输出槽位」的唯一注册来源：
-  - SLOT_SPECS          输出槽位注册表（槽位名 / 显示名 / 归一化范围 / 输出范围）
-  - get_slot_specs()    供 pipeline_manager 读取注册表、构建并行管道
+本文件是 LiveSuit 中「参数输出层」的唯一注册来源：
+  - SLOT_SPECS          参数注册表（参数名 / 显示名 / 归一化范围 in_range）
+  - get_slot_specs()    供 core/pipeline.py 的 PipelineManager 构建 ParamSource
   - Slots               数据提供者容器（目前对接眼球追踪模块），
-                        get_all_output() 返回 {槽位名: 原始值}
+                        get_all_output() 返回 {参数名: 原始值}
 
-新增输出槽位 / 新数据提供者时，只需在本文件内追加注册表项，
-无需改动 pipeline_manager 或 gui。
+新增参数输出 / 新数据提供者时，只需在本文件内追加注册表项，
+无需改动 core 或 gui。
 """
 
 from collections import OrderedDict
@@ -58,7 +58,7 @@ PROVIDER_KEY_MAP = {
 PROVIDER_INFO = "【眼部追踪】左眼left_eye_x, left_eye_y, left_eye_o三个参数，右眼right_eye_x, right_eye_y, right_eye_o三个参数"
 
 def get_slot_specs() -> OrderedDict:
-    """返回输出槽位注册表副本（供 pipeline_manager 构建并行管道）。"""
+    """返回输出槽位注册表副本（供 PipelineManager 构建参数输出层）。"""
     return OrderedDict(SLOT_SPECS)
 
 
@@ -76,7 +76,7 @@ class Slots:
         """获取所有参数输出，返回 {槽位名: 原始值}。
 
         键名使用 SLOT_SPECS 中注册的槽位名（经 PROVIDER_KEY_MAP 转换），
-        可直接交给 pipeline_manager 的管道逐槽处理。
+        可直接交给 PipelineManager 的管道逐参数处理。
         """
         #获取所有参数输出
         eye_state = self.eye_tracker.get_normalized_eye_state()
