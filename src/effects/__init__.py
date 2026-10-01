@@ -8,7 +8,7 @@ from effects.ema import EMAEffector
 
 # 类型名 -> 效果器类；节点图"新增效果器"菜单据此列出
 EFFECTOR_TYPES = {
-    "ema": EMAEffector,
+    "EMA": EMAEffector,
 }
 
 __all__ = ["EMAEffector", "EFFECTOR_TYPES"]

@@ -26,7 +26,7 @@ _ARROW_COLOR = "#c62828"
 class EMAEffector(Effector):
     """EMA 平滑效果器（有状态；遥测 history 私有，仅面板读取）。"""
 
-    TYPE_NAME = "ema"
+    TYPE_NAME = "EMA"
 
     def __init__(self, alpha=DEFAULT_ALPHA, max_history=320):
         self._lock = threading.RLock()
