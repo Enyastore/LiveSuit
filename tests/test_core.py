@@ -229,8 +229,8 @@ class TestPipeline(unittest.TestCase):
 
     def test_multi_in_out_effector(self):
         mgr = self._manager()
-        e1 = mgr.create_effector("ema", name="e1")
-        e2 = mgr.create_effector("ema", name="e2")
+        e1 = mgr.create_effector("EMA", name="e1")
+        e2 = mgr.create_effector("EMA", name="e2")
         mgr.connect(("param", "a_left_eye_x"), 0, e1, 0)
         mgr.connect(("param", "a_left_eye_y"), 0, e2, 0)
         mixer = mgr.create_effector("mixer", name="mix")

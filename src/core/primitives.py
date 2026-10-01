@@ -1,3 +1,11 @@
+"""信号数学原语（纯逻辑，无硬件 / UI 依赖）。
+
+  - Filter：指数移动平均（EMA）滤波器，供 effects 层的 EMAEffector 使用；
+  - Mapper：自然三次样条插值，供 core.channels.ServoChannel 作为输出端点使用。
+
+两者只是通用数学工具，本身不含任何分层语义。
+"""
+
 import numpy as np
 from bisect import bisect_right
 
@@ -34,6 +42,7 @@ class Filter:
         self.previous = value
         self._last_value = value
 
+
 class Mapper:
     """三阶样条插值映射器（自然三次样条，numpy 实现）。
 
@@ -57,7 +66,7 @@ class Mapper:
         range : tuple[float, float] | None
             输出范围 (lo, hi)。样条求得的归一化 y 会线性映射到该范围，
             即最终输出 = lo + y * (hi - lo)。缺省为 (0, 1)（纯归一化输出，
-            不涉及脉宽；Slot 绑定舵机时会显式传入其脉宽范围）。
+            不涉及脉宽；ServoChannel 绑定舵机时会显式传入其脉宽范围）。
         """
         if range is None:
             range = (0.0, 1.0)   # 缺省纯归一化输出范围

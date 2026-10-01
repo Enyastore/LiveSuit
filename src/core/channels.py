@@ -5,7 +5,7 @@
 曲线形状保持（换舵机型号无需重调）。
 """
 
-from after_process import Mapper
+from core.primitives import Mapper
 
 # 未绑定舵机时的输出范围：纯归一化
 NORMALIZED_RANGE = (0.0, 1.0)

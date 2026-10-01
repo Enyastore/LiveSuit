@@ -1,6 +1,8 @@
 # 舵机控制代码
 
-本文件夹是 LiveSuit 项目中「把眼球追踪数据变成舵机动作」的控制链路，包含舵机驱动、信号后处理与多模块输出汇总三部分。
+本文件夹是 LiveSuit 项目中「硬件与信号原语」的底层：PCA9685 舵机驱动，以及
+参数输出层的数据来源。信号处理（EMA 滤波 / 样条映射）与三层编排分别在
+`src/core/` 与 `src/effects/` 中实现，见下文。
 
 > ⚠️ **脉宽标定**：本项目不再使用「角度（0~180°）」标定运动。管线输出、
 > 舵机调试工具与样条曲线全部以 **PWM 脉宽（µs）** 为单位；每路舵机在
@@ -12,12 +14,17 @@
 ```
 src/servo_control/
 ├── servo_controller.py   # PCA9685 舵机驱动（ServoController，直接写脉宽 duty）
-├── after_process.py      # 信号后处理（Filter 平滑 / Mapper 样条映射）
-├── slots.py              # 数据提供者汇总（Slots 类，目前对接眼球追踪模块）
+├── slots.py              # 参数输出层入口（SLOT_SPECS + Slots 数据提供者）
 └── readme.md             # 本文档
+src/core/
+├── primitives.py         # EMA Filter / 样条 Mapper（纯数学原语）
+├── channels.py           # 舵机控制层（ServoChannel：样条 + 绑定）
+└── pipeline.py           # 编排层 PipelineManager（参数 -> 效果器 -> 通道）
+src/effects/
+└── ema.py                # EMAEffector（效果器范例，自带面板）
 src/
 ├── servo_configs.yaml    # 舵机脉宽注册表（顶层 global_* 默认 + 各通道覆盖）
-└── slot_configs.yaml     # 槽位曲线配置（alpha + 归一化样本点）
+└── pipeline.yaml         # 编排配置（效果器 / 连线 / 通道 / 绑定 / 布局）
 ```
 
 ## 整体数据流
@@ -103,8 +110,8 @@ servo_1: {}                    # 全继承全局
 - `set_pulse(pulses)`：接收脉宽列表（如 `[1500, 1450, None, ...]`，µs），第 `i` 个值
   写到索引 `i` 的通道；`None` 或未注册通道跳过不写；已注册通道钳制到该通道的
   安全提示范围。
-  > 钳制到安全范围而非各通道注册范围：运行管线侧的值已在 Slot 中按绑定舵机的
-  > 注册范围钳制（⊂ 安全范围），不受影响；而舵机调试工具可以在安全范围内
+  > 钳制到安全范围而非各通道注册范围：运行管线侧的值已在 ServoChannel 中按绑定
+  > 舵机的注册范围钳制（⊂ 安全范围），不受影响；而舵机调试工具可以在安全范围内
   > 探索注册范围之外的脉宽，用于实测找最佳值并写回 `servo_configs.yaml`。
 - `deinit()`：释放 PCA9685 资源（停用 PWM 输出）；也实现了上下文管理器。
 
@@ -117,21 +124,17 @@ servo_1: {}                    # 全继承全局
   「⚠ 超出配置范围 …µs，可能有舵机损坏风险」；回到范围内自动恢复正常显示。
 - 找到最佳脉宽后，把对应通道的 `min_pulse` / `max_pulse` 写回 `servo_configs.yaml`。
 
-### `after_process.py` — 信号后处理
+### 信号原语与效果器（不在本文件夹）
 
-把原始追踪信号转换为舵机脉宽前需要经过的两道工序：
+EMA 滤波与三次样条已按分层各归其位，不再作为并列的「后处理」：
 
-- `Filter(alpha=0.1, initial_value=0.0)` — 指数移动平均（EMA）滤波器
-  - `update(value)` 返回 `(value, after)`：`value` 为原始输入，`after` 为平滑后输出。
-  - 输入为 `None` 时不更新内部状态，直接返回上一次的有效值（hold-last）。
-  - `alpha` 越小平滑力度越大（响应越慢）。
-- `Mapper(points=None, range=(0.0, 1.0))` — 自然三次样条插值映射器
-  - 通过样本点建立三次样条曲线，把输入 `x` 映射为归一化 `y`（约定取值 `[0, 1]`），
-    再线性映射到 `range` 指定的实际输出范围（缺省 (0,1) 纯归一化；绑定舵机时
-    由 Slot 传入脉宽范围 `(min_pulse, max_pulse)`）。
-  - 样本点格式：`[(x_0, y_0), (x_1, y_1), ...]`，默认 `[(0,0), (1,1)]`。
-  - 要求至少 2 个样本点且 `x` 严格递增，否则抛 `ValueError`。
-  - 输入超出样本点范围时钳制到边界值（不外推）。
+- `core/primitives.py` —— 两个纯数学原语：
+  - `Filter(alpha=0.1, initial_value=0.0)` 指数移动平均（EMA）；`update(value)`
+    返回 `(value, after)`，输入 `None` 时 hold-last。
+  - `Mapper(points=None, range=(0.0, 1.0))` 自然三次样条插值；把归一化 `x` 映射为
+    归一化 `y` 后线性映射到 `range`（缺省 `(0,1)`；绑定舵机时传 `(min,max)` µs）。
+- `effects/ema.py` —— `EMAEffector`（效果器范例，内部使用 `Filter`）。
+- `core/channels.py` —— `ServoChannel`（舵机端点，内部使用 `Mapper`）。
 
 ### `slots.py` — 数据提供者汇总
 
@@ -148,36 +151,35 @@ servo_1: {}                    # 全继承全局
 ## 依赖
 
 - CircuitPython 库：`adafruit_pca9685`（含 `board`、`busio`）
-- `numpy`（`after_process.py` 的样条计算）
+- `numpy`（`core/primitives.py` 的样条计算）
 - 眼球追踪模块（`src/face_tracking/eye_tracker_main.py`）及其依赖
   （OpenCV、PIL、PyYAML、pybind11 编译的追踪核心等，详见该模块文档）
 
 ## 快速上手
 
+信号链路由 `core/pipeline.py` 的 `PipelineManager` 统一编排（参数输出 -> 效果器
+-> 舵机通道），接线、通道样条与节点布局持久化在 `src/pipeline.yaml`。直接
+`python3 src/gui.py` 启动，在「效果器编排」窗口里增删/接线效果器即可。
+
+如需单独使用底层数学原语：
+
 ```python
-from servo_controller import ServoController
-from after_process import Filter, Mapper
+from core.primitives import Filter, Mapper
 
-# 1. 后处理：平滑 + 映射到脉宽范围（0~1 -> 500~2500µs）
 smoother = Filter(alpha=0.2)
-mapper   = Mapper(points=[(0.0, 0.0), (0.5, 0.5), (1.0, 1.0)],
-                  range=(500.0, 2500.0))
-
-# 2. 驱动：with 块结束时自动 deinit；只写注册过的通道
-with ServoController(pulse_configs={0: (450, 2650), 1: (500, 2500)}) as sc:
-    raw = 0.3                     # 模拟一路追踪信号
-    _, smooth = smoother.update(raw)
-    pulse = mapper.get_result(smooth)
-    sc.set_pulse([pulse, None])   # 通道 0 下发，其余不写
+mapper = Mapper(points=[(0.0, 0.0), (0.5, 0.5), (1.0, 1.0)],
+                range=(500.0, 2500.0))
+_, smooth = smoother.update(0.3)
+pulse = mapper.get_result(smooth)
 ```
 
 ## 注意事项
 
 - `servo_controller.py` 依赖真实 I2C 硬件与 PCA9685，在没有硬件的环境中
-  import/实例化会失败；`after_process.py` 与 `slots.py` 不涉及硬件，
+  import/实例化会失败；`core/primitives.py` 与 `slots.py` 不涉及硬件，
   可独立测试。
 - `slots.py` 依赖眼球追踪模块，导入前请确保摄像头配置完成、追踪已启动。
 - 每路舵机的 `min_pulse` / `max_pulse` 应与其实际机械行程一致；设置过宽会在
   端点堵转并增大电流（可先用 `experiment/test_servo.py` 的 pulse 模式实测）。
-- 槽位样条曲线（`slot_configs.yaml`）的样本点 y 以**归一化 [0,1]** 存储，
-  与绑定舵机无关；GUI 中显示为当前绑定舵机的真实脉宽（µs）。
+- 通道样条曲线（存于 `pipeline.yaml` 各通道的 `point_set`）的样本点 y 以
+  **归一化 [0,1]** 存储，与绑定舵机无关；GUI 中显示为当前绑定舵机的真实脉宽（µs）。

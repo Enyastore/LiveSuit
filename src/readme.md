@@ -6,7 +6,6 @@
 ## servo_control/
 硬件与信号原语：
 - `slots.py` —— 参数输出层入口（`SLOT_SPECS` + `Slots` 数据提供者）
-- `after_process.py` —— `Filter`(EMA) / `Mapper`(三次样条) 数学原语
 - `servo_controller.py` —— PCA9685 舵机驱动
 
 ## core/
@@ -14,6 +13,7 @@
 - `params.py` 参数输出层（原始值 -> 归一化参数流）
 - `effectors.py` 效果器抽象基类
 - `channels.py` 舵机控制层（Spline + 绑定）
+- `primitives.py` 信号数学原语（EMA `Filter` / 样条 `Mapper`）
 - `graph.py` 效果器依赖图（拓扑 / 环检测）
 - `sources.py` / `store.py` / `servo_limits.py` / `config_io.py`
 - `pipeline.py` 编排层 `PipelineManager`

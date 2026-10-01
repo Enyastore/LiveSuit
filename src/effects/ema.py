@@ -7,10 +7,8 @@
 import threading
 from collections import deque
 
-import core  # noqa: F401  导入 core 以触发 servo_control 路径注入
-from after_process import Filter
-
 from core.effectors import Effector
+from core.primitives import Filter
 
 DEFAULT_ALPHA = 0.85
 
