@@ -69,6 +69,7 @@ class PipelineManager:
         self._dep = DependencyGraph()
         self._order = []                # 效果器拓扑序（实例名）
         self._latest = {}               # source_ref -> 最新值（快照用）
+        self._layout = {}               # 节点键 -> (x, y) 编排图布局（持久化）
         self._suppress_save = False     # 构建/载入期间禁止自动写盘
 
         data = config_io.read_pipeline(self._config_path)
@@ -105,6 +106,7 @@ class PipelineManager:
         self._reverse.clear()
         self._dep = DependencyGraph()
         self._order = []
+        self._layout = {}
 
     # --------------------------------------------------------
     # 参数 / 只读访问
@@ -122,8 +124,52 @@ class PipelineManager:
         return list(self.channels.values())
 
     def effector_name(self, ref):
-        """返回效果器实例的编排名（供 GUI 显示）。"""
+        """返回效果器实例的编排名（唯一，用作接线标识）。"""
         return self._eff_name_of.get(ref)
+
+    def effector_label(self, ref):
+        """返回效果器的显示名（label 优先，缺省回退编排名）。"""
+        if ref is None:
+            return None
+        return ref.label or self._eff_name_of.get(ref)
+
+    def set_effector_label(self, ref, label):
+        """设置效果器显示名（label）并写盘；空则回退编排名。"""
+        with self._lock:
+            name = self._eff_name_of.get(ref)
+            if name is None:
+                return
+            ref.label = (str(label).strip() or name)
+            self._autosave()
+
+    def get_layout(self):
+        """返回编排图节点布局副本 {节点键: (x, y)}。节点键形如 'effector:ema_x'。"""
+        with self._lock:
+            return dict(self._layout)
+
+    def set_layout(self, key, x, y):
+        """记录单个节点布局并写盘。"""
+        with self._lock:
+            self._layout[key] = (float(x), float(y))
+            self._autosave()
+
+    def clear_layout(self):
+        """清空布局（节点回到默认三列排布）并写盘。"""
+        with self._lock:
+            self._layout = {}
+            self._autosave()
+
+    def reset_pipeline(self):
+        """清空编排并恢复默认（param -> channel），同时清空布局与绑定。"""
+        with self._lock:
+            self._suppress_save = True
+            try:
+                self._reset_graph()
+                self._build_default_graph()
+            finally:
+                self._suppress_save = False
+            self._notify_bindings()
+            self._autosave()
 
     def get_connections(self):
         """返回所有连线 [(源, 目标), ...]，源/目标为 source_ref 形式。"""
@@ -157,6 +203,7 @@ class PipelineManager:
                 raise ValueError(f"未注册的效果器类型: {type_name}")
             eff = cls()
             eff_name = self._unique_name(self.effectors, name or type_name)
+            eff.label = eff_name
             self.effectors[eff_name] = eff
             self._eff_name_of[eff] = eff_name
             self._effector_inputs[eff_name] = [None] * eff.get_input_count()
@@ -461,6 +508,7 @@ class PipelineManager:
         for name, eff in self.effectors.items():
             effectors[name] = {
                 "type": eff.TYPE_NAME,
+                "label": eff.label or name,
                 "inputs": [self._ref_to_list(r)
                            for r in self._effector_inputs[name]],
                 "params": eff.get_params(),
@@ -473,7 +521,9 @@ class PipelineManager:
                 "point_set": params.get("point_set"),
                 "servo": self._bindings.get(name),
             }
-        return {"effectors": effectors, "channels": channels}
+        layout = {key: [pos[0], pos[1]]
+                  for key, pos in self._layout.items()}
+        return {"effectors": effectors, "channels": channels, "layout": layout}
 
     def save_pipeline(self):
         """把当前编排写回 pipeline.yaml。"""
@@ -488,6 +538,7 @@ class PipelineManager:
                     print(f"[pipeline] 未知效果器类型，跳过: {name}")
                     continue
                 eff = cls()
+                eff.label = (cfg or {}).get("label") or name
                 if cfg.get("params"):
                     eff.set_params(cfg["params"])
                 self.effectors[name] = eff
@@ -520,17 +571,19 @@ class PipelineManager:
                     self._channel_inputs[name] = self._list_to_ref(
                         cfg["input"])
 
+            for key, pos in (data.get("layout") or {}).items():
+                try:
+                    self._layout[key] = (float(pos[0]), float(pos[1]))
+                except (TypeError, ValueError, IndexError):
+                    continue
+
             self._rebuild_order()
 
     def _build_default_graph(self):
-        """默认编排：param_i -> EMA_i -> channel_i（保持既有行为）。"""
-        has_ema = "ema" in self._effector_types
+        """默认编排：param_i -> channel_i（不预置任何效果器）。
+
+        效果器由用户在节点图中按需新增；未绑定的通道直接输出归一化值。
+        """
         for name, param in self.params.items():
-            if has_ema:
-                eff = self.create_effector("ema", name=f"ema_{name}")
-                self.connect(param, 0, eff, 0)
-                producer, port = eff, 0
-            else:
-                producer, port = param, 0
             channel = self.add_channel(name)
-            self.connect(producer, port, channel, 0)
+            self.connect(param, 0, channel, 0)

@@ -13,6 +13,7 @@ class Effector:
     """效果器抽象：多输入、多输出、位置式端口。"""
 
     TYPE_NAME = None   # 子类覆盖：注册表 / 持久化用的类型名
+    label = None       # 显示名（编排页与自带面板标题）；由 PipelineManager 赋值并持久化
 
     def get_input_count(self):
         """返回输入端口数量。"""

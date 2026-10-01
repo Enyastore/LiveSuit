@@ -190,13 +190,15 @@ class TestPipeline(unittest.TestCase):
 
     def test_default_graph_and_tick(self):
         mgr = self._manager()
-        self.assertEqual(len(mgr.get_effectors()), 2)
+        # 默认不预置任何效果器：param 直连 channel
+        self.assertEqual(len(mgr.get_effectors()), 0)
         self.assertEqual({c.name for c in mgr.get_channels()},
                          {"a_left_eye_x", "a_left_eye_y"})
         mgr.tick()
         snap = mgr.snapshot()
         self.assertAlmostEqual(snap["params"]["a_left_eye_x"], 0.75)
-        self.assertTrue(0.0 <= snap["channels"]["a_left_eye_x"] <= 1.0)
+        # 直连且未绑定 -> 输出即归一化参数值
+        self.assertAlmostEqual(snap["channels"]["a_left_eye_x"], 0.75)
 
     def test_bind_output_and_persist(self):
         mgr = self._manager()
@@ -227,13 +229,13 @@ class TestPipeline(unittest.TestCase):
 
     def test_multi_in_out_effector(self):
         mgr = self._manager()
+        e1 = mgr.create_effector("ema", name="e1")
+        e2 = mgr.create_effector("ema", name="e2")
+        mgr.connect(("param", "a_left_eye_x"), 0, e1, 0)
+        mgr.connect(("param", "a_left_eye_y"), 0, e2, 0)
         mixer = mgr.create_effector("mixer", name="mix")
-        eff_x = list(mgr.get_effectors())
-        # 找到两个 EMA 的实例名
-        ema_names = [n for n, e in mgr.effectors.items()
-                     if e.TYPE_NAME == "ema"]
-        mgr.connect(("effector", ema_names[0], 0), 0, mixer, 0)
-        mgr.connect(("effector", ema_names[1], 0), 0, mixer, 1)
+        mgr.connect(e1, 0, mixer, 0)
+        mgr.connect(e2, 0, mixer, 1)
         # 把通道改接到 mixer 的两个输出
         channels = list(mgr.channels.values())
         mgr.connect(mixer, 0, channels[0], 0)
@@ -247,19 +249,52 @@ class TestPipeline(unittest.TestCase):
         mgr = self._manager()
         e1 = mgr.create_effector("gain", name="g1")
         e2 = mgr.create_effector("gain", name="g2")
-        ema_names = [n for n, e in mgr.effectors.items()
-                     if e.TYPE_NAME == "ema"]
-        mgr.connect(("effector", ema_names[0], 0), 0, e1, 0)
+        mgr.connect(("param", "a_left_eye_x"), 0, e1, 0)
         mgr.connect(e1, 0, e2, 0)
         with self.assertRaises(GraphError):
             mgr.connect(e2, 0, e1, 0)
 
     def test_remove_effector_clears_wiring(self):
         mgr = self._manager()
-        ema = [e for e in mgr.get_effectors() if e.TYPE_NAME == "ema"][0]
-        mgr.remove_effector(ema)
-        self.assertNotIn(ema, mgr.get_effectors())
+        eff = mgr.create_effector("gain", name="g")
+        channel = list(mgr.get_channels())[0]
+        mgr.connect(("param", "a_left_eye_x"), 0, eff, 0)
+        mgr.connect(eff, 0, channel, 0)
+        mgr.remove_effector(eff)
+        self.assertNotIn(eff, mgr.get_effectors())
         mgr.tick()   # 不应崩溃
+
+    def test_effector_label_persist(self):
+        mgr = self._manager()
+        eff = mgr.create_effector("gain", name="g")
+        self.assertEqual(mgr.effector_label(eff), "g")
+        mgr.set_effector_label(eff, "我的增益")
+        mgr2 = self._manager()
+        ref2 = [e for e in mgr2.get_effectors() if e.TYPE_NAME == "gain"][0]
+        self.assertEqual(mgr2.effector_label(ref2), "我的增益")
+
+    def test_layout_persist(self):
+        mgr = self._manager()
+        mgr.set_layout("effector:g", 123.0, 45.0)
+        mgr2 = self._manager()
+        self.assertEqual(mgr2.get_layout().get("effector:g"), (123.0, 45.0))
+
+    def test_reset_pipeline(self):
+        mgr = self._manager()
+        eff = mgr.create_effector("gain", name="g")
+        mgr.connect(("param", "a_left_eye_x"), 0, eff, 0)
+        mgr.bind("a_left_eye_x", 0)
+        mgr.set_layout("effector:g", 9.0, 9.0)
+        mgr.reset_pipeline()
+        self.assertEqual(len(mgr.get_effectors()), 0)
+        self.assertEqual(mgr.get_layout(), {})
+        self.assertIsNone(mgr.get_binding("a_left_eye_x"))
+        self.assertEqual({c.name for c in mgr.get_channels()},
+                         {"a_left_eye_x", "a_left_eye_y"})
+        # 默认直连：tick 后通道输出归一化参数值
+        mgr.tick()
+        self.assertAlmostEqual(
+            mgr.snapshot()["channels"]["a_left_eye_x"], 0.75)
 
 
 if __name__ == "__main__":

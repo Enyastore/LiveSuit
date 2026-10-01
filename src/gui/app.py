@@ -332,6 +332,37 @@ class LiveSuitApp:
             return
         self.node_graph = NodeGraphWindow(self.root, self)
 
+    def reset_pipeline(self):
+        """清空编排并恢复默认（param -> channel），重建相关子窗口。"""
+        if self.manager is None:
+            return
+        for eff in self.manager.get_effectors():
+            try:
+                eff.close_panel()
+            except Exception:  # noqa: BLE001  面板可能未开
+                pass
+        self.manager.reset_pipeline()
+
+        # 通道对象已被替换，重建通道窗口
+        for w in list(self._channel_windows):
+            try:
+                w.destroy()
+            except tk.TclError:
+                pass
+        self._channel_windows = []
+        self._build_channel_windows()
+
+        # 通道集合可能变化，重建舵机总线面板
+        if self.servo_panel is not None:
+            try:
+                self.servo_panel.destroy()
+            except tk.TclError:
+                pass
+            self.servo_panel = None
+        self.servo_panel = ServoBusPanel(self.root, self.manager,
+                                         on_close=self._on_servo_panel_closed)
+        self._apply_render_mode(self.manager.render_mode)
+
     def toggle_render(self):
         self.manager.toggle_render_mode()
 

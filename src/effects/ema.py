@@ -128,7 +128,7 @@ class _EMAPanel:
         self._font = tkfont.Font(size=8)
 
         self.top = tk.Toplevel(parent) if parent is not None else tk.Tk()
-        self.top.title("EMA 效果器")
+        self.top.title(effector.label or "EMA 效果器")
         self.top.resizable(True, True)
 
         row = tk.Frame(self.top)
