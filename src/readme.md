@@ -1,7 +1,7 @@
 # 源码根文件夹
 
 ## face_tracking/
-面捕追踪算法（目前为眼部追踪），提供归一化后的原始信号。
+面捕追踪算法（目前仅包含眼部追踪），提供归一化后的原始信号。
 
 ## servo_control/
 硬件与信号原语：
@@ -9,10 +9,10 @@
 - `servo_controller.py` —— PCA9685 舵机驱动
 
 ## core/
-纯逻辑层（禁止 import tkinter）：
+纯逻辑层：
 - `params.py` 参数输出层（原始值 -> 归一化参数流）
 - `effectors.py` 效果器抽象基类
-- `channels.py` 舵机控制层（Spline + 绑定）
+- `channels.py` 舵机控制层（最终样条插值与绑定）
 - `primitives.py` 信号数学原语（EMA `Filter` / 样条 `Mapper`）
 - `graph.py` 效果器依赖图（拓扑 / 环检测）
 - `sources.py` / `store.py` / `servo_limits.py` / `config_io.py`

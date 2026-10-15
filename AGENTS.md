@@ -5,13 +5,13 @@
 - **搜索代码一律用 bash 的 grep**（例如 `grep -rn "关键字" src`）。**禁止使用 opencode 内置的 grep 工具**（存在 bug）。
 - 找文件用 bash 的 `find` / `ls`，或 opencode 的 glob 工具。
 - 运行 Python / 测试统一用仓库虚拟环境：`.venv/bin/python`。
-- 不要新增第三方依赖；只用 `requirements.txt` 中已有的库。
+- 不要新增第三方依赖；只用 `requirements.txt` 中已有的库。除非目前库无法满足要求，则必须通知用户得到同意后再安装依赖。
 
 ## 中英翻译规则
 
 - **代码标识符**（模块名、类名、函数名、变量名、常量名）：使用**英文**。
   - 例：`ServoChannel`、`EMAEffector`、`get_input_count`、`NORMALIZED_RANGE`。
-- **注释与 docstring**：使用**中文**，风格、口吻与现有代码保持一致（解释“为什么”，而非复述代码）。
+- **注释与 docstring**：使用**中文**，风格、口吻与现有代码保持一致（解释“为什么”，而非复述代码）。**修改时简洁地描述现有版本做了什么，无需重新强调旧版本**
 - **面向用户的字符串**（GUI 文本、提示框、`print` 日志、异常消息）：使用**中文**。
 - **专有名词**保持英文：EMA、Spline、PCA9685、tkinter、YAML、PWM、I2C 等。
 - **不要中英混杂地命名标识符**（如 `get_舵机向量` 是禁止的）；标识符一律纯英文。
