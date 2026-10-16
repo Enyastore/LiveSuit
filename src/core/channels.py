@@ -23,7 +23,10 @@ class ServoChannel:
         self._points = [list(p) for p in (points or DEFAULT_POINTS)]
         self.mapper = Mapper(points=None, range=self.out_range)
         self._rebuild_mapper()
-        self.latest_input = None
+        # 生效输入：上游有效值到达前保持 0.5（输出范围中点）。这样未连接
+        # 眼追时拖动样条曲线仍会重新映射并驱动舵机，保留脱机调试能力；
+        # 用中点而非 0.0，避免启动瞬间舵机先跳到行程端点再回位（抽搐）。
+        self.latest_input = 0.5
         self.latest_output = None
 
     # ---- 输出范围 / 样本点 ----
@@ -42,9 +45,8 @@ class ServoChannel:
                         for x, y in self._points]
         self.out_range = (nlo, nhi)
         self._rebuild_mapper()
-        if self.latest_input is not None:
-            self.latest_output = self._clamp(self.mapper.get_result(
-                self.latest_input))
+        self.latest_output = self._clamp(self.mapper.get_result(
+            self.latest_input))
 
     def curve_points(self):
         """返回样本点副本 [(x, y), ...]，y 为当前输出范围的数值。"""
@@ -73,11 +75,14 @@ class ServoChannel:
 
     # ---- 逐帧处理 ----
     def process(self, value):
-        """处理一帧输入；上游无效(None)时 hold-last，返回最终输出。"""
-        self.latest_input = value
-        if value is None:
-            return self.latest_output
-        output = self._clamp(self.mapper.get_result(value))
+        """处理一帧输入，返回最终输出。
+
+        上游无效(None)时沿用上一次生效输入（初始 0.5）继续映射，而非冻结
+        输出：未连接眼追时拖动样条曲线仍能看到舵机响应（旧 Slot 行为）。
+        """
+        if value is not None:
+            self.latest_input = value
+        output = self._clamp(self.mapper.get_result(self.latest_input))
         self.latest_output = output
         return output
 

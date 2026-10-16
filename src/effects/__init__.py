@@ -5,10 +5,12 @@ EFFECTOR_TYPES 即可（无需改动 PipelineManager 或 GUI 框架）。
 """
 
 from effects.ema import EMAEffector
+from effects.generator import GeneratorEffector
 
 # 类型名 -> 效果器类；节点图"新增效果器"菜单据此列出
 EFFECTOR_TYPES = {
     "EMA": EMAEffector,
+    "Generator": GeneratorEffector,
 }
 
-__all__ = ["EMAEffector", "EFFECTOR_TYPES"]
+__all__ = ["EMAEffector", "GeneratorEffector", "EFFECTOR_TYPES"]

@@ -29,4 +29,11 @@ tkinter 界面层：
 - `servo_panel.py` / `servo_tool.py` / `welcome.py`
 
 ## gui.py
-用户入口。直接 `python3 src/gui.py` 即可打开欢迎页面。
+用户入口。直接 
+
+```bash
+source .venv/bin/activate
+python3 src/gui.py
+```
+
+即可打开欢迎页面。
