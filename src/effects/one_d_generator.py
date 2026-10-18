@@ -1,4 +1,4 @@
-"""生成器效果器：0 输入 -> 1 输出。
+"""1D 生成器效果器：0 输入 -> 1 输出。
 
 端口语义：outputs[0] = 面板滑条当前值（归一化）。
 自带面板：一个 0~1 的横向滑条，步长 0.1，直接把滑条值作为输出。
@@ -12,10 +12,10 @@ DEFAULT_VALUE = 0.0
 SLIDER_RESOLUTION = 0.01
 
 
-class GeneratorEffector(Effector):
+class OneDGeneratorEffector(Effector):
     """手动生成常量值的效果器（无输入；滑条值由面板在主线程设置）。"""
 
-    TYPE_NAME = "Generator"
+    TYPE_NAME = "1D-Generator"
 
     def __init__(self, value=DEFAULT_VALUE):
         self._lock = threading.RLock()
@@ -61,7 +61,7 @@ class GeneratorEffector(Effector):
 
     # ---- 自带面板 ----
     def show_panel(self, parent=None):
-        """显示/置顶生成器面板（0~1 滑条）。"""
+        """显示/置顶 1D 生成器面板（0~1 滑条）。"""
         if self._panel is not None:
             try:
                 if self._panel.winfo_exists():
@@ -70,7 +70,7 @@ class GeneratorEffector(Effector):
                     return self._panel
             except Exception:  # noqa: BLE001  面板已销毁
                 self._panel = None
-        self._panel = _GeneratorPanel(parent, self)
+        self._panel = _OneDGeneratorPanel(parent, self)
         return self._panel
 
     def close_panel(self):
@@ -82,8 +82,8 @@ class GeneratorEffector(Effector):
             self._panel = None
 
 
-class _GeneratorPanel:
-    """生成器效果器自带面板（tkinter Toplevel）。"""
+class _OneDGeneratorPanel:
+    """1D 生成器效果器自带面板（tkinter Toplevel）。"""
 
     def __init__(self, parent, effector, width=260):
         import tkinter as tk
@@ -91,7 +91,7 @@ class _GeneratorPanel:
         self.effector = effector
 
         self.top = tk.Toplevel(parent) if parent is not None else tk.Tk()
-        self.top.title(effector.label or "生成器")
+        self.top.title(effector.label or "1D 生成器")
         self.top.resizable(False, False)
 
         row = tk.Frame(self.top)

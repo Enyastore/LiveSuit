@@ -1,6 +1,5 @@
 """样条编辑画布 + 样本点编辑弹窗。
 
-从 gui.py 迁移而来，绑定对象由旧的 Slot 换成 core.channels.ServoChannel：
   - SplineCurveCanvas   三次样条插值调节画布（单击新增 / 拖拽 / 双击编辑 / 右键删除）
   - EditPointDialog     双击样本点的 X/Y 编辑模态框
 
@@ -30,7 +29,7 @@ class SplineCurveCanvas(tk.Canvas):
     """三次样条插值调节画布（任务管理器风格曲线图）。
 
     交互:
-      - 左键单击空白区域 -> 新增样本点
+      - 左键单击空白区域 -> 新增样本点（x=0 / x=1 边界处不新增）
       - 左键拖拽样本点    -> 移动样本点并实时刷新样条曲线
       - 左键双击样本点    -> 弹出 X(0~1) / Y(MIN~MAX) 编辑弹窗
       - 右键单击样本点    -> 删除样本点（x=0 与 x=1 边界点不可删除）
@@ -45,6 +44,10 @@ class SplineCurveCanvas(tk.Canvas):
     PAD_T = 10
     PAD_B = 16
     HIT_R = 7     # 命中半径（px）
+    # 内部样本点与 x=0 / x=1 边界保持的最小归一化距离；边界只允许
+    # 原本的两个端点，避免其他点贴边导致样条接近垂直。
+    BOUNDARY_MARGIN = 0.01
+    MIN_X_GAP = 1e-3   # 相邻样本点的最小 x 间距
 
     def __init__(self, master, channel, width=232, height=132, on_changed=None):
         super().__init__(master, width=width, height=height,
@@ -120,10 +123,12 @@ class SplineCurveCanvas(tk.Canvas):
         if self._is_boundary(i):
             x = 0.0 if i == 0 else 1.0
             return (x, x)
-        # 余量取 0.5e-3：与 _reorder_points / _add_point 的 1e-3 最小间距
-        # 一致，保证 lo <= hi 恒成立（不会拖出重复 x 触发送样条重建异常）。
-        lo = self.points[i - 1][0] + 0.5e-3
-        hi = self.points[i + 1][0] - 0.5e-3
+        # 内部点同时受邻居与边界余量约束，保证拖不到 x=0 / x=1，
+        # 也不会与相邻点重合（避免样条接近垂直或重建异常）。
+        half_gap = self.MIN_X_GAP / 2.0
+        lo = max(self.BOUNDARY_MARGIN, self.points[i - 1][0] + half_gap)
+        hi = min(1.0 - self.BOUNDARY_MARGIN,
+                 self.points[i + 1][0] - half_gap)
         return (lo, hi)
 
     # ---- 交互事件 ----
@@ -180,11 +185,13 @@ class SplineCurveCanvas(tk.Canvas):
 
 
     def _add_point(self, px, py):
-        x = max(0.001, min(0.999, self._ix(px)))
+        x = self._ix(px)
+        if not (self.BOUNDARY_MARGIN <= x <= 1.0 - self.BOUNDARY_MARGIN):
+            return  # 边界处只保留原端点，禁止新增贴边样本点
         ylo, yhi = self._y_range()
         y = max(ylo, min(yhi, self._iy(py)))
         for ex, _ey in self.points:
-            if abs(ex - x) < 1e-3:
+            if abs(ex - x) < self.MIN_X_GAP:
                 return  # 与现有样本点 X 过近则忽略
         self.points.append([x, y])
         self.points.sort(key=lambda p: p[0])
@@ -203,9 +210,10 @@ class SplineCurveCanvas(tk.Canvas):
             # 边界点（x=0 / x=1）X 锁定，仅允许调整 Y
             nx = x
         else:
-            # 非边界点：允许输入任意 x（(0,1) 开区间），输入后整体重新排序，
+            # 非边界点：x 限制在边界余量内，输入后整体重新排序，
             # 而不是 clamp 到原邻居区间（避免"改大 x 被钳到邻居处"）。
-            nx = max(1e-4, min(1.0 - 1e-4, nx))
+            nx = max(self.BOUNDARY_MARGIN,
+                     min(1.0 - self.BOUNDARY_MARGIN, nx))
         self.points[i] = [nx, ny]
         if not self._is_boundary(i):
             self._reorder_points()
@@ -217,26 +225,28 @@ class SplineCurveCanvas(tk.Canvas):
         双击编辑可能把非边界点的 x 改成大于/小于其他点的值，排序后
         需保证 x 严格递增（Mapper 要求）。采用「正向推挤 + 反向收拢」：
           1. 正向：每个内部点不小于前一点 + eps（消除过近/重合）；
-          2. 反向：最右内部点不越过 x=1-eps，其余内部点不越过
+          2. 反向：最右内部点不越过边界余量，其余内部点不越过
              后一点 - eps，避免正向推挤把点挤过头后与后一点/边界碰撞
              （旧实现只在最后硬压 points[-2]，可能与前一点重复/逆序，
              使 Mapper 抛 ValueError）。
         两端边界点（x=0 / x=1）X 锁定不移动。
         """
-        eps = 1e-3
+        eps = self.MIN_X_GAP
+        lo_bound = self.BOUNDARY_MARGIN
+        hi_bound = 1.0 - self.BOUNDARY_MARGIN
         self.points.sort(key=lambda p: p[0])
         n = len(self.points)
         for j in range(1, n - 1):   # 跳过两端边界点：正向推挤
-            need = self.points[j - 1][0] + eps
+            need = max(lo_bound, self.points[j - 1][0] + eps)
             if self.points[j][0] < need:
                 self.points[j][0] = need
         if n > 2:
-            # 反向收拢：先压最右内部点到 1-eps，再从右向左逐点收拢。
+            # 反向收拢：先压最右内部点到边界余量内，再从右向左逐点收拢。
             # 由正向推挤保证的「右点 >= 左点 + eps」可推出单遍反向
             # 后仍满足「左点 + eps <= 右点」，不会压出新碰撞。
-            self.points[-2][0] = min(self.points[-2][0], 1.0 - eps)
+            self.points[-2][0] = min(self.points[-2][0], hi_bound)
             for j in range(n - 3, 0, -1):
-                cap = self.points[j + 1][0] - eps
+                cap = min(hi_bound, self.points[j + 1][0] - eps)
                 if self.points[j][0] > cap:
                     self.points[j][0] = cap
 
