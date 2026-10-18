@@ -1,0 +1,5 @@
+opencv-python==5.0.0.93
+numpy==2.5.2
+PyYAML==6.0.3
+Pillow==12.3.0
+adafruit-circuitpython-pca9685==3.4.22

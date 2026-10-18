@@ -37,41 +37,40 @@ __all__ = [
 
 import tkinter as tk
 import cv2
-from tkinter import ttk
+from tkinter import messagebox, ttk
 from PIL import Image, ImageTk
 import yaml
 import multiprocessing
 import threading
 import queue
-import os
 import subprocess
 import sys
 import time
 import logging
 import re
 import numpy as np
-from dataclasses import dataclass, field
+from pathlib import Path
+from dataclasses import dataclass, field, fields
 from typing import Optional, List, Dict, Tuple
 
 # 内部依赖
-from eye_tracker_core import GazeVectorTracker, Normalizer
+from eye_tracker_core import GazeVectorTracker, Normalizer, V4L2_FOURCC_MAP
 
 logger = logging.getLogger(__name__)
+
+# 运行期配置文件（camera_configs.yaml 等）统一锚定到 src/，与 CWD 无关，
+# 与 pipeline_manager 的 slot/servo 配置、eye_tracker_core 的 references.yaml
+# 保持同一解析策略。
+_SRC_DIR = Path(__file__).resolve().parent.parent
+
+# 子进程启动宽限窗口（秒）：期间任一子进程提前退出即判失败，两者都存活
+# 则视为启动成功（替代固定 sleep 的竞态探测）。
+START_GRACE = 0.5
 
 
 # ============================================================
 # 工具函数
 # ============================================================
-
-# V4L2 四字符码整数值（比 cv2.VideoWriter_fourcc 更可靠，V4L2 原生）
-_V4L2_FOURCC_MAP = {
-    "YUYV": 0x56595559,
-    "MJPG": 0x47504A4D,
-    "NV12": 0x3231564E,
-    "H264": 0x34363248,
-    "BGR3": 0x33524742,
-    "RGB3": 0x33424752,
-}
 
 def _setup_camera(index: int, fps: int = 30, width: int = 640, height: int = 480,
                   fourcc_str: str = "") -> Optional[cv2.VideoCapture]:
@@ -80,8 +79,8 @@ def _setup_camera(index: int, fps: int = 30, width: int = 640, height: int = 480
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     cap.set(cv2.CAP_PROP_FPS, fps)
-    if fourcc_str and fourcc_str in _V4L2_FOURCC_MAP:
-        cap.set(cv2.CAP_PROP_FOURCC, _V4L2_FOURCC_MAP[fourcc_str])
+    if fourcc_str and fourcc_str in V4L2_FOURCC_MAP:
+        cap.set(cv2.CAP_PROP_FOURCC, V4L2_FOURCC_MAP[fourcc_str])
     if not cap.isOpened():
         cap.release()
         return None
@@ -202,10 +201,39 @@ class AppConfig:
 # ============================================================
 
 class ConfigPersistence:
-    """负责 AppConfig 的 YAML 文件读写。"""
+    """负责 AppConfig 的 YAML 文件读写。
 
-    def __init__(self, filepath: str = "config.yaml"):
-        self._filepath = filepath
+    字段与 YAML 键名的映射由 dataclass 反射自动生成（`index` <-> `camera_index`），
+    新增 CameraConfig 字段时不再需要手抄 load / save 两处。
+    """
+
+    # dataclass 字段名 -> YAML 键名（仅不同的才需要列出）
+    _FIELD_TO_KEY = {"index": "camera_index"}
+
+    def __init__(self, filepath: str = "camera_configs.yaml"):
+        # 相对路径统一锚定 src/，与其它运行时配置同一解析策略（不依赖 CWD）
+        p = Path(filepath)
+        self._filepath = str(p if p.is_absolute() else _SRC_DIR / p)
+
+    @classmethod
+    def _camera_to_dict(cls, cfg: CameraConfig) -> dict:
+        """CameraConfig -> YAML 字典，按字段定义顺序写入并应用键名别名。"""
+        return {
+            cls._FIELD_TO_KEY.get(f.name, f.name): getattr(cfg, f.name)
+            for f in fields(CameraConfig)
+        }
+
+    @classmethod
+    def _camera_from_dict(cls, data) -> CameraConfig:
+        """YAML 字典 -> CameraConfig；缺失/为 None 的字段用 dataclass 默认值。"""
+        if not isinstance(data, dict):
+            return CameraConfig()
+        kwargs = {}
+        for f in fields(CameraConfig):
+            key = cls._FIELD_TO_KEY.get(f.name, f.name)
+            if key in data and data[key] is not None:
+                kwargs[f.name] = data[key]
+        return CameraConfig(**kwargs)
 
     def load(self) -> AppConfig:
         """从文件加载配置，文件不存在时返回默认配置并保存。"""
@@ -225,87 +253,19 @@ class ConfigPersistence:
             return AppConfig()
 
         try:
-            left_data = data.get('left', {})
-            right_data = data.get('right', {})
-            config = AppConfig(
-                left=CameraConfig(
-                    index=left_data.get('camera_index', 0),
-                    crop=left_data.get('crop', [0, 0, 640, 480]),
-                    flip=left_data.get('flip', False),
-                    frame_width=left_data.get('frame_width', 640),
-                    frame_height=left_data.get('frame_height', 480),
-                    frame_rate=left_data.get('frame_rate', 30),
-                    fourcc=left_data.get('fourcc', ''),
-                    use_recommended_resolution=left_data.get('use_recommended_resolution', True),
-                    dark_search_roi_scale=left_data.get('dark_search_roi_scale', 0.70),
-                    brightness=left_data.get('brightness', 0.0),
-                    contrast=left_data.get('contrast', 1.0),
-                    openness_threshold_low=left_data.get('openness_threshold_low', 0),
-                    openness_threshold_high=left_data.get('openness_threshold_high', 80),
-                    pupil_threshold_low=left_data.get('pupil_threshold_low', 0),
-                    pupil_threshold_high=left_data.get('pupil_threshold_high', 50),
-                ),
-                right=CameraConfig(
-                    index=right_data.get('camera_index', 0),
-                    crop=right_data.get('crop', [0, 0, 640, 480]),
-                    flip=right_data.get('flip', False),
-                    frame_width=right_data.get('frame_width', 640),
-                    frame_height=right_data.get('frame_height', 480),
-                    frame_rate=right_data.get('frame_rate', 30),
-                    fourcc=right_data.get('fourcc', ''),
-                    use_recommended_resolution=right_data.get('use_recommended_resolution', True),
-                    dark_search_roi_scale=right_data.get('dark_search_roi_scale', 0.70),
-                    brightness=right_data.get('brightness', 0.0),
-                    contrast=right_data.get('contrast', 1.0),
-                    openness_threshold_low=right_data.get('openness_threshold_low', 0),
-                    openness_threshold_high=right_data.get('openness_threshold_high', 80),
-                    pupil_threshold_low=right_data.get('pupil_threshold_low', 0),
-                    pupil_threshold_high=right_data.get('pupil_threshold_high', 50),
-                ),
+            return AppConfig(
+                left=self._camera_from_dict(data.get('left', {})),
+                right=self._camera_from_dict(data.get('right', {})),
             )
         except Exception as e:
             logger.warning(f"配置数据格式有误，部分使用默认值: {e}")
             return AppConfig()
 
-        return config
-
     def save(self, config: AppConfig) -> None:
         """保存配置到文件。"""
         data = {
-            'left': {
-                'camera_index': config.left.index,
-                'crop': config.left.crop,
-                'flip': config.left.flip,
-                'frame_width': config.left.frame_width,
-                'frame_height': config.left.frame_height,
-                'frame_rate': config.left.frame_rate,
-                'fourcc': config.left.fourcc,
-                'use_recommended_resolution': config.left.use_recommended_resolution,
-                'dark_search_roi_scale': config.left.dark_search_roi_scale,
-                'brightness': config.left.brightness,
-                'contrast': config.left.contrast,
-                'openness_threshold_low': config.left.openness_threshold_low,
-                'openness_threshold_high': config.left.openness_threshold_high,
-                'pupil_threshold_low': config.left.pupil_threshold_low,
-                'pupil_threshold_high': config.left.pupil_threshold_high,
-            },
-            'right': {
-                'camera_index': config.right.index,
-                'crop': config.right.crop,
-                'flip': config.right.flip,
-                'frame_width': config.right.frame_width,
-                'frame_height': config.right.frame_height,
-                'frame_rate': config.right.frame_rate,
-                'fourcc': config.right.fourcc,
-                'use_recommended_resolution': config.right.use_recommended_resolution,
-                'dark_search_roi_scale': config.right.dark_search_roi_scale,
-                'brightness': config.right.brightness,
-                'contrast': config.right.contrast,
-                'openness_threshold_low': config.right.openness_threshold_low,
-                'openness_threshold_high': config.right.openness_threshold_high,
-                'pupil_threshold_low': config.right.pupil_threshold_low,
-                'pupil_threshold_high': config.right.pupil_threshold_high,
-            },
+            'left': self._camera_to_dict(config.left),
+            'right': self._camera_to_dict(config.right),
         }
         try:
             with open(self._filepath, 'w', encoding='utf-8') as f:
@@ -374,6 +334,8 @@ class CropDebugWindow:
         self._start_x: int = 0
         self._start_y: int = 0
         self._running: bool = True
+        # 二值化调试视口异常日志限频时间戳（避免 30ms 刷屏）
+        self._binary_err_log = 0.0
 
         # 开度调试参数（双阈值）
         self._openness_low = cam_config.openness_threshold_low
@@ -577,7 +539,10 @@ class CropDebugWindow:
         self._video_label.bind("<ButtonRelease-1>", self._on_release)
 
     def _reset_crop(self) -> None:
-        """重置剪裁黄框为整个画面范围。"""
+        """重置剪裁黄框为整个画面范围（需确认，防止误触）。"""
+        if not messagebox.askokcancel(
+                "重置剪裁", "将重置剪裁区域为整个画面范围！", parent=self._window):
+            return
         self._crop_rect = [0, 0, self._cam_config.frame_width, self._cam_config.frame_height]
 
     def _save_crop_config(self) -> None:
@@ -652,6 +617,20 @@ class CropDebugWindow:
         result_y1, result_y2 = min(y1, end_y), max(y1, end_y)
         return [result_x1, result_y1, result_x2, result_y2]
 
+    def _send_cmd(self, cmd, *args) -> bool:
+        """向追踪子进程下发一条命令；无队列/异常时记录日志，返回是否成功。
+
+        统一各滑块/下拉回调的命令下发路径，避免每处重复 try/except。
+        """
+        if self._cmd_queue is None:
+            return False
+        try:
+            self._cmd_queue.put_nowait((cmd, *args))
+            return True
+        except Exception as e:
+            logger.error(f"[{self._side}] 发送命令 {cmd} 失败: {e}")
+            return False
+
     def _on_resolution_changed(self, event: tk.Event = None) -> None:
         """下拉框选择分辨率/帧率时回调：更新配置并重启相机预览，同时通知子进程。"""
         idx = self._mode_combo.current()
@@ -700,20 +679,15 @@ class CropDebugWindow:
         logger.info(f"[{self._side}] 切换分辨率: {mode_to_label(m)}")
 
         # 通知子进程动态切换相机参数
-        if self._cmd_queue is not None:
-            try:
-                self._cmd_queue.put_nowait((
-                    "restart_capture",
-                    m["width"], m["height"], m["fps"], new_fmt,
-                ))
-                logger.info(f"[{self._side}] 已通知子进程切换分辨率")
-            except Exception as e:
-                logger.error(f"[{self._side}] 通知子进程切换失败: {e}")
+        if self._send_cmd("restart_capture",
+                          m["width"], m["height"], m["fps"], new_fmt):
+            logger.info(f"[{self._side}] 已通知子进程切换分辨率")
 
     def _on_roi_scale_changed(self, val: str) -> None:
         """搜索区域滑块回调：更新配置，实时发送到子进程。"""
         scale = float(val)
         self._cam_config.dark_search_roi_scale = scale
+        self._send_cmd("set_search_roi_scale", scale)
         logger.info(f"[{self._side}] 搜索区域比例: {scale:.2f}")
 
     def _on_postprocess_changed(self, val: str = None) -> None:
@@ -722,11 +696,7 @@ class CropDebugWindow:
         contrast = self._contrast_var.get()
         self._cam_config.brightness = brightness
         self._cam_config.contrast = contrast
-        if self._cmd_queue is not None:
-            try:
-                self._cmd_queue.put_nowait(("set_postprocess", brightness, contrast))
-            except Exception as e:
-                logger.error(f"[{self._side}] 发送后处理参数失败: {e}")
+        self._send_cmd("set_postprocess", brightness, contrast)
         logger.info(f"[{self._side}] 明度: {brightness:.0f}, 对比度: {contrast:.1f}")
 
     def _draw_search_ellipse_on_frame(self, frame, crop_w, crop_h, crop_rect=None):
@@ -892,7 +862,7 @@ class CropDebugWindow:
             info = f"距离={raw_dist:.1f}px  高处={top_y:.0f}  低处={bottom_y:.0f}"
             self._openness_info_label.config(text=info)
         except Exception:
-            pass
+            self._log_binary_error("开闭二值化视口")
 
         # 瞳孔二值化视口
         try:
@@ -909,63 +879,46 @@ class CropDebugWindow:
                 pinfo += "\n无法拟合椭圆！"
             self._pupil_info_label.config(text=pinfo)
         except Exception:
-            pass
+            self._log_binary_error("瞳孔二值化视口")
 
         self._video_label.after(30, self._show_frame_loop)
+
+    def _log_binary_error(self, what: str) -> None:
+        """二值化调试视口异常限频记录（每 2s 最多一次），避免静默失败。"""
+        now = time.time()
+        if now - self._binary_err_log > 2.0:
+            logger.exception(f"[{self._side}] {what}渲染失败")
+            self._binary_err_log = now
 
     # ---- 开闭双阈值回调 ----
     def _on_open_low_changed(self, val: str) -> None:
         self._openness_low = int(val)
-        if self._cmd_queue is not None:
-            try:
-                self._cmd_queue.put_nowait(("set_openness_threshold_low", self._openness_low))
-            except Exception as e:
-                logger.error(f"[{self._side}] 发送开闭下界阈值失败: {e}")
+        self._send_cmd("set_openness_threshold_low", self._openness_low)
 
     def _on_open_high_changed(self, val: str) -> None:
         self._openness_high = int(val)
-        if self._cmd_queue is not None:
-            try:
-                self._cmd_queue.put_nowait(("set_openness_threshold_high", self._openness_high))
-            except Exception as e:
-                logger.error(f"[{self._side}] 发送开闭上界阈值失败: {e}")
+        self._send_cmd("set_openness_threshold_high", self._openness_high)
 
     def _on_openness_blur_changed(self, val: str) -> None:
         blur = int(val)
         if blur % 2 == 0:
             blur += 1
         self._openness_blur = blur
-        if self._cmd_queue is not None:
-            try:
-                self._cmd_queue.put_nowait(("set_openness_blur", blur))
-            except Exception as e:
-                logger.error(f"[{self._side}] 发送开度模糊核失败: {e}")
+        self._send_cmd("set_openness_blur", blur)
 
     def _on_openness_aggregation_changed(self, event: tk.Event = None) -> None:
         agg = self._open_agg_var.get()
         self._openness_aggregation = agg
-        if self._cmd_queue is not None:
-            try:
-                self._cmd_queue.put_nowait(("set_openness_aggregation", agg))
-            except Exception as e:
-                logger.error(f"[{self._side}] 发送开度聚合方式失败: {e}")
+        self._send_cmd("set_openness_aggregation", agg)
 
     # ---- 瞳孔双阈值回调 ----
     def _on_pupil_low_changed(self, val: str) -> None:
         self._pupil_low = int(val)
-        if self._cmd_queue is not None:
-            try:
-                self._cmd_queue.put_nowait(("set_pupil_threshold_low", self._pupil_low))
-            except Exception as e:
-                logger.error(f"[{self._side}] 发送瞳孔下界阈值失败: {e}")
+        self._send_cmd("set_pupil_threshold_low", self._pupil_low)
 
     def _on_pupil_high_changed(self, val: str) -> None:
         self._pupil_high = int(val)
-        if self._cmd_queue is not None:
-            try:
-                self._cmd_queue.put_nowait(("set_pupil_threshold_high", self._pupil_high))
-            except Exception as e:
-                logger.error(f"[{self._side}] 发送瞳孔上界阈值失败: {e}")
+        self._send_cmd("set_pupil_threshold_high", self._pupil_high)
 
     def _on_close(self) -> None:
         self._running = False
@@ -1059,9 +1012,9 @@ class ControlPanel:
         lock_c_key = f"{side}_center"
 
         # ---- 第 0 行：锁定眼球半径 ----
-        self._make_button(parent, queue, "眼球半径", lock_r_key).pack(pady=1, fill=tk.X)
+        self._make_button(parent, queue, "眼球半径", lock_r_key, "radius").pack(pady=1, fill=tk.X)
         # ---- 第 1 行：锁定眼球中心 ----
-        self._make_button(parent, queue, "眼球中心", lock_c_key).pack(pady=1, fill=tk.X)
+        self._make_button(parent, queue, "眼球中心", lock_c_key, "center").pack(pady=1, fill=tk.X)
 
         # ---- 分隔线 ----
         ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
@@ -1165,7 +1118,8 @@ class ControlPanel:
         output_label.pack(fill=tk.X, pady=(2, 4))
         self._output_labels[side] = output_label
 
-    def _make_button(self, parent, queue, label_prefix, lock_key):
+    def _make_button(self, parent, queue, label_prefix, lock_key, kind):
+        """kind 为锁类型（"radius" / "center"），显式决定下发的命令名。"""
         btn_text = tk.StringVar()
 
         def update_text(*args):
@@ -1176,10 +1130,7 @@ class ControlPanel:
                 logger.warning(f"[{label_prefix}] 追踪尚未启动")
                 return
             locked = self._locks[lock_key]
-            if locked:
-                queue.put_nowait("unlock_radius" if "半径" in label_prefix else "unlock_center")
-            else:
-                queue.put_nowait("lock_radius" if "半径" in label_prefix else "lock_center")
+            queue.put_nowait(("unlock_" if locked else "lock_") + kind)
             self._locks[lock_key] = not locked
             update_text()
 
@@ -1206,7 +1157,11 @@ class ControlPanel:
             logger.warning(f"[{side}] 追踪尚未启动，无法保存")
 
     def _clear_extreme_vectors(self, side: str) -> None:
-        """清除指定眼（left/right）的所有极值向量。"""
+        """清除指定眼（left/right）的所有极值向量（需确认，防止误触）。"""
+        side_label = "左眼" if side == "left" else "右眼"
+        if not messagebox.askokcancel(
+                "清除注视参考", f"将清除{side_label}的所有注视极值向量！", parent=self._window):
+            return
         q = self._cmd_queue_left if side == "left" else self._cmd_queue_right
         if q is not None:
             try:
@@ -1219,8 +1174,6 @@ class ControlPanel:
 
     def _on_skip_left_changed(self, val: str) -> None:
         threshold = float(val)
-        if self._module is not None:
-            self._module._openness_skip_threshold_left = threshold  # store for UI
         if self._cmd_queue_left is not None:
             try:
                 self._cmd_queue_left.put_nowait(("set_openness_skip_threshold", threshold))
@@ -1230,8 +1183,6 @@ class ControlPanel:
 
     def _on_skip_right_changed(self, val: str) -> None:
         threshold = float(val)
-        if self._module is not None:
-            self._module._openness_skip_threshold_right = threshold
         if self._cmd_queue_right is not None:
             try:
                 self._cmd_queue_right.put_nowait(("set_openness_skip_threshold", threshold))
@@ -1281,7 +1232,11 @@ class ControlPanel:
                 logger.warning(f"未能获取 {side} 当前开度值，跳过保存")
 
     def _clear_openness_refs(self, side: str) -> None:
-        """清除指定眼睛（left/right）的开闭参考距离（open/close）并持久化。"""
+        """清除指定眼睛（left/right）的开闭参考距离（open/close）并持久化（需确认，防止误触）。"""
+        side_label = "左眼" if side == "left" else "右眼"
+        if not messagebox.askokcancel(
+                "清除开闭参考", f"将清除{side_label}的开闭度参考值！", parent=self._window):
+            return
         if self._openness_normalizer is not None:
             self._openness_normalizer.clear_openness_ref(side)
             logger.info(f"已清除 {side} 眼开闭参考距离")
@@ -1323,7 +1278,7 @@ class EyeTrackingModule:
     master : tk.Tk | None
         tkinter 父窗口。headless=False 且为 None 时自动创建隐藏根窗口。
     config_path : str
-        相机配置文件路径（默认 config.yaml）。
+        相机配置文件路径（默认 camera_configs.yaml）。
     refs_file : str
         参考值文件路径（默认 references.yaml）。
     """
@@ -1332,7 +1287,7 @@ class EyeTrackingModule:
         self,
         headless: bool = False,
         master: Optional[tk.Tk] = None,
-        config_path: str = "config.yaml",
+        config_path: str = "camera_configs.yaml",
         refs_file: str = "references.yaml",
     ):
         self._headless = headless
@@ -1364,6 +1319,9 @@ class EyeTrackingModule:
         self._raw_gaze: Dict[str, Optional[List[float]]] = {"left": None, "right": None}
         self._result_thread: Optional[threading.Thread] = None
         self._result_stop = threading.Event()
+        # 子进程死亡告警去重标记（_warn_if_tracker_died 使用）
+        self._death_logged_left = False
+        self._death_logged_right = False
 
         self._crop_window_left: Optional[CropDebugWindow] = None
         self._crop_window_right: Optional[CropDebugWindow] = None
@@ -1422,6 +1380,28 @@ class EyeTrackingModule:
         self._headless_runtime = False
         logger.info("已恢复 OpenCV 调试窗口")
 
+    def _tracker_args(self, cfg: CameraConfig, side: str, cmd_queue) -> tuple:
+        """构造单眼追踪子进程的位置参数（顺序须与 _run_tracker_in_process 一致）。"""
+        return (
+            cfg.index, cfg.flip, cfg.crop, side, cmd_queue,
+            self._result_queue, self._headless,
+            cfg.frame_width, cfg.frame_height, cfg.frame_rate,
+            self._refs_file, cfg.use_recommended_resolution,
+            cfg.dark_search_roi_scale, cfg.fourcc, cfg.brightness, cfg.contrast,
+            cfg.openness_threshold_low, cfg.openness_threshold_high,
+            cfg.pupil_threshold_low, cfg.pupil_threshold_high,
+        )
+
+    def _spawn_tracker(self, cfg: CameraConfig, side: str, cmd_queue):
+        """创建并启动单眼追踪子进程（左右眼共用，避免两份重复参数表）。"""
+        proc = multiprocessing.Process(
+            target=_run_tracker_in_process,
+            args=self._tracker_args(cfg, side, cmd_queue),
+            daemon=True,
+        )
+        proc.start()
+        return proc
+
     def start(self) -> None:
         self._stop_internal()
 
@@ -1432,60 +1412,31 @@ class EyeTrackingModule:
         # （Canvas 绘制持锁）导致队列无限积压、数据延迟 1s+。
         self._result_queue = multiprocessing.Queue(maxsize=5)
 
-        self._process_left = multiprocessing.Process(
-            target=_run_tracker_in_process,
-            args=(
-                self.config.left.index, self.config.left.flip, self.config.left.crop,
-                "left", self._cmd_queue_left, self._result_queue, self._headless,
-                self.config.left.frame_width, self.config.left.frame_height,
-                self.config.left.frame_rate,
-                self._refs_file, self.config.left.use_recommended_resolution,
-                self.config.left.dark_search_roi_scale,
-                self.config.left.fourcc,
-                self.config.left.brightness,
-                self.config.left.contrast,
-                self.config.left.openness_threshold_low,
-                self.config.left.openness_threshold_high,
-                self.config.left.pupil_threshold_low,
-                self.config.left.pupil_threshold_high,
-            ),
-            daemon=True,
-        )
-        self._process_left.start()
+        self._process_left = self._spawn_tracker(
+            self.config.left, "left", self._cmd_queue_left)
+        self._process_right = self._spawn_tracker(
+            self.config.right, "right", self._cmd_queue_right)
 
-        self._process_right = multiprocessing.Process(
-            target=_run_tracker_in_process,
-            args=(
-                self.config.right.index, self.config.right.flip, self.config.right.crop,
-                "right", self._cmd_queue_right, self._result_queue, self._headless,
-                self.config.right.frame_width, self.config.right.frame_height,
-                self.config.right.frame_rate,
-                self._refs_file, self.config.right.use_recommended_resolution,
-                self.config.right.dark_search_roi_scale,
-                self.config.right.fourcc,
-                self.config.right.brightness,
-                self.config.right.contrast,
-                self.config.right.openness_threshold_low,
-                self.config.right.openness_threshold_high,
-                self.config.right.pupil_threshold_low,
-                self.config.right.pupil_threshold_high,
-            ),
-            daemon=True,
-        )
-        self._process_right.start()
-
-        time.sleep(0.5)
-        left_alive = self._process_left.is_alive()
-        right_alive = self._process_right.is_alive()
+        # 启动宽限轮询：期间任一子进程提前退出即判失败，并携带 exitcode 便于
+        # 定位（如相机打开失败时子进程会快速结束）；两者都存活到宽限结束即成功。
+        left_proc, right_proc = self._process_left, self._process_right
+        deadline = time.time() + START_GRACE
+        while time.time() < deadline:
+            if not (left_proc.is_alive() and right_proc.is_alive()):
+                break
+            time.sleep(0.05)
+        left_alive = left_proc.is_alive()
+        right_alive = right_proc.is_alive()
 
         if not left_alive or not right_alive:
-            self._stop_internal()
             failed_side = []
             if not left_alive:
-                failed_side.append("左眼")
+                failed_side.append(f"左眼(exitcode={left_proc.exitcode})")
             if not right_alive:
-                failed_side.append("右眼")
-            raise RuntimeError(f"{'、'.join(failed_side)}追踪子进程启动失败（相机不可用或索引错误）")
+                failed_side.append(f"右眼(exitcode={right_proc.exitcode})")
+            self._stop_internal()
+            raise RuntimeError(
+                f"{'、'.join(failed_side)}追踪子进程启动失败（相机不可用或索引错误）")
 
         # 启动结果收集线程
         self._start_result_collector()
@@ -1509,6 +1460,8 @@ class EyeTrackingModule:
         if result_queue is None:
             return
 
+        last_err_log = 0.0   # 异常日志限频（秒），避免故障时刷屏
+
         while not self._result_stop.is_set():
             # 非阻塞快速排空队列积压：Tkinter 主线程绘制 Canvas 期间持锁，
             # 本线程可能被 GIL 长时间阻塞；每次被调度时一次性消费掉所有积压
@@ -1520,48 +1473,90 @@ class EyeTrackingModule:
                 except queue.Empty:
                     break
                 except Exception:
+                    # 队列被关闭/损坏等异常：限频记录后退出本次排空，
+                    # 不让采集线程静默死亡（否则数据冻结且无任何日志）。
+                    if time.time() - last_err_log > 2.0:
+                        logger.exception("读取追踪结果队列失败")
+                        last_err_log = time.time()
                     break
                 if data is None or data.get("side") is None:
                     continue
                 latest[data["side"]] = data  # 后写入覆盖先写入，天然取最新
 
-            if not latest:
+            if latest:
+                for side in ("left", "right"):
+                    data = latest.get(side)
+                    if data is None:
+                        continue
+                    try:
+                        self._apply_side_result(side, data, openness_normalizer)
+                    except Exception:
+                        # 单侧处理异常不影响另一侧；限频记录，防止线程静默死亡
+                        if time.time() - last_err_log > 2.0:
+                            logger.exception(f"[{side}] 处理追踪结果失败")
+                            last_err_log = time.time()
+            else:
                 time.sleep(0.002)  # 队列为空，短暂休眠避免忙轮询空转
-                continue
+            self._warn_if_tracker_died()
 
-            for side in ("left", "right"):
-                data = latest.get(side)
-                if data is None:
-                    continue
-                self._raw_gaze[side] = data.get("gaze_rotated")
+    def _apply_side_result(self, side: str, data: dict,
+                           openness_normalizer: Normalizer) -> None:
+        """把单眼一帧结果合并进 _latest_state（快照式整体替换）。"""
+        self._raw_gaze[side] = data.get("gaze_rotated")
 
-                raw_openness = data.get("raw_eye_openness", None)
+        raw_openness = data.get("raw_eye_openness", None)
 
-                # 计算归一化 eye_o
-                eye_o = None
-                if raw_openness is not None and isinstance(raw_openness, (int, float)) and raw_openness > 0:
-                    open_ref = openness_normalizer.get_openness_ref(side, "open")
-                    close_ref = openness_normalizer.get_openness_ref(side, "close")
-                    if open_ref is not None and close_ref is not None and open_ref > close_ref:
-                        eye_o = (raw_openness - close_ref) / (open_ref - close_ref)
-                        eye_o = max(0.0, min(1.0, eye_o))
+        # 计算归一化 eye_o
+        eye_o = None
+        if raw_openness is not None and isinstance(raw_openness, (int, float)) and raw_openness > 0:
+            open_ref = openness_normalizer.get_openness_ref(side, "open")
+            close_ref = openness_normalizer.get_openness_ref(side, "close")
+            if open_ref is not None and close_ref is not None and open_ref > close_ref:
+                eye_o = (raw_openness - close_ref) / (open_ref - close_ref)
+                eye_o = max(0.0, min(1.0, eye_o))
 
-                # 快照式整体替换：读者拿到的始终是同一次更新的一致快照
-                new_state = dict(self._latest_state)
-                new_state[side] = {
-                    "eye_x": data.get("eye_x"),
-                    "eye_y": data.get("eye_y"),
-                    "confidence": data.get("confidence"),
-                    "raw_eye_openness": raw_openness,
-                    "eye_o": eye_o,
-                }
-                new_state["timestamp"] = time.time()
-                self._latest_state = new_state
+        # 快照式整体替换：读者拿到的始终是同一次更新的一致快照
+        new_state = dict(self._latest_state)
+        new_state[side] = {
+            "eye_x": data.get("eye_x"),
+            "eye_y": data.get("eye_y"),
+            "confidence": data.get("confidence"),
+            "raw_eye_openness": raw_openness,
+            "eye_o": eye_o,
+        }
+        new_state["timestamp"] = time.time()
+        self._latest_state = new_state
+
+    def _warn_if_tracker_died(self) -> None:
+        """轻量存活监控：追踪子进程退出时限频记录告警（仅日志，不触碰 Tk）。
+
+        数据源（GUI/外部脚本）应通过 is_running() 感知进程状态；本方法只负责
+        在采集线程里留下可排查的日志痕迹。
+        """
+        for side, proc in (("left", self._process_left), ("right", self._process_right)):
+            if proc is not None and not proc.is_alive():
+                flag = "_death_logged_left" if side == "left" else "_death_logged_right"
+                if not getattr(self, flag, False):
+                    logger.warning(
+                        f"追踪子进程 {side} 已退出（exitcode={proc.exitcode}），"
+                        f"该眼数据将停止更新")
+                    setattr(self, flag, True)
 
     def _stop_internal(self) -> None:
         if self._control_panel is not None:
             self._control_panel.destroy()
             self._control_panel = None
+
+        # 关闭裁剪调试窗口并释放其独占的相机句柄：避免与追踪子进程双开
+        # 同一相机，以及 stop 后重启时相机被占用导致启动失败。
+        for attr in ("_crop_window_left", "_crop_window_right"):
+            win = getattr(self, attr, None)
+            if win is not None:
+                try:
+                    win.close()
+                except Exception:  # noqa: BLE001  窗口可能已被用户销毁
+                    pass
+                setattr(self, attr, None)
 
         # 停止结果收集线程
         self._result_stop.set()
@@ -1582,6 +1577,9 @@ class EyeTrackingModule:
         self._result_queue = None
         self._raw_gaze = {"left": None, "right": None}
         self._latest_state = self._empty_state()
+        # 重置子进程死亡告警去重标记（下次 start 重新监控）
+        self._death_logged_left = False
+        self._death_logged_right = False
         logger.info("眼球追踪已停止")
 
     def get_normalized_eye_state(self) -> dict:
@@ -1843,7 +1841,7 @@ def _build_debug_panel(module: EyeTrackingModule, window: tk.Widget,
 
 def launch_debug_panel(
     master: Optional[tk.Tk] = None,
-    config_path: str = "config.yaml",
+    config_path: str = "camera_configs.yaml",
     refs_file: str = "references.yaml",
 ) -> EyeTrackingModule:
     """创建并显示眼球追踪调试面板，返回绑定该面板的模块实例。
